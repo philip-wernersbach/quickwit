@@ -275,9 +275,7 @@ impl RetentionPolicy {
             .unwrap_or_else(|| {
                 if let Some(next_next_date) = schedule_iter.next() {
                     let time_between_schedules = next_next_date - future_date;
-                    Duration::from_secs(
-                        time_between_schedules.num_seconds().clamp(0, 3600) as u64,
-                    )
+                    Duration::from_secs(time_between_schedules.num_seconds().clamp(0, 3600) as u64)
                 } else {
                     // we don't know when the schedule is. That's odd. Let's allow no jitter
                     warn!("found retention policy schedule with no next execution");
@@ -302,13 +300,11 @@ where D: Deserializer<'de> {
     let value: Option<String> = Deserialize::deserialize(deserializer)?;
     match value {
         None => Ok(None),
-        Some(s) => humantime::parse_duration(&s)
-            .map(Some)
-            .map_err(|error| {
-                de::Error::custom(format!(
-                    "failed to parse human-readable duration `{s}`: {error:?}",
-                ))
-            }),
+        Some(s) => humantime::parse_duration(&s).map(Some).map_err(|error| {
+            de::Error::custom(format!(
+                "failed to parse human-readable duration `{s}`: {error:?}",
+            ))
+        }),
     }
 }
 
@@ -959,10 +955,7 @@ mod tests {
         "#;
         let retention_policy =
             serde_yaml::from_str::<RetentionPolicy>(retention_policy_yaml).unwrap();
-        assert_eq!(
-            retention_policy.jitter,
-            Some(Duration::from_secs(30 * 60))
-        );
+        assert_eq!(retention_policy.jitter, Some(Duration::from_secs(30 * 60)));
     }
 
     #[test]
@@ -973,8 +966,7 @@ mod tests {
             jitter: Some(Duration::from_secs(30 * 60)),
         };
         let retention_policy_yaml = serde_yaml::to_string(&retention_policy).unwrap();
-        let deserialized: RetentionPolicy =
-            serde_yaml::from_str(&retention_policy_yaml).unwrap();
+        let deserialized: RetentionPolicy = serde_yaml::from_str(&retention_policy_yaml).unwrap();
         assert_eq!(deserialized, retention_policy);
     }
 
