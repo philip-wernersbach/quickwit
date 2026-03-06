@@ -1,30 +1,27 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
+use bytesize::ByteSize;
 use http::HeaderMap;
-use quickwit_common::net::{find_private_ip, get_short_hostname, Host};
+use quickwit_common::fs::get_disk_size;
+use quickwit_common::net::{Host, find_private_ip, get_short_hostname};
 use quickwit_common::new_coolid;
 use quickwit_common::uri::Uri;
 use quickwit_proto::types::NodeId;
@@ -38,8 +35,8 @@ use crate::service::QuickwitService;
 use crate::storage_config::StorageConfigs;
 use crate::templating::render_config;
 use crate::{
-    validate_identifier, validate_node_id, ConfigFormat, IndexerConfig, IngestApiConfig,
-    JaegerConfig, MetastoreConfigs, NodeConfig, SearcherConfig,
+    ConfigFormat, IndexerConfig, IngestApiConfig, JaegerConfig, MetastoreConfigs, NodeConfig,
+    SearcherConfig, TlsConfig, validate_identifier, validate_node_id,
 };
 
 pub const DEFAULT_CLUSTER_ID: &str = "quickwit-default-cluster";
@@ -67,6 +64,10 @@ fn default_node_id() -> ConfigValue<String, QW_NODE_ID> {
         }
     };
     ConfigValue::with_default(node_id)
+}
+
+fn default_availability_zone() -> ConfigValue<String, QW_AVAILABILITY_ZONE> {
+    ConfigValue::none()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -172,6 +173,8 @@ struct NodeConfigBuilder {
     cluster_id: ConfigValue<String, QW_CLUSTER_ID>,
     #[serde(default = "default_node_id")]
     node_id: ConfigValue<String, QW_NODE_ID>,
+    #[serde(default = "default_availability_zone")]
+    availability_zone: ConfigValue<String, QW_AVAILABILITY_ZONE>,
     #[serde(default = "default_enabled_services")]
     enabled_services: ConfigValue<List, QW_ENABLED_SERVICES>,
     #[serde(default = "default_listen_address")]
@@ -221,6 +224,7 @@ impl NodeConfigBuilder {
         env_vars: &HashMap<String, String>,
     ) -> anyhow::Result<NodeConfig> {
         let node_id = self.node_id.resolve(env_vars).map(NodeId::new)?;
+        let availability_zone = self.availability_zone.resolve_optional(env_vars)?;
 
         let enabled_services = self
             .enabled_services
@@ -308,6 +312,7 @@ impl NodeConfigBuilder {
         let node_config = NodeConfig {
             cluster_id: self.cluster_id.resolve(env_vars)?,
             node_id,
+            availability_zone,
             enabled_services,
             gossip_listen_addr,
             grpc_listen_addr,
@@ -343,7 +348,59 @@ fn validate(node_config: &NodeConfig) -> anyhow::Result<()> {
     if node_config.peer_seeds.is_empty() {
         warn!("peer seeds are empty");
     }
+    validate_disk_usage(node_config);
     Ok(())
+}
+
+/// A list of all the known disk budgets
+///
+/// External disk usage and unbounded disk usages, e.g the indexing workbench
+/// (indexing/) and the delete task workbench (delete_task_service/) are not included.
+#[derive(Default, Debug)]
+struct ExpectedDiskUsage {
+    // indexer / ingester
+    split_store_max_num_bytes: Option<ByteSize>,
+    max_queue_disk_usage: Option<ByteSize>,
+    // searcher
+    split_cache: Option<ByteSize>,
+}
+
+impl ExpectedDiskUsage {
+    fn from_config(node_config: &NodeConfig) -> Self {
+        let mut expected = Self::default();
+        if node_config.is_service_enabled(QuickwitService::Indexer) {
+            expected.max_queue_disk_usage =
+                Some(node_config.ingest_api_config.max_queue_disk_usage);
+            expected.split_store_max_num_bytes =
+                Some(node_config.indexer_config.split_store_max_num_bytes);
+        }
+        if node_config.is_service_enabled(QuickwitService::Searcher) {
+            expected.split_cache = node_config
+                .searcher_config
+                .split_cache
+                .map(|limits| limits.max_num_bytes);
+        }
+        expected
+    }
+
+    fn total(&self) -> ByteSize {
+        self.split_store_max_num_bytes.unwrap_or_default()
+            + self.max_queue_disk_usage.unwrap_or_default()
+            + self.split_cache.unwrap_or_default()
+    }
+}
+
+fn validate_disk_usage(node_config: &NodeConfig) {
+    if let Some(volume_size) = get_disk_size(&node_config.data_dir_path) {
+        let expected_disk_usage = ExpectedDiskUsage::from_config(node_config);
+        if expected_disk_usage.total() > volume_size {
+            warn!(
+                ?volume_size,
+                ?expected_disk_usage,
+                "data dir volume too small"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +409,7 @@ impl Default for NodeConfigBuilder {
         Self {
             cluster_id: default_cluster_id(),
             node_id: default_node_id(),
+            availability_zone: ConfigValue::none(),
             enabled_services: default_enabled_services(),
             listen_address: default_listen_address(),
             rest_listen_port: None,
@@ -387,6 +445,8 @@ struct RestConfigBuilder {
     #[serde(with = "http_serde::header_map")]
     #[serde(default)]
     pub extra_headers: HeaderMap,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 impl RestConfigBuilder {
@@ -405,19 +465,21 @@ impl RestConfigBuilder {
             listen_addr: SocketAddr::new(listen_ip, listen_port),
             cors_allow_origins: self.cors_allow_origins,
             extra_headers: self.extra_headers,
+            tls: self.tls,
         };
         Ok(rest_config)
     }
 }
 
 #[cfg(any(test, feature = "testsuite"))]
-pub fn node_config_for_test() -> NodeConfig {
-    use quickwit_common::net::find_available_tcp_port;
-
+pub fn node_config_for_tests_from_ports(
+    rest_listen_port: u16,
+    grpc_listen_port: u16,
+) -> NodeConfig {
     let node_id = NodeId::new(default_node_id().unwrap());
     let enabled_services = QuickwitService::supported_services();
+    let availability_zone = Some(String::from("az-1"));
     let listen_address = Host::default();
-    let rest_listen_port = find_available_tcp_port().expect("OS should find an available port");
     let rest_listen_addr = listen_address
         .with_port(rest_listen_port)
         .to_socket_addr()
@@ -426,7 +488,6 @@ pub fn node_config_for_test() -> NodeConfig {
         .with_port(rest_listen_port)
         .to_socket_addr()
         .expect("default host should be an IP address");
-    let grpc_listen_port = find_available_tcp_port().expect("OS should find an available port");
     let grpc_listen_addr = listen_address
         .with_port(grpc_listen_port)
         .to_socket_addr()
@@ -443,10 +504,12 @@ pub fn node_config_for_test() -> NodeConfig {
         listen_addr: rest_listen_addr,
         cors_allow_origins: Vec::new(),
         extra_headers: HeaderMap::new(),
+        tls: None,
     };
     NodeConfig {
         cluster_id: default_cluster_id().unwrap(),
         node_id,
+        availability_zone,
         enabled_services,
         gossip_advertise_addr: gossip_listen_addr,
         grpc_advertise_addr: grpc_listen_addr,
@@ -480,6 +543,7 @@ mod tests {
 
     use super::*;
     use crate::storage_config::StorageBackendFlavor;
+    use crate::{CacheConfig, LambdaConfig, LambdaDeployConfig};
 
     fn get_config_filepath(config_filename: &str) -> String {
         format!(
@@ -501,6 +565,7 @@ mod tests {
         assert!(config.is_service_enabled(QuickwitService::Janitor));
         assert!(config.is_service_enabled(QuickwitService::Metastore));
 
+        assert_eq!(config.availability_zone.unwrap(), "az-1");
         assert_eq!(
             config.rest_config.listen_addr,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1111)
@@ -606,12 +671,33 @@ mod tests {
             SearcherConfig {
                 aggregation_memory_limit: ByteSize::gb(1),
                 aggregation_bucket_limit: 500_000,
-                fast_field_cache_capacity: ByteSize::gb(10),
-                split_footer_cache_capacity: ByteSize::gb(1),
-                partial_request_cache_capacity: ByteSize::mb(64),
+                fast_field_cache: CacheConfig::default_with_capacity(ByteSize::gb(10)),
+                split_footer_cache: CacheConfig::default_with_capacity(ByteSize::gb(1)),
+                partial_request_cache: CacheConfig::default_with_capacity(ByteSize::mb(64)),
+                predicate_cache: CacheConfig::default_with_capacity(ByteSize::mb(256)),
                 max_num_concurrent_split_searches: 150,
-                max_num_concurrent_split_streams: 120,
+                max_splits_per_search: None,
+                _max_num_concurrent_split_streams: Some(serde::de::IgnoredAny),
                 split_cache: None,
+                request_timeout_secs: NonZeroU64::new(30).unwrap(),
+                storage_timeout_policy: Some(crate::StorageTimeoutPolicy {
+                    min_throughtput_bytes_per_secs: 100_000,
+                    timeout_millis: 2_000,
+                    max_num_retries: 2
+                }),
+                warmup_memory_budget: ByteSize::gb(100),
+                warmup_single_split_initial_allocation: ByteSize::gb(1),
+                lambda: Some(LambdaConfig {
+                    function_name: "quickwit-lambda-leaf-search".to_string(),
+                    max_splits_per_invocation: NonZeroUsize::new(10).unwrap(),
+                    offload_threshold: 30,
+                    auto_deploy: Some(LambdaDeployConfig {
+                        execution_role_arn: "arn:aws:iam::123456789012:role/quickwit-lambda-role"
+                            .to_string(),
+                        memory_size: ByteSize::gib(5),
+                        invocation_timeout_secs: 15,
+                    }),
+                }),
             }
         );
         assert_eq!(
@@ -658,8 +744,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(format!("{parsing_error:?}")
-            .contains("unknown field `max_num_concurrent_split_searches_with_typo`"));
+        assert!(
+            format!("{parsing_error:?}")
+                .contains("unknown field `max_num_concurrent_split_searches_with_typo`")
+        );
     }
 
     #[tokio::test]
@@ -674,6 +762,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.cluster_id, DEFAULT_CLUSTER_ID);
         assert_eq!(config.node_id, get_short_hostname().unwrap());
+        assert_eq!(config.availability_zone, None);
         assert_eq!(
             config.enabled_services,
             QuickwitService::supported_services()
@@ -872,7 +961,7 @@ mod tests {
                     ..Default::default()
                 },
                 peer_seeds: ConfigValue::for_test(List(vec![
-                    "unresolvable-host".to_string(),
+                    "unresolvable.example.com".to_string(),
                     "localhost".to_string(),
                     "localhost:1337".to_string(),
                     "127.0.0.1".to_string(),
@@ -886,6 +975,7 @@ mod tests {
             assert_eq!(
                 node_config.peer_seed_addrs().await.unwrap(),
                 vec![
+                    "unresolvable.example.com:1789".to_string(),
                     "localhost:1789".to_string(),
                     "localhost:1337".to_string(),
                     "127.0.0.1:1789".to_string(),
@@ -995,13 +1085,15 @@ mod tests {
             node_id: 1
             metastore_uri: ''
         "#;
-            assert!(load_node_config_with_env(
-                ConfigFormat::Yaml,
-                config_yaml.as_bytes(),
-                &Default::default()
-            )
-            .await
-            .is_err());
+            assert!(
+                load_node_config_with_env(
+                    ConfigFormat::Yaml,
+                    config_yaml.as_bytes(),
+                    &Default::default()
+                )
+                .await
+                .is_err()
+            );
         }
         {
             let config_yaml = r#"
@@ -1010,13 +1102,15 @@ mod tests {
             metastore_uri: postgres://username:password@host:port/db
             default_index_root_uri: ''
         "#;
-            assert!(load_node_config_with_env(
-                ConfigFormat::Yaml,
-                config_yaml.as_bytes(),
-                &Default::default()
-            )
-            .await
-            .is_err());
+            assert!(
+                load_node_config_with_env(
+                    ConfigFormat::Yaml,
+                    config_yaml.as_bytes(),
+                    &Default::default()
+                )
+                .await
+                .is_err()
+            );
         }
     }
 
@@ -1096,9 +1190,11 @@ mod tests {
             max_trace_duration_secs: 0
         "#;
         let error = serde_yaml::from_str::<JaegerConfig>(jaeger_config_yaml).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("max_trace_duration_secs: invalid value: integer `0`"))
+        assert!(
+            error
+                .to_string()
+                .contains("max_trace_duration_secs: invalid value: integer `0`")
+        )
     }
 
     #[tokio::test]

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::time::{Duration, Instant};
 
@@ -83,8 +78,8 @@ impl CloseIdleShardsTask {
 
 #[cfg(test)]
 mod tests {
-    use quickwit_proto::ingest::ShardState;
-    use quickwit_proto::types::{queue_id, IndexUid, Position, ShardId};
+
+    use quickwit_proto::types::{IndexUid, ShardId};
 
     use super::*;
     use crate::ingest_v2::models::IngesterShard;
@@ -94,7 +89,7 @@ mod tests {
     async fn test_close_idle_shards_run() {
         let (_temp_dir, state) = IngesterState::for_test().await;
         let weak_state = state.weak();
-        let idle_shard_timeout = Duration::from_millis(200);
+        let idle_shard_timeout = RUN_INTERVAL_PERIOD * 4;
         let join_handle = CloseIdleShardsTask::spawn(weak_state, idle_shard_timeout);
 
         let mut state_guard = state.lock_partially().await.unwrap();
@@ -102,23 +97,22 @@ mod tests {
 
         let index_uid = IndexUid::for_test("test-index", 0);
         let shard_01 = IngesterShard::new_solo(
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            None,
-            now - idle_shard_timeout,
-        );
-        let queue_id_01 = queue_id(&index_uid, "test-source", &ShardId::from(1));
+            index_uid.clone(),
+            "test-source".to_string(),
+            ShardId::from(1),
+        )
+        .with_last_write(now - idle_shard_timeout)
+        .build();
+        let queue_id_01 = shard_01.queue_id();
         state_guard.shards.insert(queue_id_01.clone(), shard_01);
 
         let shard_02 = IngesterShard::new_solo(
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            None,
-            now - idle_shard_timeout / 2,
-        );
-        let queue_id_02 = queue_id(&index_uid, "test-source", &ShardId::from(2));
+            index_uid.clone(),
+            "test-source".to_string(),
+            ShardId::from(2),
+        )
+        .build();
+        let queue_id_02 = shard_02.queue_id();
         state_guard.shards.insert(queue_id_02.clone(), shard_02);
         drop(state_guard);
 

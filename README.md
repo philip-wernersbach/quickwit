@@ -1,7 +1,8 @@
 [![CI](https://github.com/quickwit-oss/quickwit/actions/workflows/ci.yml/badge.svg)](https://github.com/quickwit-oss/quickwit/actions?query=workflow%3ACI+branch%3Amain)
 [![codecov](https://codecov.io/gh/quickwit-oss/quickwit/branch/main/graph/badge.svg?token=06SRGAV5SS)](https://codecov.io/gh/quickwit-oss/quickwit)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/quickwit-oss/quickwit/badge)](https://scorecard.dev/viewer/?uri=github.com/quickwit-oss/quickwit)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.0-4baaaa.svg)](CODE_OF_CONDUCT.md)
-[![License: AGPL V3](https://img.shields.io/badge/license-AGPL%20V3-blue)](LICENSE.md)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](LICENSE)
 [![Twitter Follow](https://img.shields.io/twitter/follow/Quickwit_Inc?color=%231DA1F2&logo=Twitter&style=plastic)](https://twitter.com/Quickwit_Inc)
 [![Discord](https://img.shields.io/discord/908281611840282624?logo=Discord&logoColor=%23FFFFFF&style=plastic)](https://discord.quickwit.io)
 <br/>
@@ -130,17 +131,11 @@ We estimate that Quickwit can be up to 10x cheaper on average than Elastic. To u
 
 ### What license does Quickwit use?
 
-Quickwit is open-source under the GNU Affero General Public License Version 3 - AGPLv3. Fundamentally, this means you are free to use Quickwit for your project if you don't modify Quickwit. However, if you do and you are distributing your modified version to the public, you have to make the modifications public.
-We also provide a commercial license for enterprises to provide support and a voice on our roadmap.
+Quickwit is open-source under the Apache License, Version 2.0 - Apache-2.0.
 
 ### Is it possible to set up Quickwit for a High Availability (HA)?
 
 HA is available for search, for indexing it's available only with a Kafka source.
-
-### What is Quickwit's business model?
-
-Our business model relies on our commercial license. There is no plan to become SaaS soon.
-
 
 # 🤝 Contribute and spread the word
 

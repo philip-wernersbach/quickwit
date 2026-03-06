@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
@@ -27,7 +22,7 @@ use quickwit_common::shared_consts::INGESTER_PRIMARY_SHARDS_PREFIX;
 use quickwit_common::sorted_iter::{KeyDiff, SortedByKeyIterator};
 use quickwit_common::tower::{ConstantRate, Rate};
 use quickwit_proto::ingest::ShardState;
-use quickwit_proto::types::{split_queue_id, NodeId, QueueId, ShardId, SourceUid};
+use quickwit_proto::types::{NodeId, ShardId, SourceUid};
 use serde::{Deserialize, Serialize, Serializer};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -129,7 +124,7 @@ enum ShardInfosChange<'a> {
 }
 
 impl LocalShardsSnapshot {
-    pub fn diff<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = ShardInfosChange<'a>> + '_ {
+    pub fn diff<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = ShardInfosChange<'a>> + 'a {
         self.per_source_shard_infos
             .iter()
             .diff_by_key(other.per_source_shard_infos.iter())
@@ -283,43 +278,24 @@ impl BroadcastLocalShardsTask {
         let Ok(mut state_guard) = state.lock_partially().await else {
             return Some(LocalShardsSnapshot::default());
         };
-
-        let queue_ids: Vec<(QueueId, ShardState)> = state_guard
-            .shards
-            .iter()
-            .filter_map(|(queue_id, shard)| {
-                if shard.is_advertisable && !shard.is_replica() {
-                    Some((queue_id.clone(), shard.shard_state))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut num_open_shards = 0;
-        let mut num_closed_shards = 0;
-
         #[allow(clippy::mutable_key_type)]
-        let ingestion_rates: HashMap<(SourceUid, ShardId), (ShardState, ConstantRate)> = queue_ids
-            .iter()
-            .flat_map(|(queue_id, shard_state)| {
-                let Some((_rate_limiter, rate_meter)) = state_guard.rate_trackers.get_mut(queue_id)
-                else {
-                    warn!(
-                        "rate limiter `{queue_id}` not found: this should never happen, please \
-                         report"
-                    );
-                    return None;
-                };
-                let (index_uid, source_id, shard_id) = split_queue_id(queue_id)?;
-                let source_uid = SourceUid {
-                    index_uid,
-                    source_id,
-                };
-                // Shard ingestion rate in MiB/s.
-                Some(((source_uid, shard_id), (*shard_state, rate_meter.harvest())))
-            })
-            .collect();
+        let ingestion_rates: HashMap<(SourceUid, ShardId), (ShardState, ConstantRate)> =
+            state_guard
+                .shards
+                .values_mut()
+                .filter(|shard| shard.is_advertisable && !shard.is_replica())
+                .map(|shard| {
+                    let source_uid = SourceUid {
+                        index_uid: shard.index_uid.clone(),
+                        source_id: shard.source_id.clone(),
+                    };
+                    let shard_id = shard.shard_id.clone();
+                    let shard_state = shard.shard_state;
+                    let rate_meter = &mut shard.rate_meter;
+
+                    ((source_uid, shard_id), (shard_state, rate_meter.harvest()))
+                })
+                .collect();
 
         self.shard_throughput_time_series_map
             .record_shard_throughputs(ingestion_rates);
@@ -327,6 +303,9 @@ impl BroadcastLocalShardsTask {
         let per_source_shard_infos = self
             .shard_throughput_time_series_map
             .get_per_source_shard_infos();
+
+        let mut num_open_shards = 0;
+        let mut num_closed_shards = 0;
 
         for shard_infos in per_source_shard_infos.values() {
             for shard_info in shard_infos {
@@ -445,19 +424,16 @@ pub async fn setup_local_shards_update_listener(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::Instant;
 
-    use quickwit_cluster::{create_cluster_for_test, ChannelTransport};
-    use quickwit_common::rate_limiter::{RateLimiter, RateLimiterSettings};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use quickwit_cluster::{ChannelTransport, create_cluster_for_test};
     use quickwit_proto::ingest::ShardState;
-    use quickwit_proto::types::{queue_id, IndexUid, Position};
+    use quickwit_proto::types::{IndexUid, SourceId};
 
     use super::*;
     use crate::ingest_v2::models::IngesterShard;
-    use crate::ingest_v2::rate_meter::RateMeter;
     use crate::ingest_v2::state::IngesterState;
 
     #[test]
@@ -483,12 +459,12 @@ mod tests {
         assert_eq!(num_changes, 0);
 
         let previous_snapshot = LocalShardsSnapshot::default();
-        let index_uid = IndexUid::from_str("test-index:00000000000000000000000000").unwrap();
+        let index_uid = IndexUid::for_test("test-index", 0);
         let current_snapshot = LocalShardsSnapshot {
             per_source_shard_infos: vec![(
                 SourceUid {
                     index_uid: index_uid.clone(),
-                    source_id: "test-source".to_string(),
+                    source_id: SourceId::from("test-source"),
                 },
                 vec![ShardInfo {
                     shard_id: ShardId::from(1),
@@ -529,7 +505,7 @@ mod tests {
             per_source_shard_infos: vec![(
                 SourceUid {
                     index_uid: index_uid.clone(),
-                    source_id: "test-source".to_string(),
+                    source_id: SourceId::from("test-source"),
                 },
                 vec![ShardInfo {
                     shard_id: ShardId::from(1),
@@ -598,47 +574,33 @@ mod tests {
 
         let mut state_guard = state.lock_partially().await.unwrap();
 
-        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
-        let queue_id_00 = queue_id(&index_uid, "test-source", &ShardId::from(0));
+        let index_uid = IndexUid::for_test("test-index", 0);
         let shard_00 = IngesterShard::new_solo(
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            None,
-            Instant::now(),
-        );
-        state_guard.shards.insert(queue_id_00.clone(), shard_00);
+            index_uid.clone(),
+            SourceId::from("test-source"),
+            ShardId::from(0),
+        )
+        .build();
+        state_guard.shards.insert(shard_00.queue_id(), shard_00);
 
-        let queue_id_01 = queue_id(&index_uid, "test-source", &ShardId::from(1));
-        let mut shard_01 = IngesterShard::new_solo(
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            None,
-            Instant::now(),
-        );
-        shard_01.is_advertisable = true;
-        state_guard.shards.insert(queue_id_01.clone(), shard_01);
+        let shard_01 = IngesterShard::new_solo(
+            index_uid.clone(),
+            SourceId::from("test-source"),
+            ShardId::from(1),
+        )
+        .advertisable()
+        .build();
+        state_guard.shards.insert(shard_01.queue_id(), shard_01);
 
-        let queue_id_02 = queue_id(&index_uid, "test-source", &ShardId::from(2));
-        let mut shard_02 = IngesterShard::new_replica(
+        let shard_02 = IngesterShard::new_replica(
+            index_uid.clone(),
+            SourceId::from("test-source"),
+            ShardId::from(2),
             NodeId::from("test-leader"),
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            Instant::now(),
-        );
-        shard_02.is_advertisable = true;
-        state_guard.shards.insert(queue_id_02.clone(), shard_02);
-
-        for queue_id in [queue_id_00, queue_id_01, queue_id_02] {
-            let rate_limiter = RateLimiter::from_settings(RateLimiterSettings::default());
-            let rate_meter = RateMeter::default();
-
-            state_guard
-                .rate_trackers
-                .insert(queue_id, (rate_limiter, rate_meter));
-        }
+        )
+        .advertisable()
+        .build();
+        state_guard.shards.insert(shard_02.queue_id(), shard_02);
         drop(state_guard);
 
         let new_snapshot = task.snapshot_local_shards().await.unwrap();
@@ -668,7 +630,7 @@ mod tests {
     fn test_make_key() {
         let source_uid = SourceUid {
             index_uid: IndexUid::for_test("test-index", 0),
-            source_id: "test-source".to_string(),
+            source_id: SourceId::from("test-source"),
         };
         let key = make_key(&source_uid);
         assert_eq!(
@@ -698,7 +660,7 @@ mod tests {
 
         let local_shards_update_counter = Arc::new(AtomicUsize::new(0));
         let local_shards_update_counter_clone = local_shards_update_counter.clone();
-        let index_uid = IndexUid::from_str("test-index:00000000000000000000000000").unwrap();
+        let index_uid = IndexUid::for_test("test-index", 0);
 
         let index_uid_clone = index_uid.clone();
         event_broker
@@ -722,7 +684,7 @@ mod tests {
 
         let source_uid = SourceUid {
             index_uid: index_uid.clone(),
-            source_id: "test-source".to_string(),
+            source_id: SourceId::from("test-source"),
         };
         let key = make_key(&source_uid);
         let value = serde_json::to_string(&vec![ShardInfo {
@@ -744,20 +706,23 @@ mod tests {
         let mut time_series = ShardThroughputTimeSeries::default();
         assert_eq!(time_series.last(), ByteSize::mb(0));
         assert_eq!(time_series.average(), ByteSize::mb(0));
+
         time_series.record(ByteSize::mb(2));
         assert_eq!(time_series.last(), ByteSize::mb(2));
         assert_eq!(time_series.average(), ByteSize::mb(2));
+
         time_series.record(ByteSize::mb(1));
         assert_eq!(time_series.last(), ByteSize::mb(1));
         assert_eq!(time_series.average(), ByteSize::kb(1500));
+
         time_series.record(ByteSize::mb(3));
         assert_eq!(time_series.last(), ByteSize::mb(3));
         assert_eq!(time_series.average(), ByteSize::mb(2));
+
         for _ in 0..SHARD_THROUGHPUT_LONG_TERM_WINDOW_LEN {
             time_series.record(ByteSize::mb(4));
             assert_eq!(time_series.last(), ByteSize::mb(4));
         }
-
         assert_eq!(time_series.last(), ByteSize::mb(4));
     }
 }

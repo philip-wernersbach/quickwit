@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -23,7 +18,7 @@ use std::time::Duration;
 use fnv::FnvHashMap;
 use futures::{Stream, StreamExt};
 use quickwit_actors::{Inbox, Mailbox, Observe, Universe};
-use quickwit_cluster::{create_cluster_for_test, ChannelTransport, Cluster, ClusterChange};
+use quickwit_cluster::{ChannelTransport, Cluster, ClusterChange, create_cluster_for_test};
 use quickwit_common::test_utils::wait_until_predicate;
 use quickwit_common::tower::{Change, Pool};
 use quickwit_config::service::QuickwitService;
@@ -39,13 +34,16 @@ use quickwit_proto::metastore::{
 use quickwit_proto::types::NodeId;
 use serde_json::json;
 
-use crate::control_plane::{ControlPlane, CONTROL_PLAN_LOOP_INTERVAL};
-use crate::indexing_scheduler::MIN_DURATION_BETWEEN_SCHEDULING;
 use crate::IndexerNodeInfo;
+use crate::control_plane::{CONTROL_PLAN_LOOP_INTERVAL, ControlPlane};
+use crate::indexing_scheduler::MIN_DURATION_BETWEEN_SCHEDULING;
 
 fn index_metadata_for_test(index_id: &str, source_id: &str, num_pipelines: usize) -> IndexMetadata {
     let mut index_metadata = IndexMetadata::for_test(index_id, "ram://indexes/test-index");
-    let source_config = SourceConfig {
+    let ingest_source_config = SourceConfig::ingest_v2();
+    index_metadata.add_source(ingest_source_config).unwrap();
+
+    let kafka_source_config = SourceConfig {
         enabled: true,
         source_id: source_id.to_string(),
         num_pipelines: NonZeroUsize::new(num_pipelines).unwrap(),
@@ -60,9 +58,7 @@ fn index_metadata_for_test(index_id: &str, source_id: &str, num_pipelines: usize
         transform_config: None,
         input_format: SourceInputFormat::Json,
     };
-    index_metadata
-        .sources
-        .insert(source_id.to_string(), source_config);
+    index_metadata.add_source(kafka_source_config).unwrap();
     index_metadata
 }
 
@@ -391,7 +387,7 @@ async fn test_scheduler_scheduling_multiple_indexers() {
     assert_eq!(scheduler_state.num_schedule_indexing_plan, 1);
 
     // Shutdown cluster and wait until the new scheduling.
-    cluster_indexer_2.shutdown().await;
+    cluster_indexer_2.leave().await;
 
     cluster
         .wait_for_ready_members(

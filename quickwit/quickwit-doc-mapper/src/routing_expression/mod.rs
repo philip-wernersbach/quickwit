@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::borrow::Cow;
 use std::fmt::{self, Display};
@@ -360,8 +355,8 @@ mod expression_dsl {
     use nom::combinator::{eof, map, opt};
     use nom::error::ErrorKind;
     use nom::multi::separated_list0;
-    use nom::sequence::{delimited, tuple};
-    use nom::{AsChar, Finish, IResult, InputTakeAtPosition};
+    use nom::sequence::delimited;
+    use nom::{AsChar, Finish, IResult, Input, Parser};
 
     // this is a RoutingSubExpr in our DSL.
     #[derive(Debug, PartialEq, Eq, Clone)]
@@ -388,7 +383,7 @@ mod expression_dsl {
     // tag, but ignore leading and trailing whitespaces
     pub fn wtag<'a, Error: nom::error::ParseError<&'a str>>(
         t: &'a str,
-    ) -> impl FnMut(&'a str) -> IResult<&'a str, &'a str, Error> {
+    ) -> impl Parser<&'a str, Output = &'a str, Error = Error> {
         delimited(multispace0, tag(t), multispace0)
     }
 
@@ -406,13 +401,13 @@ mod expression_dsl {
 
     /// An entire routing expression, containing comma separated routing sub-expressions
     fn routing_expr(input: &str) -> IResult<&str, Vec<ExpressionAst>> {
-        separated_list0(wtag(","), routing_sub_expr)(input)
+        separated_list0(wtag(","), routing_sub_expr).parse(input)
     }
 
     /// A sub-part of a routing expression
     fn routing_sub_expr(input: &str) -> IResult<&str, ExpressionAst> {
         let (input, identifier) = identifier(input)?;
-        let (input, args) = opt(tuple((wtag("("), arguments, wtag(")"))))(input)?;
+        let (input, args) = opt((wtag("("), arguments, wtag(")"))).parse(input)?;
         let res = if let Some((_, args, _)) = args {
             ExpressionAst::Function {
                 name: identifier.to_owned(),
@@ -435,15 +430,14 @@ mod expression_dsl {
 
     /// Arguments for a function
     fn arguments(input: &str) -> IResult<&str, Vec<Argument>> {
-        separated_list0(wtag(","), argument)(input)
+        separated_list0(wtag(","), argument).parse(input)
     }
 
     /// A single argument for a function
     fn argument(input: &str) -> IResult<&str, Argument> {
         if let Ok((input, number)) = number(input) {
             Ok((input, Argument::Number(number)))
-        } else if let Ok((input, (_, arg, _))) = tuple((wtag("("), routing_expr, wtag(")")))(input)
-        {
+        } else if let Ok((input, (_, arg, _))) = (wtag("("), routing_expr, wtag(")")).parse(input) {
             Ok((input, Argument::Expression(arg)))
         } else {
             routing_sub_expr(input).map(|(input, arg)| (input, Argument::Expression(vec![arg])))
@@ -467,19 +461,21 @@ mod expression_dsl {
     }
 
     /// Parse a single path component, separated by dots. De-escape any escaped dot it may contain.
-    fn escaped_key(input: &str) -> IResult<&str, Cow<str>> {
+    fn escaped_key(input: &str) -> IResult<&str, Cow<'_, str>> {
         map(escaped(key_identifier, '\\', tag(".")), |s: &str| {
             if s.contains("\\.") {
                 Cow::Owned(s.replace("\\.", "."))
             } else {
                 Cow::Borrowed(s)
             }
-        })(input)
+        })
+        .parse(input)
     }
 
     /// Parse a field name into a path, de-escaping where appropriate.
-    pub(crate) fn parse_field_name(input: &str) -> anyhow::Result<Vec<Cow<str>>> {
-        let (i, res) = separated_list0(tag("."), escaped_key)(input)
+    pub(crate) fn parse_field_name(input: &str) -> anyhow::Result<Vec<Cow<'_, str>>> {
+        let (i, res) = separated_list0(tag("."), escaped_key)
+            .parse(input)
             .finish()
             .map_err(|e| anyhow::anyhow!("error parsing key expression: {e}"))?;
         eof::<_, ()>(i)?;

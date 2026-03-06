@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 
@@ -27,16 +22,18 @@ use quickwit_proto::metastore::{
     CreateIndexResponse, CreateIndexTemplateRequest, DeleteIndexRequest,
     DeleteIndexTemplatesRequest, DeleteQuery, DeleteShardsRequest, DeleteShardsResponse,
     DeleteSourceRequest, DeleteSplitsRequest, DeleteTask, EmptyResponse,
-    FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetIndexTemplateRequest,
-    GetIndexTemplateResponse, IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataRequest,
-    IndexesMetadataResponse, LastDeleteOpstampRequest, LastDeleteOpstampResponse,
-    ListDeleteTasksRequest, ListDeleteTasksResponse, ListIndexTemplatesRequest,
-    ListIndexTemplatesResponse, ListIndexesMetadataRequest, ListIndexesMetadataResponse,
-    ListShardsRequest, ListShardsResponse, ListSplitsRequest, ListSplitsResponse,
-    ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreResult, MetastoreService,
-    MetastoreServiceClient, MetastoreServiceStream, OpenShardsRequest, OpenShardsResponse,
-    PublishSplitsRequest, ResetSourceCheckpointRequest, StageSplitsRequest, ToggleSourceRequest,
-    UpdateIndexRequest, UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse,
+    FindIndexTemplateMatchesRequest, FindIndexTemplateMatchesResponse, GetClusterIdentityRequest,
+    GetClusterIdentityResponse, GetIndexTemplateRequest, GetIndexTemplateResponse,
+    IndexMetadataRequest, IndexMetadataResponse, IndexesMetadataRequest, IndexesMetadataResponse,
+    LastDeleteOpstampRequest, LastDeleteOpstampResponse, ListDeleteTasksRequest,
+    ListDeleteTasksResponse, ListIndexStatsRequest, ListIndexStatsResponse,
+    ListIndexTemplatesRequest, ListIndexTemplatesResponse, ListIndexesMetadataRequest,
+    ListIndexesMetadataResponse, ListShardsRequest, ListShardsResponse, ListSplitsRequest,
+    ListSplitsResponse, ListStaleSplitsRequest, MarkSplitsForDeletionRequest, MetastoreResult,
+    MetastoreService, MetastoreServiceClient, MetastoreServiceStream, OpenShardsRequest,
+    OpenShardsResponse, PruneShardsRequest, PublishSplitsRequest, ResetSourceCheckpointRequest,
+    StageSplitsRequest, ToggleSourceRequest, UpdateIndexRequest, UpdateSourceRequest,
+    UpdateSplitsDeleteOpstampRequest, UpdateSplitsDeleteOpstampResponse,
 };
 
 /// A [`MetastoreService`] implementation that proxies some requests to the control plane so it can
@@ -86,11 +83,6 @@ impl MetastoreService for ControlPlaneMetastore {
         Ok(response)
     }
 
-    // Technically, proxying this call via the control plane is not necessary at the moment because
-    // it does not modify attributes the control plane cares about (retention policy, search
-    // settings). However, it would be easy to forget to do so when we add the ability to update the
-    // doc mapping or merge policy of an index, so we've already set up the proxy here since calling
-    // `update_index` is very infrequent anyway.
     async fn update_index(
         &self,
         request: UpdateIndexRequest,
@@ -109,14 +101,25 @@ impl MetastoreService for ControlPlaneMetastore {
         Ok(response)
     }
 
+    async fn update_source(&self, request: UpdateSourceRequest) -> MetastoreResult<EmptyResponse> {
+        let response = self.control_plane.update_source(request).await?;
+        Ok(response)
+    }
+
     async fn toggle_source(&self, request: ToggleSourceRequest) -> MetastoreResult<EmptyResponse> {
-        let response = self.control_plane.clone().toggle_source(request).await?;
+        let response = self.control_plane.toggle_source(request).await?;
         Ok(response)
     }
 
     async fn delete_source(&self, request: DeleteSourceRequest) -> MetastoreResult<EmptyResponse> {
         let response = self.control_plane.delete_source(request).await?;
         Ok(response)
+    }
+
+    // Proxy through the control plane to debounce queries
+    async fn prune_shards(&self, request: PruneShardsRequest) -> MetastoreResult<EmptyResponse> {
+        self.control_plane.prune_shards(request).await?;
+        Ok(EmptyResponse {})
     }
 
     // Other metastore API calls.
@@ -158,6 +161,13 @@ impl MetastoreService for ControlPlaneMetastore {
         request: ListSplitsRequest,
     ) -> MetastoreResult<MetastoreServiceStream<ListSplitsResponse>> {
         self.metastore.list_splits(request).await
+    }
+
+    async fn list_index_stats(
+        &self,
+        request: ListIndexStatsRequest,
+    ) -> MetastoreResult<ListIndexStatsResponse> {
+        self.metastore.list_index_stats(request).await
     }
 
     async fn list_stale_splits(
@@ -271,5 +281,12 @@ impl MetastoreService for ControlPlaneMetastore {
         request: DeleteIndexTemplatesRequest,
     ) -> MetastoreResult<EmptyResponse> {
         self.metastore.delete_index_templates(request).await
+    }
+
+    async fn get_cluster_identity(
+        &self,
+        request: GetClusterIdentityRequest,
+    ) -> MetastoreResult<GetClusterIdentityResponse> {
+        self.metastore.get_cluster_identity(request).await
     }
 }

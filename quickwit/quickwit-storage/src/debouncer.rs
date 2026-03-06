@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 use std::hash::Hash;
@@ -79,10 +74,10 @@ impl<K: Hash + Eq + Clone, V: Clone> AsyncDebouncer<K, V> {
 
         // explicit scope to drop the lock
         let weak_fut_opt = { self.cache.lock().unwrap().get(&key).cloned() };
-        if let Some(weak_future) = weak_fut_opt {
-            if let Some(future) = weak_future.upgrade() {
-                return future.await;
-            }
+        if let Some(weak_future) = weak_fut_opt
+            && let Some(future) = weak_future.upgrade()
+        {
+            return future.await;
         }
 
         let fut = Box::pin(build_a_future()) as BoxFuture<'static, V>;
@@ -206,8 +201,8 @@ mod tests {
 
     use std::ops::Range;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use once_cell::sync::OnceCell;

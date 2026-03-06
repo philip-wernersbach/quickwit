@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! # Sources
 //!
@@ -90,7 +85,7 @@ pub use gcp_pubsub_source::{GcpPubSubSource, GcpPubSubSourceFactory};
 pub use kafka_source::{KafkaSource, KafkaSourceFactory};
 #[cfg(feature = "kinesis")]
 pub use kinesis::kinesis_source::{KinesisSource, KinesisSourceFactory};
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 #[cfg(feature = "pulsar")]
 pub use pulsar_source::{PulsarSource, PulsarSourceFactory};
 #[cfg(feature = "sqs")]
@@ -103,8 +98,8 @@ use quickwit_config::{
     FileSourceNotification, FileSourceParams, IndexingSettings, SourceConfig, SourceParams,
 };
 use quickwit_ingest::IngesterPool;
-use quickwit_metastore::checkpoint::{SourceCheckpoint, SourceCheckpointDelta};
 use quickwit_metastore::IndexMetadataResponseExt;
+use quickwit_metastore::checkpoint::{SourceCheckpoint, SourceCheckpointDelta};
 use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_proto::metastore::{
     IndexMetadataRequest, MetastoreError, MetastoreResult, MetastoreService,
@@ -120,6 +115,7 @@ pub use vec_source::{VecSource, VecSourceFactory};
 pub use void_source::{VoidSource, VoidSourceFactory};
 
 use self::doc_file_reader::dir_and_filename;
+use self::stdin_source::StdinSourceFactory;
 use crate::actors::DocProcessor;
 use crate::models::RawDocBatch;
 use crate::source::ingest::IngestSourceFactory;
@@ -138,7 +134,19 @@ use crate::source::ingest_api_source::IngestApiSourceFactory;
 /// 5MB seems like a good one size fits all value.
 const BATCH_NUM_BYTES_LIMIT: u64 = ByteSize::mib(5).as_u64();
 
-const EMIT_BATCHES_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 1_000 });
+static EMIT_BATCHES_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
+    if cfg!(any(test, feature = "testsuite")) {
+        let timeout = Duration::from_millis(100);
+        assert!(timeout < *quickwit_actors::HEARTBEAT);
+        timeout
+    } else {
+        let timeout = Duration::from_millis(1_000);
+        if *quickwit_actors::HEARTBEAT < timeout {
+            error!("QW_ACTOR_HEARTBEAT_SECS smaller than batch timeout");
+        }
+        timeout
+    }
+});
 
 /// Runtime configuration used during execution of a source actor.
 #[derive(Clone)]
@@ -408,6 +416,7 @@ pub fn quickwit_supported_sources() -> &'static SourceLoader {
         source_factory.add_source(SourceType::Kinesis, KinesisSourceFactory);
         #[cfg(feature = "pulsar")]
         source_factory.add_source(SourceType::Pulsar, PulsarSourceFactory);
+        source_factory.add_source(SourceType::Stdin, StdinSourceFactory);
         source_factory.add_source(SourceType::Vec, VecSourceFactory);
         source_factory.add_source(SourceType::Void, VoidSourceFactory);
         source_factory
@@ -564,8 +573,8 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use quickwit_config::{SourceInputFormat, VecSourceParams};
-    use quickwit_metastore::checkpoint::IndexCheckpointDelta;
     use quickwit_metastore::IndexMetadata;
+    use quickwit_metastore::checkpoint::IndexCheckpointDelta;
     use quickwit_proto::metastore::{IndexMetadataResponse, MockMetastoreService};
     use quickwit_proto::types::NodeId;
 
@@ -615,7 +624,10 @@ mod tests {
             }
         }
 
-        #[cfg(any(feature = "kafka", feature = "sqs"))]
+        #[cfg(all(
+            test,
+            any(feature = "kafka-broker-tests", feature = "sqs-localstack-tests")
+        ))]
         pub fn with_metastore(mut self, metastore: MetastoreServiceClient) -> Self {
             self.metastore_opt = Some(metastore);
             self
@@ -673,7 +685,7 @@ mod tests {
         {
             let source_config = SourceConfig {
                 source_id: "void".to_string(),
-                num_pipelines: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::MIN,
                 enabled: true,
                 source_params: SourceParams::void(),
                 transform_config: None,
@@ -684,7 +696,7 @@ mod tests {
         {
             let source_config = SourceConfig {
                 source_id: "vec".to_string(),
-                num_pipelines: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::MIN,
                 enabled: true,
                 source_params: SourceParams::Vec(VecSourceParams::default()),
                 transform_config: None,
@@ -695,7 +707,7 @@ mod tests {
         {
             let source_config = SourceConfig {
                 source_id: "file".to_string(),
-                num_pipelines: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::MIN,
                 enabled: true,
                 source_params: SourceParams::file_from_str("file-does-not-exist.json").unwrap(),
                 transform_config: None,
@@ -710,7 +722,7 @@ mod tests {
         {
             let source_config = SourceConfig {
                 source_id: "file".to_string(),
-                num_pipelines: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::MIN,
                 enabled: true,
                 source_params: SourceParams::file_from_str("data/test_corpus.json").unwrap(),
                 transform_config: None,
@@ -728,7 +740,11 @@ mod tests {
 
 #[cfg(all(
     test,
-    any(feature = "sqs-localstack-tests", feature = "kafka-broker-tests")
+    any(
+        feature = "sqs-localstack-tests",
+        feature = "kafka-broker-tests",
+        feature = "pulsar-broker-tests"
+    )
 ))]
 mod test_setup_helper {
 
@@ -751,7 +767,7 @@ mod test_setup_helper {
         let index_config = IndexConfig::for_test(index_id, &index_uri);
         let create_index_request = CreateIndexRequest::try_from_index_and_source_configs(
             &index_config,
-            &[source_config.clone()],
+            std::slice::from_ref(source_config),
         )
         .unwrap();
         let index_uid: IndexUid = metastore

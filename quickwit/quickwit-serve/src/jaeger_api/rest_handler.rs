@@ -1,26 +1,20 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use hyper::StatusCode;
 use itertools::Itertools;
 use quickwit_jaeger::JaegerService;
 use quickwit_proto::jaeger::storage::v1::{
@@ -28,21 +22,22 @@ use quickwit_proto::jaeger::storage::v1::{
     SpansResponseChunk, TraceQueryParameters,
 };
 use quickwit_proto::tonic;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
+use warp::hyper::StatusCode;
 use warp::{Filter, Rejection};
 
 use super::model::build_jaeger_traces;
 use super::parse_duration::{parse_duration_with_units, to_well_known_timestamp};
 use crate::jaeger_api::model::{
-    JaegerError, JaegerResponseBody, JaegerSpan, JaegerTrace, TracesSearchQueryParams,
-    DEFAULT_NUMBER_OF_TRACES,
+    DEFAULT_NUMBER_OF_TRACES, JaegerError, JaegerResponseBody, JaegerSpan, JaegerTrace,
+    TracesSearchQueryParams,
 };
 use crate::rest::recover_fn;
 use crate::rest_api_response::RestApiResponse;
 use crate::search_api::extract_index_id_patterns;
-use crate::{require, BodyFormat};
+use crate::{BodyFormat, require};
 
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(
@@ -57,7 +52,7 @@ pub(crate) struct JaegerApi;
 ///
 /// This is where all Jaeger handlers
 /// should be registered.
-/// Request are executed on the `otel traces v0_7` index.
+/// Request are executed on the `otel-traces-v0_*` indexes.
 pub(crate) fn jaeger_api_handlers(
     jaeger_service_opt: Option<JaegerService>,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
@@ -68,6 +63,7 @@ pub(crate) fn jaeger_api_handlers(
         .or(jaeger_traces_search_handler(jaeger_service_opt.clone()))
         .or(jaeger_traces_handler(jaeger_service_opt.clone()))
         .recover(recover_fn)
+        .boxed()
 }
 
 fn jaeger_api_path_filter() -> impl Filter<Extract = (Vec<String>,), Error = Rejection> + Clone {
@@ -143,7 +139,7 @@ pub fn jaeger_traces_search_handler(
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Rejection> + Clone {
     jaeger_api_path_filter()
         .and(warp::path!("traces"))
-        .and(serde_qs::warp::query(serde_qs::Config::default()))
+        .and(warp::query())
         .and(require(jaeger_service_opt))
         .then(jaeger_traces_search)
         .map(|result| make_jaeger_api_response(result, BodyFormat::default()))
@@ -181,7 +177,7 @@ async fn jaeger_services(
         .await
         .map_err(|error| JaegerError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("failed to fetch services: {}", error),
+            message: format!("failed to fetch services: {error}"),
         })?;
     Ok(JaegerResponseBody::<Vec<String>> {
         data: get_services_response.services,
@@ -248,8 +244,12 @@ async fn jaeger_traces_search(
         service_name: search_params.service.unwrap_or_default(),
         operation_name: search_params.operation.unwrap_or_default(),
         tags,
-        start_time_min: search_params.start.map(to_well_known_timestamp),
-        start_time_max: search_params.end.map(to_well_known_timestamp),
+        start_time_min: search_params
+            .start
+            .map(|ts| to_well_known_timestamp(ts * 1000)),
+        start_time_max: search_params
+            .end
+            .map(|ts| to_well_known_timestamp(ts * 1000)),
         duration_min,
         duration_max,
         num_traces: search_params.limit.unwrap_or(DEFAULT_NUMBER_OF_TRACES),
@@ -261,6 +261,7 @@ async fn jaeger_traces_search(
             "find_traces",
             Instant::now(),
             index_id_patterns,
+            true,
         )
         .await
         .map_err(|error| {
@@ -353,7 +354,7 @@ mod tests {
     async fn test_when_jaeger_not_found() {
         let jaeger_api_handler = jaeger_api_handlers(None).recover(crate::rest::recover_fn_final);
         let resp = warp::test::request()
-            .path("/otel-traces-v0_7/jaeger/api/services")
+            .path("/otel-traces-v0_9/jaeger/api/services")
             .reply(&jaeger_api_handler)
             .await;
         assert_eq!(resp.status(), 404);
@@ -385,17 +386,19 @@ mod tests {
 
         let jaeger_api_handler = jaeger_api_handlers(Some(jaeger)).recover(recover_fn);
         let resp = warp::test::request()
-            .path("/otel-traces-v0_7/jaeger/api/services")
+            .path("/otel-traces-v0_9/jaeger/api/services")
             .reply(&jaeger_api_handler)
             .await;
         assert_eq!(resp.status(), 200);
         let actual_response_json: JsonValue = serde_json::from_slice(resp.body())?;
-        assert!(actual_response_json
-            .get("data")
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            actual_response_json
+                .get("data")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -421,17 +424,19 @@ mod tests {
         let jaeger = JaegerService::new(JaegerConfig::default(), mock_search_service);
         let jaeger_api_handler = jaeger_api_handlers(Some(jaeger)).recover(recover_fn);
         let resp = warp::test::request()
-            .path("/otel-traces-v0_7/jaeger/api/services/service1/operations")
+            .path("/otel-traces-v0_9/jaeger/api/services/service1/operations")
             .reply(&jaeger_api_handler)
             .await;
         assert_eq!(resp.status(), 200);
         let actual_response_json: JsonValue = serde_json::from_slice(resp.body()).unwrap();
-        assert!(actual_response_json
-            .get("data")
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            actual_response_json
+                .get("data")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -448,6 +453,18 @@ mod tests {
                     "{\"type\":\"term\",\"field\":\"resource_attributes.tag.second\",\"value\":\"\
                      true\"}"
                 ));
+                assert!(req.query_ast.contains(
+                    "{\"type\":\"term\",\"field\":\"resource_attributes.tag.second\",\"value\":\"\
+                     true\"}"
+                ));
+                // no lowerbound because minDuration < 1ms,
+                assert!(req.query_ast.contains(
+                    "{\"type\":\"range\",\"field\":\"span_duration_millis\",\"lower_bound\":\"\
+                     Unbounded\",\"upper_bound\":{\"Included\":1200}}"
+                ));
+                assert_eq!(req.start_timestamp, Some(1702352106));
+                // TODO(trinity) i think we have an off by 1 here, imo this should be rounded up
+                assert_eq!(req.end_timestamp, Some(1702373706));
                 assert_eq!(
                     req.index_id_patterns,
                     vec![OTEL_TRACES_INDEX_ID.to_string()]
@@ -460,8 +477,10 @@ mod tests {
                     hits: Vec::new(),
                     elapsed_time_micros: 0,
                     errors: Vec::new(),
-                    aggregation: None,
+                    aggregation_postcard: None,
                     scroll_id: None,
+                    failed_splits: Vec::new(),
+                    num_successful_splits: 1,
                 })
             });
         let mock_search_service = Arc::new(mock_search_service);
@@ -469,7 +488,7 @@ mod tests {
         let jaeger_api_handler = jaeger_api_handlers(Some(jaeger)).recover(recover_fn);
         let resp = warp::test::request()
             .path(
-                "/otel-traces-v0_7/jaeger/api/traces?service=quickwit&\
+                "/otel-traces-v0_9/jaeger/api/traces?service=quickwit&\
                  operation=delete_splits_marked_for_deletion&minDuration=500us&maxDuration=1.2s&\
                  tags=%7B%22tag.first%22%3A%22common%22%2C%22tag.second%22%3A%22true%22%7D&\
                  limit=1&start=1702352106016000&end=1702373706016000&lookback=custom",
@@ -491,8 +510,10 @@ mod tests {
                     hits: Vec::new(),
                     elapsed_time_micros: 0,
                     errors: Vec::new(),
-                    aggregation: None,
+                    aggregation_postcard: None,
                     scroll_id: None,
+                    failed_splits: Vec::new(),
+                    num_successful_splits: 1,
                 })
             });
         let mock_search_service = Arc::new(mock_search_service);
@@ -500,17 +521,19 @@ mod tests {
 
         let jaeger_api_handler = jaeger_api_handlers(Some(jaeger)).recover(recover_fn);
         let resp = warp::test::request()
-            .path("/otel-traces-v0_7/jaeger/api/traces/1506026ddd216249555653218dc88a6c")
+            .path("/otel-traces-v0_9/jaeger/api/traces/1506026ddd216249555653218dc88a6c")
             .reply(&jaeger_api_handler)
             .await;
 
         assert_eq!(resp.status(), 200);
         let actual_response_json: JsonValue = serde_json::from_slice(resp.body()).unwrap();
-        assert!(actual_response_json
-            .get("data")
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            actual_response_json
+                .get("data")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -24,13 +19,14 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use quickwit_actors::{
-    Actor, ActorContext, ActorExitStatus, ActorHandle, Handler, Health, Mailbox, QueueCapacity,
-    Supervisable, HEARTBEAT,
+    Actor, ActorContext, ActorExitStatus, ActorHandle, HEARTBEAT, Handler, Health, Mailbox,
+    QueueCapacity, Supervisable,
 };
+use quickwit_common::KillSwitch;
+use quickwit_common::metrics::OwnedGaugeGuard;
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::temp_dir::TempDirectory;
-use quickwit_common::KillSwitch;
-use quickwit_config::{IndexingSettings, SourceConfig};
+use quickwit_config::{IndexingSettings, RetentionPolicy, SourceConfig};
 use quickwit_doc_mapper::DocMapper;
 use quickwit_ingest::IngesterPool;
 use quickwit_proto::indexing::IndexingPipelineId;
@@ -41,6 +37,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, instrument};
 
 use super::MergePlanner;
+use crate::SplitsUpdateMailbox;
 use crate::actors::doc_processor::DocProcessor;
 use crate::actors::index_serializer::IndexSerializer;
 use crate::actors::publisher::PublisherType;
@@ -50,10 +47,9 @@ use crate::actors::{Indexer, Packager, Publisher, Uploader};
 use crate::merge_policy::MergePolicy;
 use crate::models::IndexingStatistics;
 use crate::source::{
-    quickwit_supported_sources, AssignShards, Assignment, SourceActor, SourceRuntime,
+    AssignShards, Assignment, SourceActor, SourceRuntime, quickwit_supported_sources,
 };
 use crate::split_store::IndexingSplitStore;
-use crate::SplitsUpdateMailbox;
 
 const SUPERVISE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -120,10 +116,12 @@ pub struct IndexingPipeline {
     handles_opt: Option<IndexingPipelineHandles>,
     // Killswitch used for the actors in the pipeline. This is not the supervisor killswitch.
     kill_switch: KillSwitch,
+
     // The set of shard is something that can change dynamically without necessarily
     // requiring a respawn of the pipeline.
     // We keep the list of shards here however, to reassign them after a respawn.
     shard_ids: BTreeSet<ShardId>,
+    _indexing_pipelines_gauge_guard: OwnedGaugeGuard,
 }
 
 #[async_trait]
@@ -158,13 +156,22 @@ impl Actor for IndexingPipeline {
 
 impl IndexingPipeline {
     pub fn new(params: IndexingPipelineParams) -> Self {
+        let indexing_pipelines_gauge = crate::metrics::INDEXER_METRICS
+            .indexing_pipelines
+            .with_label_values([&params.pipeline_id.index_uid.index_id]);
+        let indexing_pipelines_gauge_guard = OwnedGaugeGuard::from_gauge(indexing_pipelines_gauge);
+        let params_fingerprint = params.params_fingerprint;
         IndexingPipeline {
             params,
             previous_generations_statistics: Default::default(),
             handles_opt: None,
             kill_switch: KillSwitch::default(),
-            statistics: IndexingStatistics::default(),
+            statistics: IndexingStatistics {
+                params_fingerprint,
+                ..Default::default()
+            },
             shard_ids: Default::default(),
+            _indexing_pipelines_gauge_guard: indexing_pipelines_gauge_guard,
         }
     }
 
@@ -264,6 +271,7 @@ impl IndexingPipeline {
             .set_num_spawn_attempts(self.statistics.num_spawn_attempts);
         let pipeline_metrics_opt = handles.indexer.last_observation().pipeline_metrics_opt;
         self.statistics.pipeline_metrics_opt = pipeline_metrics_opt;
+        self.statistics.params_fingerprint = self.params.params_fingerprint;
         self.statistics.shard_ids.clone_from(&self.shard_ids);
         ctx.observe(self);
     }
@@ -303,7 +311,7 @@ impl IndexingPipeline {
         skip_all,
         fields(
             index=%self.params.pipeline_id.index_uid.index_id,
-            gen=self.generation()
+            r#gen=self.generation()
         ))]
     async fn spawn_pipeline(&mut self, ctx: &ActorContext<Self>) -> anyhow::Result<()> {
         let _spawn_pipeline_permit = ctx
@@ -361,6 +369,7 @@ impl IndexingPipeline {
             UploaderType::IndexUploader,
             self.params.metastore.clone(),
             self.params.merge_policy.clone(),
+            self.params.retention_policy.clone(),
             self.params.split_store.clone(),
             SplitsUpdateMailbox::Sequencer(sequencer_mailbox),
             self.params.max_concurrent_split_uploads_index,
@@ -570,7 +579,7 @@ pub struct IndexingPipelineParams {
     pub storage: Arc<dyn Storage>,
 
     // Indexing-related parameters
-    pub doc_mapper: Arc<dyn DocMapper>,
+    pub doc_mapper: Arc<DocMapper>,
     pub indexing_directory: TempDirectory,
     pub indexing_settings: IndexingSettings,
     pub split_store: IndexingSplitStore,
@@ -579,6 +588,7 @@ pub struct IndexingPipelineParams {
 
     // Merge-related parameters
     pub merge_policy: Arc<dyn MergePolicy>,
+    pub retention_policy: Option<RetentionPolicy>,
     pub merge_planner_mailbox: Mailbox<MergePlanner>,
     pub max_concurrent_split_uploads_merge: usize,
 
@@ -587,6 +597,7 @@ pub struct IndexingPipelineParams {
     pub source_storage_resolver: StorageResolver,
     pub ingester_pool: IngesterPool,
     pub queues_dir_path: PathBuf,
+    pub params_fingerprint: u64,
 
     pub event_broker: EventBroker,
 }
@@ -600,7 +611,7 @@ mod tests {
     use quickwit_actors::{Command, Universe};
     use quickwit_common::ServiceStream;
     use quickwit_config::{IndexingSettings, SourceInputFormat, SourceParams};
-    use quickwit_doc_mapper::{default_doc_mapper_for_test, DefaultDocMapper};
+    use quickwit_doc_mapper::{DocMapper, default_doc_mapper_for_test};
     use quickwit_metastore::checkpoint::IndexCheckpointDelta;
     use quickwit_metastore::{IndexMetadata, IndexMetadataResponseExt, PublishSplitsRequestExt};
     use quickwit_proto::metastore::{
@@ -710,18 +721,30 @@ mod tests {
             storage,
             split_store,
             merge_policy: default_merge_policy(),
+            retention_policy: None,
             queues_dir_path: PathBuf::from("./queues"),
             max_concurrent_split_uploads_index: 4,
             max_concurrent_split_uploads_merge: 5,
             cooperative_indexing_permits: None,
             merge_planner_mailbox,
             event_broker: EventBroker::default(),
+            params_fingerprint: 42u64,
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
         let (_pipeline_mailbox, pipeline_handle) = universe.spawn_builder().spawn(pipeline);
         let (pipeline_exit_status, pipeline_statistics) = pipeline_handle.join().await;
-        assert_eq!(pipeline_statistics.generation, 1);
-        assert_eq!(pipeline_statistics.num_spawn_attempts, 1 + num_fails);
+        assert_eq!(
+            pipeline_statistics.generation, 1,
+            "generation is {}, expected 1",
+            pipeline_statistics.generation
+        );
+        assert_eq!(
+            pipeline_statistics.num_spawn_attempts,
+            1 + num_fails,
+            "num spawn attempts is {}, expected 1 + {}",
+            pipeline_statistics.num_spawn_attempts,
+            1 + num_fails
+        );
         assert!(pipeline_exit_status.is_success());
         Ok(())
     }
@@ -823,11 +846,13 @@ mod tests {
             storage,
             split_store,
             merge_policy: default_merge_policy(),
+            retention_policy: None,
             max_concurrent_split_uploads_index: 4,
             max_concurrent_split_uploads_merge: 5,
             cooperative_indexing_permits: None,
             merge_planner_mailbox,
             event_broker: Default::default(),
+            params_fingerprint: 42u64,
         };
         let pipeline = IndexingPipeline::new(pipeline_params);
         let (_pipeline_mailbox, pipeline_handler) = universe.spawn_builder().spawn(pipeline);
@@ -899,6 +924,7 @@ mod tests {
             metastore: metastore.clone(),
             split_store: split_store.clone(),
             merge_policy: default_merge_policy(),
+            retention_policy: None,
             max_concurrent_split_uploads: 2,
             merge_io_throughput_limiter_opt: None,
             merge_scheduler_service: universe.get_or_spawn_one(),
@@ -921,11 +947,13 @@ mod tests {
             storage,
             split_store,
             merge_policy: default_merge_policy(),
+            retention_policy: None,
             max_concurrent_split_uploads_index: 4,
             max_concurrent_split_uploads_merge: 5,
             cooperative_indexing_permits: None,
             merge_planner_mailbox: merge_planner_mailbox.clone(),
             event_broker: Default::default(),
+            params_fingerprint: 42u64,
         };
         let indexing_pipeline = IndexingPipeline::new(indexing_pipeline_params);
         let (_indexing_pipeline_mailbox, indexing_pipeline_handler) =
@@ -934,7 +962,7 @@ mod tests {
             .process_pending_and_observe()
             .await;
         assert_eq!(obs.generation, 1);
-        // Let's shutdown the indexer, this will trigger the the indexing pipeline failure and the
+        // Let's shutdown the indexer, this will trigger the indexing pipeline failure and the
         // restart.
         let indexer = universe.get::<Indexer>().into_iter().next().unwrap();
         let _ = indexer.ask(Command::Quit).await;
@@ -1017,7 +1045,7 @@ mod tests {
         let split_store = IndexingSplitStore::create_without_local_store_for_test(storage.clone());
         let (merge_planner_mailbox, _) = universe.create_test_mailbox();
         // Create a minimal mapper with wrong date format to ensure that all documents will fail
-        let broken_mapper = serde_json::from_str::<DefaultDocMapper>(
+        let broken_mapper = serde_json::from_str::<DocMapper>(
             r#"
                 {
                     "store_source": true,
@@ -1047,10 +1075,12 @@ mod tests {
             storage,
             split_store,
             merge_policy: default_merge_policy(),
+            retention_policy: None,
             max_concurrent_split_uploads_index: 4,
             max_concurrent_split_uploads_merge: 5,
             cooperative_indexing_permits: None,
             merge_planner_mailbox,
+            params_fingerprint: 42u64,
             event_broker: Default::default(),
         };
         let pipeline = IndexingPipeline::new(pipeline_params);

@@ -15,14 +15,6 @@ keep it open, just write `See #<Issue Number>`.
 Feel free to send your contribution in an unfinished state to get early feedback.
 In that case, simply mark the PR with the tag [WIP] (standing for work in progress).
 
-## Signing the CLA
-Quickwit is an open source project licensed under AGPLv3.
-It is also distributed under a commercial license by Quickwit, Inc.
-
-Contributors are required to sign a Contributor License Agreement.
-The process is simple and fast. Upon your first pull request, you will be prompted to
-[sign our CLA by visiting this link](https://cla-assistant.io/quickwit-oss/quickwit).
-
 ## PR verification checks
 When you submit a pull request to the project, the CI system runs several verification checks. After your PR is merged, a more exhaustive list of tests will be run.
 
@@ -38,7 +30,7 @@ You will be notified by email from the CI system if any issues are discovered, b
 ### Local Development
 
 1. Install Rust, CMake, Docker (https://docs.docker.com/engine/install/) and Docker Compose (https://docs.docker.com/compose/install/)
-2. Install node@20 and `npm install -g yarn`
+2. Install node@24 and `npm install -g yarn`
 3. Install awslocal https://github.com/localstack/awscli-local
 4. Install protoc https://grpc.io/docs/protoc-installation/ (you may need to install the latest binaries rather than your distro's flavor)
 5. Install nextest https://nexte.st/docs/installation/pre-built-binaries/
@@ -56,7 +48,7 @@ Run `make test-all` to run all tests.
 * `make test-all` - starts necessary Docker services and runs all tests.
 * `make -k test-all docker-compose-down` - the same as above, but tears down the Docker services after running all the tests.
 * `make fmt` - runs formatter, this command requires the nightly toolchain to be installed by running `rustup toolchain install nightly`.
-* `make fix` - runs formatter and clippy checks.
+* `make fix` - runs formatter and clippy checks as well as removing unused dependencies (requires `cargo install cargo-machete`).
 * `make typos` - runs the spellcheck tool over the codebase. (Install by running `cargo install typos-cli`)
 * `make doc` - builds docs.
 * `make docker-compose-up` - starts Docker services.
@@ -84,7 +76,7 @@ Run `make test-all` to run all tests.
 1. Ensure Docker and Docker Compose are correctly installed on your machine (see above)
 2. Start the Jaeger services (UI, collector, agent, ...) running the command `make docker-compose-up DOCKER_SERVICES=jaeger`
 3. Start Quickwit with the following environment variables:
-   
+
 ```
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 QW_ENABLE_OPENTELEMETRY_OTLP_EXPORTER=true
@@ -115,6 +107,14 @@ As the react UI is embedded in the rust binary, we need to build the react app b
 ## Testing release (alpha, beta, rc)
 
 The following Quickwit installation command `curl -L https://install.quickwit.io | sh` always installs the latest stable version of quickwit. To make it easier in installing and testing new (alpha, beta, rc) releases, you can manually pull and execute the script as `./install.sh --allow-any-latest-version`. This will force the script to install any latest available release package.
+
+## Tracking licenses
+
+We keep track of the licenses used by the open source crates used by this project using
+[`rust-license-tool`](https://github.com/DataDog/rust-license-tool). The listing is checked every
+time CI is run. To update the listing, install the tool with `cargo install --git
+https://github.com/DataDog/rust-license-tool` and then run `dd-rust-license-tool write`. If there are
+any errors, you may need to update the listing of exceptions in `license-tool.toml`.
 
 # Documentation
 

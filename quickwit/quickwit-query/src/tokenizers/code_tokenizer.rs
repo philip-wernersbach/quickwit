@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::ops::Range;
 use std::str::CharIndices;
@@ -76,7 +71,7 @@ enum AdvanceResult {
     Backtrack,
 }
 
-impl<'a> CodeTokenStream<'a> {
+impl CodeTokenStream<'_> {
     fn advance_inner(&mut self, enable_hex: bool) -> bool {
         // this is cheap, just a copy of a few ptrs and integers
         let checkpoint = self.chars.clone();
@@ -116,7 +111,7 @@ impl<'a> CodeTokenStream<'a> {
     }
 }
 
-impl<'a> TokenStream for CodeTokenStream<'a> {
+impl TokenStream for CodeTokenStream<'_> {
     fn advance(&mut self) -> bool {
         self.token.text.clear();
         self.token.position = self.token.position.wrapping_add(1);
@@ -133,7 +128,7 @@ impl<'a> TokenStream for CodeTokenStream<'a> {
     }
 }
 
-impl<'a> CodeTokenStream<'a> {
+impl CodeTokenStream<'_> {
     fn update_token(&mut self, token_offsets: Range<usize>) {
         self.token.offset_from = token_offsets.start;
         self.token.offset_to = token_offsets.end;
@@ -318,9 +313,9 @@ fn get_char_type(c: char) -> CharType {
             CharType::LowerCase
         }
     } else if c.is_numeric() {
-        return CharType::Numeric;
+        CharType::Numeric
     } else {
-        return CharType::Delimiter;
+        CharType::Delimiter
     }
 }
 
@@ -382,7 +377,7 @@ impl ProcessingHexState {
                     // end of sequence, check if size is multiple of 2, or try to generate code
                     // state. We use next_char_offset as it already takes into account the size of
                     // the last character
-                    if (next_char_offset - self.start_offset) % 2 == 0 {
+                    if (next_char_offset - self.start_offset).is_multiple_of(2) {
                         return HexResult::Emit(self.start_offset..next_char_offset);
                     }
                 }
@@ -416,7 +411,7 @@ impl ProcessingHexState {
 
     fn finalize(&self) -> HexResult {
         let next_char_offset = self.current_char_offset + self.current_char.len_utf8();
-        if (next_char_offset - self.start_offset) % 2 == 0 {
+        if (next_char_offset - self.start_offset).is_multiple_of(2) {
             return HexResult::Emit(self.start_offset..next_char_offset);
         }
         self.to_processing_chars_state()

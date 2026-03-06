@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 use std::time::Duration;
@@ -28,14 +23,15 @@ impl<I> PrettySample<I> {
     }
 }
 
-impl<I, T> fmt::Debug for PrettySample<I>
+impl<I> fmt::Debug for PrettySample<I>
 where
-    I: IntoIterator<Item = T> + Clone,
-    T: fmt::Debug,
+    I: IntoIterator + Clone,
+    I::Item: fmt::Debug,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "[")?;
-        // in general we will get passed a reference (&[...], &HashMap...) or a Map<_> of them.
+
+        // In general, we will receive a reference (&[...], &HashMap...) or a Map<_> of them.
         // So we either perform a Copy, or a cheap Clone of a simple struct
         let mut iter = self.0.clone().into_iter().enumerate();
         for (i, item) in &mut iter {
@@ -60,15 +56,15 @@ pub trait PrettyDisplay {
     fn pretty_display(&self) -> impl fmt::Display;
 }
 
-struct PrettyDurationDisplay<'a>(&'a Duration);
+struct DurationPrettyDisplay<'a>(&'a Duration);
 
-impl fmt::Display for PrettyDurationDisplay<'_> {
+impl fmt::Display for DurationPrettyDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         // This is enough for my current use cases. To be extended as you see fit.
         let duration_millis = self.0.as_millis();
 
         if duration_millis < 1_000 {
-            return write!(formatter, "{}ms", duration_millis);
+            return write!(formatter, "{duration_millis}ms");
         }
         write!(
             formatter,
@@ -81,7 +77,37 @@ impl fmt::Display for PrettyDurationDisplay<'_> {
 
 impl PrettyDisplay for Duration {
     fn pretty_display(&self) -> impl fmt::Display {
-        PrettyDurationDisplay(self)
+        DurationPrettyDisplay(self)
+    }
+}
+
+struct SequencePrettyDisplay<I>(I);
+
+impl<I> fmt::Display for SequencePrettyDisplay<I>
+where
+    I: IntoIterator + Clone,
+    I::Item: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[")?;
+
+        // In general, we will receive a reference (&[...], &HashMap...) or a Map<_> of them.
+        // So we either perform a Copy, or a cheap Clone of a simple struct
+        let mut iter = self.0.clone().into_iter().peekable();
+
+        while let Some(item) = iter.next() {
+            write!(f, "{item}")?;
+            if iter.peek().is_some() {
+                write!(f, ", ")?;
+            }
+        }
+        write!(f, "]")
+    }
+}
+
+impl<T: fmt::Display> PrettyDisplay for &[T] {
+    fn pretty_display(&self) -> impl fmt::Display {
+        SequencePrettyDisplay(*self)
     }
 }
 
@@ -108,17 +134,29 @@ mod tests {
     }
 
     #[test]
-    fn test_pretty_duration() {
-        let pretty_duration = Duration::from_millis(0);
-        assert_eq!(format!("{}", pretty_duration.pretty_display()), "0ms");
+    fn test_duration_pretty_display() {
+        let duration = Duration::from_millis(0);
+        assert_eq!(format!("{}", duration.pretty_display()), "0ms");
 
-        let pretty_duration = Duration::from_millis(125);
-        assert_eq!(format!("{}", pretty_duration.pretty_display()), "125ms");
+        let duration = Duration::from_millis(125);
+        assert_eq!(format!("{}", duration.pretty_display()), "125ms");
 
-        let pretty_duration = Duration::from_millis(1_000);
-        assert_eq!(format!("{}", pretty_duration.pretty_display()), "1.0s");
+        let duration = Duration::from_millis(1_000);
+        assert_eq!(format!("{}", duration.pretty_display()), "1.0s");
 
-        let pretty_duration = Duration::from_millis(1_125);
-        assert_eq!(format!("{}", pretty_duration.pretty_display()), "1.12s");
+        let duration = Duration::from_millis(1_125);
+        assert_eq!(format!("{}", duration.pretty_display()), "1.12s");
+    }
+
+    #[test]
+    fn test_sequence_pretty_display() {
+        let empty_slice: &[i32] = &[];
+        assert_eq!(format!("{}", empty_slice.pretty_display()), "[]");
+
+        let slice_one: &[i32] = &[1];
+        assert_eq!(format!("{}", slice_one.pretty_display()), "[1]");
+
+        let slice_two: &[i32] = &[1, 2];
+        assert_eq!(format!("{}", slice_two.pretty_display()), "[1, 2]");
     }
 }

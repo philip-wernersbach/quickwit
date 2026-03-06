@@ -1,29 +1,23 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::cmp::Reverse;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use itertools::Itertools;
 use quickwit_proto::indexing::CpuCapacity;
-use tracing::warn;
 
 use super::scheduling_logic_model::*;
 use crate::indexing_scheduler::scheduling::inflate_node_capacities_if_necessary;
@@ -46,7 +40,7 @@ pub fn solve(
     previous_solution: SchedulingSolution,
 ) -> SchedulingSolution {
     // We first inflate the indexer capacities to make sure they globally
-    // have at least 110% of the total problem load. This is done proportionally
+    // have at least 120% of the total problem load. This is done proportionally
     // to their original capacity.
     inflate_node_capacities_if_necessary(&mut problem);
     // As a heuristic, to offer stability, we work iteratively
@@ -214,6 +208,27 @@ fn assert_enforce_nodes_cpu_capacity_post_condition(
     );
 }
 
+// ----------------------------------------------------
+// Phase 3
+// Place unassigned sources.
+//
+// We use a greedy algorithm as a simple heuristic here.
+//
+// We go through the sources in decreasing order of their load,
+// in two passes.
+//
+// In the first pass, we have a look at
+// the nodes with which there is an affinity.
+//
+// If one of them has room for all of the shards, then we assign all
+// of the shards to it.
+//
+// In the second pass, we just put as many shards as possible on the node
+// with the highest available capacity.
+//
+// If this algorithm fails to place all remaining shards, we inflate
+// the node capacities by 20% in the scheduling problem and start from the beginning.
+
 fn attempt_place_unassigned_shards(
     unassigned_shards: &[Source],
     problem: &SchedulingProblem,
@@ -268,26 +283,6 @@ fn place_unassigned_shards_with_affinity(
     }
 }
 
-// ----------------------------------------------------
-// Phase 3
-// Place unassigned sources.
-//
-// We use a greedy algorithm as a simple heuristic here.
-//
-// We go through the sources in decreasing order of their load,
-// in two passes.
-//
-// In the first pass, we have a look at
-// the nodes with which there is an affinity.
-//
-// If one of them has room for all of the shards, then we assign all
-// of the shards to it.
-//
-// In the second pass, we just put as many shards as possible on the node
-// with the highest available capacity.
-//
-// If this algorithm fails to place all remaining shards, we inflate
-// the node capacities by 20% in the scheduling problem and start from the beginning.
 #[must_use]
 fn place_unassigned_shards_ignoring_affinity(
     mut problem: SchedulingProblem,
@@ -299,21 +294,25 @@ fn place_unassigned_shards_ignoring_affinity(
         Reverse(load)
     });
 
-    // Thanks to the call to `inflate_node_capacities_if_necessary`,
-    // we are certain that even on our first attempt, the total capacity of the indexer exceeds 120%
-    // of the partial solution.
+    // Thanks to the call to `inflate_node_capacities_if_necessary`, we are
+    // certain that even on our first attempt, the total capacity of the indexer
+    // exceeds 120% of the partial solution. If a large shard needs to be placed
+    // in an already well balanced solution, it may not fit on any node. In that
+    // case, we iteratively grow the virtual capacity until it can be placed.
     //
-    // 1.2^30 is about 240.
-    // If we reach 30 attempts we are certain to have a logical bug.
+    // 1.2^30 is about 240. If we reach 30 attempts we are certain to have a
+    // logical bug.
     for attempt_number in 0..30 {
         match attempt_place_unassigned_shards(&unassigned_shards[..], &problem, partial_solution) {
-            Ok(solution) => {
-                if attempt_number != 0 {
-                    warn!(
+            Ok(mut solution) => {
+                // the higher the attempt number, the more unbalanced the solution
+                if attempt_number > 0 {
+                    tracing::warn!(
                         attempt_number = attempt_number,
-                        "required to scale node capacity"
+                        "capacity re-scaled, scheduling solution likely unbalanced"
                     );
                 }
+                solution.capacity_scaling_iterations = attempt_number;
                 return solution;
             }
             Err(NotEnoughCapacity) => {
@@ -362,10 +361,6 @@ fn place_unassigned_shards_single_source(
         let num_placable_shards = available_capacity.cpu_millis() / source.load_per_shard;
         let num_shards_to_place = num_placable_shards.min(num_shards);
         // Update the solution, the shard load, and the number of shards to place.
-        if num_shards_to_place == 0u32 {
-            // No need to fill indexer_assignments with empty assignments.
-            continue;
-        }
         solution.indexer_assignments[indexer_ord]
             .add_shards(source.source_ord, num_shards_to_place);
         num_shards -= num_shards_to_place;
@@ -785,7 +780,31 @@ mod tests {
     proptest! {
         #[test]
         fn test_proptest_post_conditions((problem, solution) in problem_solution_strategy()) {
-            solve(problem, solution);
+            let solution_1 = solve(problem.clone(), solution);
+            let solution_2 = solve(problem.clone(), solution_1.clone());
+            // TODO: This assert actually fails for some scenarii. We say it is fine
+            // for now as long as the solution does not change again during the
+            // next resolution:
+            // let has_solution_changed_once = solution_1.indexer_assignments != solution_2.indexer_assignments;
+            // assert!(!has_solution_changed_once, "Solution changed for same problem\nSolution 1:{solution_1:?}\nSolution 2: {solution_2:?}");
+            let solution_3 = solve(problem, solution_2.clone());
+            let has_solution_changed_again = solution_2.indexer_assignments != solution_3.indexer_assignments;
+            assert!(!has_solution_changed_again, "solution unstable!!!\nSolution 1: {solution_1:?}\nSolution 2: {solution_2:?}\nSolution 3: {solution_3:?}");
         }
+    }
+
+    #[test]
+    fn test_capacity_scaling_iteration_required() {
+        // Create a problem where affinity constraints cause suboptimal placement
+        // requiring iterative scaling despite initial capacity scaling.
+        let mut problem =
+            SchedulingProblem::with_indexer_cpu_capacities(vec![mcpu(3000), mcpu(3000)]);
+        problem.add_source(1, NonZeroU32::new(2500).unwrap()); // Source 0
+        problem.add_source(1, NonZeroU32::new(2500).unwrap()); // Source 1
+        problem.add_source(1, NonZeroU32::new(1500).unwrap()); // Source 2
+        let previous_solution = problem.new_solution();
+        let solution = solve(problem, previous_solution);
+
+        assert_eq!(solution.capacity_scaling_iterations, 1);
     }
 }

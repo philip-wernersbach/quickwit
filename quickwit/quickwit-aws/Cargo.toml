@@ -12,16 +12,12 @@ license.workspace = true
 
 [dependencies]
 aws-config = { workspace = true }
+aws-runtime = { workspace = true }
 aws-sdk-kinesis = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true }
 aws-sdk-sqs = { workspace = true, optional = true }
 aws-smithy-async = { workspace = true }
-aws-smithy-runtime = { workspace = true }
-aws-types = { workspace = true }
-
 futures = { workspace = true }
-hyper = { workspace = true }
-hyper-rustls = { workspace = true }
 tokio = { workspace = true }
 
 quickwit-common = { workspace = true }

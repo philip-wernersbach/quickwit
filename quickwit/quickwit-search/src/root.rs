@@ -1,25 +1,21 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures::future::try_join_all;
@@ -28,8 +24,8 @@ use quickwit_common::pretty::PrettySample;
 use quickwit_common::shared_consts;
 use quickwit_common::uri::Uri;
 use quickwit_config::build_doc_mapper;
-use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
 use quickwit_doc_mapper::DYNAMIC_FIELD_NAME;
+use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
 use quickwit_metastore::{IndexMetadata, ListIndexesMetadataResponseExt, SplitMetadata};
 use quickwit_proto::metastore::{
     ListIndexesMetadataRequest, MetastoreService, MetastoreServiceClient,
@@ -44,23 +40,23 @@ use quickwit_query::query_ast::{
     BoolQuery, QueryAst, QueryAstVisitor, RangeQuery, TermQuery, TermSetQuery,
 };
 use serde::{Deserialize, Serialize};
+use tantivy::TantivyError;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::collector::Collector;
-use tantivy::schema::{FieldEntry, FieldType, Schema};
-use tantivy::TantivyError;
+use tantivy::schema::{Field, FieldEntry, FieldType, Schema};
 use tracing::{debug, error, info, info_span, instrument};
 
 use crate::cluster_client::ClusterClient;
-use crate::collector::{make_merge_collector, QuickwitAggregations};
-use crate::find_trace_ids_collector::Span;
+use crate::collector::{QuickwitAggregations, make_merge_collector};
+use crate::metrics_trackers::{RootSearchMetricsFuture, RootSearchMetricsStep};
 use crate::scroll_context::{ScrollContext, ScrollKeyAndStartOffset};
-use crate::search_job_placer::{group_by, group_jobs_by_index_id, Job};
+use crate::search_job_placer::{Job, group_by, group_jobs_by_index_id};
 use crate::search_response_rest::StorageRequestCount;
 use crate::service::SearcherContext;
 use crate::{
-    extract_split_and_footer_offsets, list_relevant_splits, SearchError, SearchJobPlacer,
-    SearchPlanResponseRest, SearchServiceClient,
+    SearchError, SearchJobPlacer, SearchPlanResponseRest, SearchServiceClient,
+    extract_split_and_footer_offsets, list_relevant_splits,
 };
 
 /// Maximum accepted scroll TTL.
@@ -91,6 +87,7 @@ pub struct SearchJob {
 }
 
 impl SearchJob {
+    /// Create a fake job from a split_id (used for hashing), and a cost.
     #[cfg(test)]
     pub fn for_test(split_id: &str, cost: usize) -> SearchJob {
         use std::str::FromStr;
@@ -177,6 +174,7 @@ struct RequestMetadata {
 /// - resolved query ASTs are the same across indexes.
 /// - if a sort field is of type datetime, it must be a datetime field on all indexes. This
 ///   constraint come from the need to support datetime formatting on sort values.
+///
 /// Returns the timestamp field, the resolved query AST and the indexes metadatas
 /// needed for leaf search requests.
 /// Note: the requirements on timestamp fields and resolved query ASTs can be lifted
@@ -251,7 +249,12 @@ fn validate_request_and_build_metadata(
         )?;
 
         // Validates the query by effectively building it against the current schema.
-        doc_mapper.query(doc_mapper.schema(), &query_ast_resolved_for_index, true)?;
+        doc_mapper.query(
+            doc_mapper.schema(),
+            query_ast_resolved_for_index,
+            true,
+            None,
+        )?;
 
         let index_metadata_for_leaf_search = IndexMetasForLeafSearch {
             index_uri: index_metadata.index_uri().clone(),
@@ -334,7 +337,7 @@ fn validate_requested_snippet_fields(
                     "the snippet field `{}` must be of type `Str`, got `{}`",
                     field_name,
                     other.value_type().name()
-                ))
+                ));
             }
         }
     }
@@ -368,6 +371,8 @@ fn simplify_search_request_for_scroll_api(req: &SearchRequest) -> crate::Result<
         // request is simplified after initial query, and we cache the hit count, so we don't need
         // to recompute it afterward.
         count_hits: quickwit_proto::search::CountHits::Underestimate as i32,
+        ignore_missing_indexes: req.ignore_missing_indexes,
+        skip_aggregation_finalization: false,
     })
 }
 
@@ -472,6 +477,27 @@ fn validate_sort_by_field_type(
     Ok(())
 }
 
+fn check_is_fast_field(
+    schema: &Schema,
+    fast_field_name: &str,
+    dynamic_fast_field: Option<Field>,
+) -> crate::Result<()> {
+    let Some((field, _path)): Option<(Field, &str)> =
+        schema.find_field_with_default(fast_field_name, dynamic_fast_field)
+    else {
+        return Err(SearchError::InvalidArgument(format!(
+            "Field \"{fast_field_name}\" does not exist"
+        )));
+    };
+    let field_entry: &FieldEntry = schema.get_field_entry(field);
+    if !field_entry.is_fast() {
+        return Err(SearchError::InvalidArgument(format!(
+            "Field \"{fast_field_name}\" is not configured as a fast field"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_request(
     schema: &Schema,
     timestamp_field_name: &Option<&str>,
@@ -490,11 +516,18 @@ fn validate_request(
     validate_requested_snippet_fields(schema, &search_request.snippet_fields)?;
 
     if let Some(agg) = search_request.aggregation_request.as_ref() {
-        let _aggs: QuickwitAggregations = serde_json::from_str(agg).map_err(|_err| {
+        let aggs: QuickwitAggregations = serde_json::from_str(agg).map_err(|_err| {
             let err = serde_json::from_str::<tantivy::aggregation::agg_req::Aggregations>(agg)
                 .unwrap_err();
             SearchError::InvalidAggregationRequest(err.to_string())
         })?;
+
+        // ensure that the required fast fields are indeed configured as fast fields.
+        let fast_field_names = aggs.fast_field_names();
+        let dynamic_field = schema.get_field(DYNAMIC_FIELD_NAME).ok();
+        for fast_field_name in &fast_field_names {
+            check_is_fast_field(schema, fast_field_name, dynamic_field)?;
+        }
     };
 
     if search_request.start_offset > 10_000 {
@@ -574,6 +607,8 @@ async fn search_partial_hits_phase_with_scroll(
             max_hits_per_page: max_hits,
             cached_partial_hits_start_offset: search_request.start_offset,
             cached_partial_hits,
+            failed_splits: leaf_search_resp.failed_splits.clone(),
+            num_successful_splits: leaf_search_resp.num_successful_splits,
         };
         let scroll_key_and_start_offset: ScrollKeyAndStartOffset =
             ScrollKeyAndStartOffset::new_with_start_offset(
@@ -619,6 +654,7 @@ pub fn is_metadata_count_request(request: &SearchRequest) -> bool {
 ///
 /// The passed query_ast should match the serialized on in request.
 pub fn is_metadata_count_request_with_ast(query_ast: &QueryAst, request: &SearchRequest) -> bool {
+    // TODO detect Cache(MatchAll), Boost(MatchAll) and Bool{must/should:MatchAll}
     if query_ast != &QueryAst::MatchAll {
         return false;
     }
@@ -649,11 +685,50 @@ pub fn get_count_from_metadata(split_metadatas: &[SplitMetadata]) -> Vec<LeafSea
             partial_hits: Vec::new(),
             failed_splits: Vec::new(),
             num_attempted_splits: 1,
+            num_successful_splits: 1,
             intermediate_aggregation_result: None,
+            resource_stats: None,
         })
         .collect()
 }
 
+/// Returns true if the query is particularly memory intensive.
+///
+/// This function only considers the memory usage associated to the input data
+/// and does not take in account aggregations (intermediary or not) results for instance.
+///
+/// Since its point is to log memory intensive queries, it focuses on the metric of the number of
+/// bytes per document.
+///
+/// The threshold is computed dynamically using gradient descent.
+fn is_top_5pct_memory_intensive(num_bytes: u64, split_num_docs: u64) -> bool {
+    // It is not worth considering small splits for this.
+    if split_num_docs < 100_000 {
+        return false;
+    }
+    // We multiply those figure by 1_000 for accuracy.
+    const PERCENTILE: u64 = 95;
+    const PRIOR_NUM_BYTES_PER_DOC: u64 = 3 * 1_000;
+    static NUM_BYTES_PER_DOC_95_PERCENTILE_ESTIMATOR: AtomicU64 =
+        AtomicU64::new(PRIOR_NUM_BYTES_PER_DOC);
+    let num_bits_per_docs = num_bytes * 1_000 / split_num_docs;
+    let current_estimator = NUM_BYTES_PER_DOC_95_PERCENTILE_ESTIMATOR.load(Ordering::Relaxed);
+    let is_memory_intensive = num_bits_per_docs > current_estimator;
+    let new_estimator: u64 = if is_memory_intensive {
+        current_estimator.saturating_add(PRIOR_NUM_BYTES_PER_DOC * PERCENTILE / 100)
+    } else {
+        current_estimator.saturating_sub(PRIOR_NUM_BYTES_PER_DOC * (100 - PERCENTILE) / 100)
+    };
+    // We do not use fetch_add / fetch_sub directly as they wrap around.
+    // Concurrency could lead to different results here, but really we don't care.
+    //
+    // This is just ignoring some gradient updates.
+    NUM_BYTES_PER_DOC_95_PERCENTILE_ESTIMATOR.store(new_estimator, Ordering::Relaxed);
+    is_memory_intensive
+}
+
+/// If this method fails for some splits, a partial search response is returned, with the list of
+/// faulty splits in the failed_splits field.
 #[instrument(level = "debug", skip_all)]
 pub(crate) async fn search_partial_hits_phase(
     searcher_context: &SearcherContext,
@@ -683,23 +758,20 @@ pub(crate) async fn search_partial_hits_phase(
             try_join_all(leaf_request_tasks).await?
         };
 
-    // Creates a collector which merges responses into one
-    let merge_collector = make_merge_collector(
-        search_request,
-        &searcher_context.create_new_aggregation_limits(),
-    )?;
+    let merge_collector =
+        make_merge_collector(search_request, searcher_context.get_aggregation_limits())?;
 
     // Merging is a cpu-bound task.
     // It should be executed by Tokio's blocking threads.
 
     // Wrap into result for merge_fruits
-    let leaf_search_responses: Vec<tantivy::Result<LeafSearchResponse>> =
+    let leaf_search_results: Vec<tantivy::Result<LeafSearchResponse>> =
         leaf_search_responses.into_iter().map(Ok).collect_vec();
     let span = info_span!("merge_fruits");
     let leaf_search_response = crate::search_thread_pool()
         .run_cpu_intensive(move || {
             let _span_guard = span.enter();
-            merge_collector.merge_fruits(leaf_search_responses)
+            merge_collector.merge_fruits(leaf_search_results)
         })
         .await
         .context("failed to merge leaf search responses")?
@@ -711,11 +783,26 @@ pub(crate) async fn search_partial_hits_phase(
         has_intermediate_aggregation_result = leaf_search_response.intermediate_aggregation_result.is_some(),
         "Merged leaf search response."
     );
-    if !leaf_search_response.failed_splits.is_empty() {
-        error!(failed_splits = ?leaf_search_response.failed_splits, "leaf search response contains at least one failed split");
-        let errors: String = leaf_search_response.failed_splits.iter().join(", ");
-        return Err(SearchError::Internal(errors));
+
+    if let Some(resource_stats) = &leaf_search_response.resource_stats
+        && is_top_5pct_memory_intensive(
+            resource_stats.short_lived_cache_num_bytes,
+            resource_stats.split_num_docs,
+        )
+    {
+        // We log at most 5 times per minute.
+        quickwit_common::rate_limited_info!(
+            limit_per_min = 5,
+            split_num_docs = resource_stats.split_num_docs,
+            short_lived_cached_num_bytes = resource_stats.short_lived_cache_num_bytes,
+            "memory intensive query"
+        );
     }
+
+    if !leaf_search_response.failed_splits.is_empty() {
+        quickwit_common::rate_limited_error!(limit_per_min=6, failed_splits = ?leaf_search_response.failed_splits, "leaf search response contains at least one failed split");
+    }
+
     Ok(leaf_search_response)
 }
 
@@ -833,19 +920,19 @@ fn build_hit_with_position(
         .sort_value
         .as_mut()
         .and_then(|sort_field| sort_field.sort_value.as_mut());
-    if let Some(sort_by_value) = sort_value_opt {
-        if let Some(output_datetime_format) = &sort_field_1_datetime_format_opt {
-            convert_sort_datetime_value(sort_by_value, *output_datetime_format)?;
-        }
+    if let Some(sort_by_value) = sort_value_opt
+        && let Some(output_datetime_format) = &sort_field_1_datetime_format_opt
+    {
+        convert_sort_datetime_value(sort_by_value, *output_datetime_format)?;
     }
     let sort_value_2_opt = partial_hit_ref
         .sort_value2
         .as_mut()
         .and_then(|sort_field| sort_field.sort_value.as_mut());
-    if let Some(sort_by_value) = sort_value_2_opt {
-        if let Some(output_datetime_format) = &sort_field_2_datetime_format_opt {
-            convert_sort_datetime_value(sort_by_value, *output_datetime_format)?;
-        }
+    if let Some(sort_by_value) = sort_value_2_opt
+        && let Some(output_datetime_format) = &sort_field_2_datetime_format_opt
+    {
+        convert_sort_datetime_value(sort_by_value, *output_datetime_format)?;
     }
     let position = *hit_order.get(&key).expect("hit order must be present");
     let index_id = split_id_to_index_id_map
@@ -867,23 +954,22 @@ fn build_hit_with_position(
 fn get_sort_field_datetime_format(
     sort_field: Option<&SortField>,
 ) -> crate::Result<Option<SortDatetimeFormat>> {
-    if let Some(sort_field) = sort_field {
-        if let Some(sort_field_datetime_format_int) = &sort_field.sort_datetime_format {
-            let sort_field_datetime_format =
-                SortDatetimeFormat::from_i32(*sort_field_datetime_format_int)
-                    .context("invalid sort datetime format")?;
-            return Ok(Some(sort_field_datetime_format));
-        }
+    if let Some(sort_field) = sort_field
+        && let Some(sort_field_datetime_format_int) = &sort_field.sort_datetime_format
+    {
+        let sort_field_datetime_format =
+            SortDatetimeFormat::try_from(*sort_field_datetime_format_int)
+                .context("invalid sort datetime format")?;
+        return Ok(Some(sort_field_datetime_format));
     }
     Ok(None)
 }
 
 /// Performs a distributed search.
-/// 1. Sends leaf request over gRPC to multiple leaf nodes.
+/// 1. Sends leaf requests over gRPC to multiple leaf nodes.
 /// 2. Merges the search results.
 /// 3. Sends fetch docs requests to multiple leaf nodes.
 /// 4. Builds the response with docs and returns.
-#[instrument(skip_all, fields(num_splits=%split_metadatas.len()))]
 async fn root_search_aux(
     searcher_context: &SearcherContext,
     indexes_metas_for_leaf_search: &IndexesMetasForLeafSearch,
@@ -913,18 +999,18 @@ async fn root_search_aux(
     )
     .await?;
 
-    let mut aggregation_result_json_opt = finalize_aggregation_if_any(
+    let mut aggregation_result_postcard_opt = finalize_aggregation_if_any(
         &search_request,
         first_phase_result.intermediate_aggregation_result,
         searcher_context,
     )?;
     // In case there is no index, we don't want the response to contain any aggregation structure
     if indexes_metas_for_leaf_search.is_empty() {
-        aggregation_result_json_opt = None;
+        aggregation_result_postcard_opt = None;
     }
 
     Ok(SearchResponse {
-        aggregation: aggregation_result_json_opt,
+        aggregation_postcard: aggregation_result_postcard_opt,
         num_hits: first_phase_result.num_hits,
         hits,
         elapsed_time_micros: 0u64,
@@ -932,6 +1018,8 @@ async fn root_search_aux(
         scroll_id: scroll_key_and_start_offset_opt
             .as_ref()
             .map(ToString::to_string),
+        failed_splits: first_phase_result.failed_splits,
+        num_successful_splits: first_phase_result.num_successful_splits,
     })
 }
 
@@ -939,17 +1027,11 @@ fn finalize_aggregation(
     intermediate_aggregation_result_bytes_opt: Option<Vec<u8>>,
     aggregations: QuickwitAggregations,
     searcher_context: &SearcherContext,
-) -> crate::Result<Option<String>> {
+) -> crate::Result<Option<Vec<u8>>> {
     let merge_aggregation_result = match aggregations {
         QuickwitAggregations::FindTraceIdsAggregation(_) => {
-            let Some(intermediate_aggregation_result_bytes) =
-                intermediate_aggregation_result_bytes_opt
-            else {
-                return Ok(None);
-            };
             // The merge collector has already merged the intermediate results.
-            let aggs: Vec<Span> = postcard::from_bytes(&intermediate_aggregation_result_bytes)?;
-            serde_json::to_string(&aggs)?
+            return Ok(intermediate_aggregation_result_bytes_opt);
         }
         QuickwitAggregations::TantivyAggregations(aggregations) => {
             let intermediate_aggregation_results =
@@ -964,11 +1046,10 @@ fn finalize_aggregation(
                     Default::default()
                 };
             let final_aggregation_results: AggregationResults = intermediate_aggregation_results
-                .into_final_result(
-                    aggregations,
-                    &searcher_context.create_new_aggregation_limits(),
-                )?;
-            serde_json::to_string(&final_aggregation_results)?
+                .into_final_result(aggregations, searcher_context.get_aggregation_limits())?;
+            let final_aggregation_proxy: quickwit_query::aggregations::AggregationResults =
+                final_aggregation_results.into();
+            postcard::to_stdvec(&final_aggregation_proxy)?
         }
     };
     Ok(Some(merge_aggregation_result))
@@ -978,17 +1059,20 @@ fn finalize_aggregation_if_any(
     search_request: &SearchRequest,
     intermediate_aggregation_result_bytes_opt: Option<Vec<u8>>,
     searcher_context: &SearcherContext,
-) -> crate::Result<Option<String>> {
+) -> crate::Result<Option<Vec<u8>>> {
     let Some(aggregations_json) = search_request.aggregation_request.as_ref() else {
         return Ok(None);
     };
+    if search_request.skip_aggregation_finalization {
+        return Ok(intermediate_aggregation_result_bytes_opt);
+    }
     let aggregations: QuickwitAggregations = serde_json::from_str(aggregations_json)?;
-    let aggregation_result_json = finalize_aggregation(
+    let aggregation_result_postcard = finalize_aggregation(
         intermediate_aggregation_result_bytes_opt,
         aggregations,
         searcher_context,
     )?;
-    Ok(aggregation_result_json)
+    Ok(aggregation_result_postcard)
 }
 
 /// Checks that all of the index researched as found.
@@ -999,36 +1083,34 @@ fn finalize_aggregation_if_any(
 /// We put this check here and not in the metastore to make sure the logic is independent
 /// of the metastore implementation, and some different use cases could require different
 /// behaviors. This specification was principally motivated by #4042.
-pub fn check_all_index_metadata_found(
-    index_metadatas: &[IndexMetadata],
+pub fn ensure_all_indexes_found(
+    indexes_metadata: &[IndexMetadata],
     index_id_patterns: &[String],
 ) -> crate::Result<()> {
     let mut index_ids: HashSet<&str> = index_id_patterns
         .iter()
-        .map(|index_ptn| index_ptn.as_str())
-        .filter(|index_ptn| !index_ptn.contains('*') && !index_ptn.starts_with('-'))
+        .filter(|pattern| !pattern.contains('*') && !pattern.starts_with('-'))
+        .map(|pattern| pattern.as_str())
         .collect();
 
     if index_ids.is_empty() {
-        // All of the patterns are wildcard patterns.
+        // All the patterns are wildcard or negative patterns.
         return Ok(());
     }
-
-    for index_metadata in index_metadatas {
-        index_ids.remove(index_metadata.index_uid.index_id.as_str());
+    for index_metadata in indexes_metadata {
+        index_ids.remove(index_metadata.index_id());
     }
-
-    if !index_ids.is_empty() {
-        let missing_index_ids = index_ids
-            .into_iter()
-            .map(|missing_index_id| missing_index_id.to_string())
-            .collect();
-        return Err(SearchError::IndexesNotFound {
-            index_ids: missing_index_ids,
-        });
+    if index_ids.is_empty() {
+        return Ok(());
     }
+    let not_found_index_ids = index_ids
+        .into_iter()
+        .map(|index_id| index_id.to_string())
+        .collect();
 
-    Ok(())
+    Err(SearchError::IndexesNotFound {
+        index_ids: not_found_index_ids,
+    })
 }
 
 async fn refine_and_list_matches(
@@ -1072,8 +1154,46 @@ async fn refine_and_list_matches(
     Ok(split_metadatas)
 }
 
+/// Fetches the list of splits and their metadata from the metastore
+async fn plan_splits_for_root_search(
+    search_request: &mut SearchRequest,
+    metastore: &mut MetastoreServiceClient,
+) -> crate::Result<(Vec<SplitMetadata>, IndexesMetasForLeafSearch)> {
+    let list_indexes_metadatas_request = ListIndexesMetadataRequest {
+        index_id_patterns: search_request.index_id_patterns.clone(),
+    };
+    let indexes_metadata: Vec<IndexMetadata> = metastore
+        .list_indexes_metadata(list_indexes_metadatas_request)
+        .await?
+        .deserialize_indexes_metadata()
+        .await?;
+
+    if !search_request.ignore_missing_indexes {
+        ensure_all_indexes_found(&indexes_metadata[..], &search_request.index_id_patterns[..])?;
+    }
+
+    if indexes_metadata.is_empty() {
+        return Ok((Vec::new(), HashMap::default()));
+    }
+
+    let request_metadata = validate_request_and_build_metadata(&indexes_metadata, search_request)?;
+    let split_metadatas = refine_and_list_matches(
+        metastore,
+        search_request,
+        indexes_metadata,
+        request_metadata.query_ast_resolved,
+        request_metadata.sort_fields_is_datetime,
+        request_metadata.timestamp_field_opt,
+    )
+    .await?;
+    Ok((
+        split_metadatas,
+        request_metadata.indexes_meta_for_leaf_search,
+    ))
+}
+
 /// Performs a distributed search.
-/// 1. Sends leaf request over gRPC to multiple leaf nodes.
+/// 1. Sends leaf requests over gRPC to multiple leaf nodes.
 /// 2. Merges the search results.
 /// 3. Sends fetch docs requests to multiple leaf nodes.
 /// 4. Builds the response with docs and returns.
@@ -1084,57 +1204,67 @@ pub async fn root_search(
     mut metastore: MetastoreServiceClient,
     cluster_client: &ClusterClient,
 ) -> crate::Result<SearchResponse> {
-    info!(searcher_context = ?searcher_context, search_request = ?search_request);
-    let start_instant = tokio::time::Instant::now();
-    let list_indexes_metadatas_request = ListIndexesMetadataRequest {
-        index_id_patterns: search_request.index_id_patterns.clone(),
-    };
-    let indexes_metadata: Vec<IndexMetadata> = metastore
-        .list_indexes_metadata(list_indexes_metadatas_request)
-        .await?
-        .deserialize_indexes_metadata()
-        .await?;
+    let start_instant = Instant::now();
 
-    check_all_index_metadata_found(&indexes_metadata[..], &search_request.index_id_patterns[..])?;
+    let (split_metadatas, indexes_meta_for_leaf_search) = RootSearchMetricsFuture {
+        start: start_instant,
+        tracked: plan_splits_for_root_search(&mut search_request, &mut metastore),
+        is_success: None,
+        step: RootSearchMetricsStep::Plan,
+    }
+    .await?;
 
-    if indexes_metadata.is_empty() {
-        // We go through root_search_aux instead of directly
-        // returning an empty response to make sure we generate
-        // a (pretty useless) scroll id if requested.
-        let mut search_response = root_search_aux(
-            searcher_context,
-            &HashMap::default(),
-            search_request,
-            Vec::new(),
-            cluster_client,
-        )
-        .await?;
-        search_response.elapsed_time_micros = start_instant.elapsed().as_micros() as u64;
-        return Ok(search_response);
+    let num_docs: usize = split_metadatas.iter().map(|split| split.num_docs).sum();
+    let num_splits = split_metadatas.len();
+
+    // It would have been nice to add those in the context of the trace span,
+    // but with our current logging setting, it makes logs too verbose.
+    info!(
+        query_ast = search_request.query_ast.as_str(),
+        agg = search_request.aggregation_request(),
+        start_ts = ?(search_request.start_timestamp()..search_request.end_timestamp()),
+        count_required = search_request.count_hits().as_str_name(),
+        num_docs = num_docs,
+        num_splits = num_splits,
+        "root_search"
+    );
+
+    if let Some(max_total_split_searches) = searcher_context.searcher_config.max_splits_per_search
+        && max_total_split_searches < num_splits
+    {
+        error!(
+            num_splits,
+            max_total_split_searches,
+            index=?search_request.index_id_patterns,
+            query=%search_request.query_ast,
+            "max total splits exceeded"
+        );
+        return Err(SearchError::InvalidArgument(format!(
+            "Number of targeted splits {num_splits} exceeds the limit {max_total_split_searches}"
+        )));
     }
 
-    let request_metadata = validate_request_and_build_metadata(&indexes_metadata, &search_request)?;
-    let split_metadatas = refine_and_list_matches(
-        &mut metastore,
-        &mut search_request,
-        indexes_metadata,
-        request_metadata.query_ast_resolved,
-        request_metadata.sort_fields_is_datetime,
-        request_metadata.timestamp_field_opt,
-    )
-    .await?;
+    let mut search_response_result = RootSearchMetricsFuture {
+        start: start_instant,
+        tracked: root_search_aux(
+            searcher_context,
+            &indexes_meta_for_leaf_search,
+            search_request,
+            split_metadatas,
+            cluster_client,
+        ),
+        is_success: None,
+        step: RootSearchMetricsStep::Exec {
+            num_targeted_splits: num_splits,
+        },
+    }
+    .await;
 
-    let mut search_response = root_search_aux(
-        searcher_context,
-        &request_metadata.indexes_meta_for_leaf_search,
-        search_request,
-        split_metadatas,
-        cluster_client,
-    )
-    .await?;
+    if let Ok(search_response) = &mut search_response_result {
+        search_response.elapsed_time_micros = start_instant.elapsed().as_micros() as u64;
+    }
 
-    search_response.elapsed_time_micros = start_instant.elapsed().as_micros() as u64;
-    Ok(search_response)
+    search_response_result
 }
 
 /// Returns details on how a query would be executed
@@ -1151,7 +1281,9 @@ pub async fn search_plan(
         .deserialize_indexes_metadata()
         .await?;
 
-    check_all_index_metadata_found(&indexes_metadata[..], &search_request.index_id_patterns[..])?;
+    if !search_request.ignore_missing_indexes {
+        ensure_all_indexes_found(&indexes_metadata[..], &search_request.index_id_patterns[..])?;
+    }
     if indexes_metadata.is_empty() {
         return Ok(SearchPlanResponse {
             result: serde_json::to_string(&SearchPlanResponseRest {
@@ -1181,10 +1313,11 @@ pub async fn search_plan(
 
     let (query, mut warmup_info) = doc_mapper.query(
         doc_mapper.schema(),
-        &request_metadata.query_ast_resolved,
+        request_metadata.query_ast_resolved.clone(),
         true,
+        None,
     )?;
-    let merge_collector = make_merge_collector(&search_request, &Default::default())?;
+    let merge_collector = make_merge_collector(&search_request, Default::default())?;
     warmup_info.merge(merge_collector.warmup_info());
     warmup_info.simplify();
 
@@ -1240,7 +1373,7 @@ pub async fn search_plan(
             searched_splits: split_ids,
             storage_requests: StorageRequestCount {
                 footer: 1,
-                fastfield: warmup_info.fast_field_names.len(),
+                fastfield: warmup_info.fast_fields.len(),
                 fieldnorm: fieldnorm_query_count,
                 sstable: sstable_query_count,
                 posting: sstable_query_count,
@@ -1285,7 +1418,7 @@ fn convert_search_after_datetime_values(
             let Some(datetime_format_int) = sort_field.sort_datetime_format else {
                 continue;
             };
-            let input_datetime_format = SortDatetimeFormat::from_i32(datetime_format_int)
+            let input_datetime_format = SortDatetimeFormat::try_from(datetime_format_int)
                 .context("invalid sort datetime format")?;
             convert_sort_datetime_value_into_nanos(search_after_sort_value, input_datetime_format)?;
         }
@@ -1305,8 +1438,7 @@ fn convert_sort_datetime_value_into_nanos(
                 *value = value.checked_mul(1_000_000).ok_or_else(|| {
                     SearchError::Internal(format!(
                         "sort value defined in milliseconds is too large and cannot be converted \
-                         into nanoseconds: {}",
-                        value
+                         into nanoseconds: {value}"
                     ))
                 })?;
             }
@@ -1319,8 +1451,7 @@ fn convert_sort_datetime_value_into_nanos(
                 *value = value.checked_mul(1_000_000).ok_or_else(|| {
                     SearchError::Internal(format!(
                         "sort value defined in milliseconds is too large and cannot be converted \
-                         into nanoseconds: {}",
-                        value
+                         into nanoseconds: {value}"
                     ))
                 })?;
             }
@@ -1330,8 +1461,8 @@ fn convert_sort_datetime_value_into_nanos(
         },
         _ => {
             return Err(SearchError::Internal(format!(
-                "datetime conversion are only support for u64 and i64 sort values, not `{:?}`",
-                sort_value
+                "datetime conversion are only support for u64 and i64 sort values, not \
+                 `{sort_value:?}`"
             )));
         }
     }
@@ -1363,8 +1494,8 @@ fn convert_sort_datetime_value(
         },
         _ => {
             return Err(SearchError::Internal(format!(
-                "datetime conversion are only support for u64 and i64 sort values, not `{:?}`",
-                sort_value
+                "datetime conversion are only support for u64 and i64 sort values, not \
+                 `{sort_value:?}`"
             )));
         }
     }
@@ -1400,7 +1531,7 @@ struct ExtractTimestampRange<'a> {
     end_timestamp: Option<i64>,
 }
 
-impl<'a> ExtractTimestampRange<'a> {
+impl ExtractTimestampRange<'_> {
     fn update_start_timestamp(
         &mut self,
         lower_bound: &quickwit_query::JsonLiteral,
@@ -1416,10 +1547,8 @@ impl<'a> ExtractTimestampRange<'a> {
             // a match_none, but the visitor doesn't allow mutation.
             lower_bound = lower_bound.saturating_add(1);
         }
-        self.start_timestamp = Some(
-            self.start_timestamp
-                .map_or(lower_bound, |current| current.max(lower_bound)),
-        );
+
+        self.start_timestamp = self.start_timestamp.max(Some(lower_bound));
     }
 
     fn update_end_timestamp(&mut self, upper_bound: &quickwit_query::JsonLiteral, included: bool) {
@@ -1434,14 +1563,13 @@ impl<'a> ExtractTimestampRange<'a> {
             // a match_none, but the visitor doesn't allow mutation.
             upper_bound = upper_bound.saturating_add(1);
         }
-        self.end_timestamp = Some(
-            self.end_timestamp
-                .map_or(upper_bound, |current| current.min(upper_bound)),
-        );
+
+        let new_end_timestamp = self.end_timestamp.unwrap_or(upper_bound).min(upper_bound);
+        self.end_timestamp = Some(new_end_timestamp);
     }
 }
 
-impl<'a, 'b> QueryAstVisitor<'b> for ExtractTimestampRange<'a> {
+impl<'b> QueryAstVisitor<'b> for ExtractTimestampRange<'_> {
     type Err = std::convert::Infallible;
 
     fn visit_bool(&mut self, bool_query: &'b BoolQuery) -> Result<(), Self::Err> {
@@ -1568,6 +1696,7 @@ pub fn jobs_to_leaf_request(
     let mut search_request_for_leaf = request.clone();
     search_request_for_leaf.start_offset = 0;
     search_request_for_leaf.max_hits += request.start_offset;
+    search_request_for_leaf.index_id_patterns = Vec::new();
 
     let mut leaf_search_request = LeafSearchRequest {
         search_request: Some(search_request_for_leaf),
@@ -1580,6 +1709,12 @@ pub fn jobs_to_leaf_request(
     // Group jobs by index uid, as the split offsets are relative to the index.
     group_jobs_by_index_id(jobs, |job_group| {
         let index_uid = &job_group[0].index_uid;
+        leaf_search_request
+            .search_request
+            .as_mut()
+            .unwrap()
+            .index_id_patterns
+            .push(index_uid.index_id.to_string());
         let search_index_meta = search_indexes_metadatas.get(index_uid).ok_or_else(|| {
             SearchError::Internal(format!(
                 "received job for an unknown index {index_uid}. it should never happen"
@@ -1662,9 +1797,11 @@ mod tests {
     use std::str::FromStr;
     use std::sync::{Arc, RwLock};
 
-    use quickwit_common::shared_consts::SCROLL_BATCH_LEN;
     use quickwit_common::ServiceStream;
-    use quickwit_config::{DocMapping, IndexConfig, IndexingSettings, SearchSettings};
+    use quickwit_common::shared_consts::SCROLL_BATCH_LEN;
+    use quickwit_config::{
+        DocMapping, IndexConfig, IndexingSettings, IngestSettings, SearchSettings,
+    };
     use quickwit_indexing::MockSplitBuilder;
     use quickwit_metastore::{IndexMetadata, ListSplitsRequestExt, ListSplitsResponseExt};
     use quickwit_proto::metastore::{
@@ -1677,7 +1814,7 @@ mod tests {
     use tantivy::schema::{FAST, STORED, TEXT};
 
     use super::*;
-    use crate::{searcher_pool_for_test, MockSearchService};
+    use crate::{MockSearchService, searcher_pool_for_test};
 
     #[track_caller]
     fn check_snippet_fields_validation(snippet_fields: &[String]) -> anyhow::Result<()> {
@@ -1728,9 +1865,11 @@ mod tests {
             "Invalid argument: unknown field used in `sort by`: doesnotexist"
         );
         for sort_field_name in &["_doc", "_score", "_shard_doc"] {
-            assert!(get_sort_by_field_entry(sort_field_name, &schema)
-                .unwrap()
-                .is_none());
+            assert!(
+                get_sort_by_field_entry(sort_field_name, &schema)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -1755,6 +1894,7 @@ mod tests {
         }"#;
         let doc_mapping = serde_json::from_str(doc_mapping_json).unwrap();
         let indexing_settings = IndexingSettings::default();
+        let ingest_settings = IngestSettings::default();
         let search_settings = SearchSettings {
             default_search_fields: vec!["body".to_string()],
         };
@@ -1763,8 +1903,9 @@ mod tests {
             index_uri,
             doc_mapping,
             indexing_settings,
+            ingest_settings,
             search_settings,
-            retention_policy_opt: Default::default(),
+            retention_policy_opt: None,
         })
     }
 
@@ -1926,6 +2067,7 @@ mod tests {
             "store_source": true
         }"#;
         let doc_mapping = serde_json::from_str(doc_mapping_json).unwrap();
+        let ingest_settings = IngestSettings::default();
         let indexing_settings = IndexingSettings::default();
         let search_settings = SearchSettings {
             default_search_fields: vec!["body".to_string()],
@@ -1934,9 +2076,10 @@ mod tests {
             index_id: index_id.to_string(),
             index_uri,
             doc_mapping,
+            ingest_settings,
             indexing_settings,
             search_settings,
-            retention_policy_opt: Default::default(),
+            retention_policy_opt: None,
         })
     }
 
@@ -2446,7 +2589,7 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_indexes_metadata_request| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
@@ -2543,15 +2686,17 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
             .expect_list_splits()
             .returning(move |_list_splits_request| {
-                let splits = vec![MockSplitBuilder::new("split1")
-                    .with_index_uid(&index_uid)
-                    .build()];
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
                 let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
                 Ok(ServiceStream::from(vec![Ok(splits_response)]))
             });
@@ -2611,7 +2756,7 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
@@ -2703,7 +2848,7 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
@@ -2773,8 +2918,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_root_search_multiple_splits_sort_heteregeneous_field_ascending(
-    ) -> anyhow::Result<()> {
+    async fn test_root_search_multiple_splits_sort_heteregeneous_field_ascending()
+    -> anyhow::Result<()> {
         let search_request = quickwit_proto::search::SearchRequest {
             index_id_patterns: vec!["test-index".to_string()],
             query_ast: qast_json_helper("test", &["body"]),
@@ -2793,7 +2938,7 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
@@ -2955,8 +3100,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_root_search_multiple_splits_sort_heteregeneous_field_descending(
-    ) -> anyhow::Result<()> {
+    async fn test_root_search_multiple_splits_sort_heteregeneous_field_descending()
+    -> anyhow::Result<()> {
         let search_request = quickwit_proto::search::SearchRequest {
             index_id_patterns: vec!["test-index".to_string()],
             query_ast: qast_json_helper("test", &["body"]),
@@ -2975,7 +3120,7 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
@@ -3137,6 +3282,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_root_search_missing_index() -> anyhow::Result<()> {
+        let mut mock_metastore = MockMetastoreService::new();
+        let index_metadata = IndexMetadata::for_test("test-index1", "ram:///test-index");
+        let index_uid = index_metadata.index_uid.clone();
+        mock_metastore
+            .expect_list_indexes_metadata()
+            .returning(move |_index_ids_query| {
+                Ok(ListIndexesMetadataResponse::for_test(vec![
+                    index_metadata.clone(),
+                ]))
+            });
+        mock_metastore
+            .expect_list_splits()
+            .returning(move |_list_splits_request| {
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
+                let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
+                Ok(ServiceStream::from(vec![Ok(splits_response)]))
+            });
+        let mock_metastore_client = MetastoreServiceClient::from_mock(mock_metastore);
+        let mut mock_search_service = MockSearchService::new();
+        mock_search_service.expect_leaf_search().returning(
+            |_leaf_search_req: quickwit_proto::search::LeafSearchRequest| {
+                Ok(quickwit_proto::search::LeafSearchResponse {
+                    num_hits: 3,
+                    partial_hits: vec![
+                        mock_partial_hit("split1", 3, 1),
+                        mock_partial_hit("split1", 2, 2),
+                        mock_partial_hit("split1", 1, 3),
+                    ],
+                    failed_splits: Vec::new(),
+                    num_attempted_splits: 1,
+                    ..Default::default()
+                })
+            },
+        );
+        mock_search_service.expect_fetch_docs().returning(
+            |fetch_docs_req: quickwit_proto::search::FetchDocsRequest| {
+                Ok(quickwit_proto::search::FetchDocsResponse {
+                    hits: get_doc_for_fetch_req(fetch_docs_req),
+                })
+            },
+        );
+        let searcher_pool = searcher_pool_for_test([("127.0.0.1:1001", mock_search_service)]);
+        let search_job_placer = SearchJobPlacer::new(searcher_pool);
+        let cluster_client = ClusterClient::new(search_job_placer.clone());
+
+        let searcher_context = SearcherContext::for_test();
+
+        // search with ignore_missing_indexes=true succeeds
+        let search_request = quickwit_proto::search::SearchRequest {
+            index_id_patterns: vec!["test-index1".to_string(), "test-index2".to_string()],
+            query_ast: qast_json_helper("test", &["body"]),
+            max_hits: 10,
+            ignore_missing_indexes: true,
+            ..Default::default()
+        };
+        let search_response = root_search(
+            &searcher_context,
+            search_request,
+            mock_metastore_client.clone(),
+            &cluster_client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(search_response.num_hits, 3);
+        assert_eq!(search_response.hits.len(), 3);
+
+        // search with ignore_missing_indexes=false fails
+        let search_request = quickwit_proto::search::SearchRequest {
+            index_id_patterns: vec!["test-index1".to_string(), "test-index2".to_string()],
+            query_ast: qast_json_helper("test", &["body"]),
+            max_hits: 10,
+            ignore_missing_indexes: false,
+            ..Default::default()
+        };
+        let search_error = root_search(
+            &searcher_context,
+            search_request,
+            mock_metastore_client,
+            &cluster_client,
+        )
+        .await
+        .unwrap_err();
+        if let SearchError::IndexesNotFound { index_ids } = search_error {
+            assert_eq!(index_ids, vec!["test-index2".to_string()]);
+        } else {
+            panic!("unexpected error type: {search_error}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_root_search_multiple_splits_retry_on_other_node() -> anyhow::Result<()> {
         let search_request = quickwit_proto::search::SearchRequest {
             index_id_patterns: vec!["test-index".to_string()],
@@ -3151,7 +3392,7 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
@@ -3273,7 +3514,7 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_indexes_metadata_request| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
@@ -3413,15 +3654,17 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
             .expect_list_splits()
             .returning(move |_list_splits_request| {
-                let splits = vec![MockSplitBuilder::new("split1")
-                    .with_index_uid(&index_uid)
-                    .build()];
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
                 let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
                 Ok(ServiceStream::from(vec![Ok(splits_response)]))
             });
@@ -3478,7 +3721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_root_search_single_split_retry_single_node_fails() -> anyhow::Result<()> {
+    async fn test_root_search_single_split_retry_single_node_fails() {
         let search_request = quickwit_proto::search::SearchRequest {
             index_id_patterns: vec!["test-index".to_string()],
             query_ast: qast_json_helper("test", &["body"]),
@@ -3492,15 +3735,17 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
             .expect_list_splits()
             .returning(move |_filter| {
-                let splits = vec![MockSplitBuilder::new("split1")
-                    .with_index_uid(&index_uid)
-                    .build()];
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
                 let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
                 Ok(ServiceStream::from(vec![Ok(splits_response)]))
             });
@@ -3535,14 +3780,14 @@ mod tests {
             MetastoreServiceClient::from_mock(mock_metastore),
             &cluster_client,
         )
-        .await;
-        assert!(search_response.is_err());
-        Ok(())
+        .await
+        .unwrap();
+        assert_eq!(search_response.failed_splits.len(), 1);
     }
 
     #[tokio::test]
-    async fn test_root_search_one_splits_two_nodes_but_one_is_failing_for_split(
-    ) -> anyhow::Result<()> {
+    async fn test_root_search_one_splits_two_nodes_but_one_is_failing_for_split()
+    -> anyhow::Result<()> {
         let search_request = quickwit_proto::search::SearchRequest {
             index_id_patterns: vec!["test-index".to_string()],
             query_ast: qast_json_helper("test", &["body"]),
@@ -3556,15 +3801,17 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
             .expect_list_splits()
             .returning(move |_filter| {
-                let splits = vec![MockSplitBuilder::new("split1")
-                    .with_index_uid(&index_uid)
-                    .build()];
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
                 let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
                 Ok(ServiceStream::from(vec![Ok(splits_response)]))
             });
@@ -3631,8 +3878,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_root_search_one_splits_two_nodes_but_one_is_failing_completely(
-    ) -> anyhow::Result<()> {
+    async fn test_root_search_one_splits_two_nodes_but_one_is_failing_completely()
+    -> anyhow::Result<()> {
         let search_request = quickwit_proto::search::SearchRequest {
             index_id_patterns: vec!["test-index".to_string()],
             query_ast: qast_json_helper("test", &["body"]),
@@ -3646,15 +3893,17 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
             .expect_list_splits()
             .returning(move |_filter| {
-                let splits = vec![MockSplitBuilder::new("split1")
-                    .with_index_uid(&index_uid)
-                    .build()];
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
                 let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
                 Ok(ServiceStream::from(vec![Ok(splits_response)]))
             });
@@ -3719,15 +3968,17 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
             .expect_list_splits()
             .returning(move |_filter| {
-                let splits = vec![MockSplitBuilder::new("split")
-                    .with_index_uid(&index_uid)
-                    .build()];
+                let splits = vec![
+                    MockSplitBuilder::new("split")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
                 let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
                 Ok(ServiceStream::from(vec![Ok(splits_response)]))
             });
@@ -3738,33 +3989,37 @@ mod tests {
         let searcher_context = SearcherContext::for_test();
         let metastore = MetastoreServiceClient::from_mock(mock_metastore);
 
-        assert!(root_search(
-            &searcher_context,
-            quickwit_proto::search::SearchRequest {
-                index_id_patterns: vec!["test-index".to_string()],
-                query_ast: qast_json_helper("invalid_field:\"test\"", &["body"]),
-                max_hits: 10,
-                ..Default::default()
-            },
-            metastore.clone(),
-            &cluster_client,
-        )
-        .await
-        .is_err());
+        assert!(
+            root_search(
+                &searcher_context,
+                quickwit_proto::search::SearchRequest {
+                    index_id_patterns: vec!["test-index".to_string()],
+                    query_ast: qast_json_helper("invalid_field:\"test\"", &["body"]),
+                    max_hits: 10,
+                    ..Default::default()
+                },
+                metastore.clone(),
+                &cluster_client,
+            )
+            .await
+            .is_err()
+        );
 
-        assert!(root_search(
-            &searcher_context,
-            quickwit_proto::search::SearchRequest {
-                index_id_patterns: vec!["test-index".to_string()],
-                query_ast: qast_json_helper("test", &["invalid_field"]),
-                max_hits: 10,
-                ..Default::default()
-            },
-            metastore,
-            &cluster_client,
-        )
-        .await
-        .is_err());
+        assert!(
+            root_search(
+                &searcher_context,
+                quickwit_proto::search::SearchRequest {
+                    index_id_patterns: vec!["test-index".to_string()],
+                    query_ast: qast_json_helper("test", &["invalid_field"]),
+                    max_hits: 10,
+                    ..Default::default()
+                },
+                metastore,
+                &cluster_client,
+            )
+            .await
+            .is_err()
+        );
 
         Ok(())
     }
@@ -3804,15 +4059,17 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
             .expect_list_splits()
             .returning(move |_filter| {
-                let splits = vec![MockSplitBuilder::new("split1")
-                    .with_index_uid(&index_uid)
-                    .build()];
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
                 let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
                 Ok(ServiceStream::from(vec![Ok(splits_response)]))
             });
@@ -3827,10 +4084,11 @@ mod tests {
         )
         .await;
         assert!(search_response.is_err());
-        assert!(search_response
-            .unwrap_err()
-            .to_string()
-            .starts_with("invalid aggregation request: unknown variant `termss`, expected one of"));
+        assert!(
+            search_response.unwrap_err().to_string().starts_with(
+                "invalid aggregation request: unknown variant `termss`, expected one of"
+            )
+        );
         Ok(())
     }
 
@@ -3850,15 +4108,17 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
             .expect_list_splits()
             .returning(move |_filter| {
-                let splits = vec![MockSplitBuilder::new("split1")
-                    .with_index_uid(&index_uid)
-                    .build()];
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
                 let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
                 Ok(ServiceStream::from(vec![Ok(splits_response)]))
             });
@@ -3904,8 +4164,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_plan_multiple_splits() -> anyhow::Result<()> {
-        use quickwit_query::query_ast::{FullTextMode, FullTextParams, FullTextQuery};
         use quickwit_query::MatchAllOrNone;
+        use quickwit_query::query_ast::{FullTextMode, FullTextParams, FullTextQuery};
 
         let search_request = quickwit_proto::search::SearchRequest {
             index_id_patterns: vec!["test-index".to_string()],
@@ -3920,7 +4180,7 @@ mod tests {
             .expect_list_indexes_metadata()
             .returning(move |_index_ids_query| {
                 Ok(ListIndexesMetadataResponse::for_test(vec![
-                    index_metadata.clone()
+                    index_metadata.clone(),
                 ]))
             });
         mock_metastore
@@ -3956,6 +4216,7 @@ mod tests {
                         mode: FullTextMode::PhraseFallbackToIntersection,
                         zero_terms_query: MatchAllOrNone::MatchNone,
                     },
+                    lenient: false,
                 },),
                 tantivy_ast: r#"BooleanQuery {
     subqueries: [
@@ -3985,6 +4246,69 @@ mod tests {
                 },
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_plan_missing_index() -> anyhow::Result<()> {
+        let mut mock_metastore = MockMetastoreService::new();
+        let index_metadata = IndexMetadata::for_test("test-index1", "ram:///test-index");
+        let index_uid = index_metadata.index_uid.clone();
+        mock_metastore
+            .expect_list_indexes_metadata()
+            .returning(move |_index_ids_query| {
+                Ok(ListIndexesMetadataResponse::for_test(vec![
+                    index_metadata.clone(),
+                ]))
+            });
+        mock_metastore
+            .expect_list_splits()
+            .returning(move |_filter| {
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                    MockSplitBuilder::new("split2")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
+                let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
+                Ok(ServiceStream::from(vec![Ok(splits_response)]))
+            });
+        let mock_metastore_service = MetastoreServiceClient::from_mock(mock_metastore);
+
+        // plan with ignore_missing_indexes=true succeeds
+        search_plan(
+            quickwit_proto::search::SearchRequest {
+                index_id_patterns: vec!["test-index1".to_string(), "test-index2".to_string()],
+                query_ast: qast_json_helper("test-query", &["body"]),
+                max_hits: 10,
+                ignore_missing_indexes: true,
+                ..Default::default()
+            },
+            mock_metastore_service.clone(),
+        )
+        .await
+        .unwrap();
+
+        // plan with ignore_missing_indexes=false fails
+        let search_error = search_plan(
+            quickwit_proto::search::SearchRequest {
+                index_id_patterns: vec!["test-index1".to_string(), "test-index2".to_string()],
+                query_ast: qast_json_helper("test-query", &["body"]),
+                max_hits: 10,
+                ignore_missing_indexes: false,
+                ..Default::default()
+            },
+            mock_metastore_service.clone(),
+        )
+        .await
+        .unwrap_err();
+        if let SearchError::IndexesNotFound { index_ids } = search_error {
+            assert_eq!(index_ids, vec!["test-index2".to_string()]);
+        } else {
+            panic!("unexpected error type: {search_error}");
+        }
         Ok(())
     }
 
@@ -4712,11 +5036,11 @@ mod tests {
                     list_splits_request.deserialize_list_splits_query().unwrap();
                 assert!(
                     list_splits_query.index_uids
-                        == vec![
+                        == Some(vec![
                             index_uid_1.clone(),
                             index_uid_2.clone(),
                             index_uid_3.clone()
-                        ]
+                        ])
                 );
                 let splits = vec![
                     MockSplitBuilder::new("index-1-split-1")
@@ -4756,12 +5080,17 @@ mod tests {
                         .map(|split_offset| mock_partial_hit(&split_offset.split_id, 3, 1))
                         .collect_vec();
                     partial_hits.extend_from_slice(&partial_hits2);
+                    let num_attempted_splits: u64 = leaf_search_req
+                        .leaf_requests
+                        .iter()
+                        .map(|leaf_req| leaf_req.split_offsets.len() as u64)
+                        .sum::<u64>();
                     Ok(quickwit_proto::search::LeafSearchResponse {
                         num_hits: leaf_search_req.leaf_requests[0].split_offsets.len() as u64
                             + leaf_search_req.leaf_requests[1].split_offsets.len() as u64,
                         partial_hits,
                         failed_splits: Vec::new(),
-                        num_attempted_splits: 1,
+                        num_attempted_splits,
                         ..Default::default()
                     })
                 },
@@ -4802,5 +5131,259 @@ mod tests {
             vec!["test-index-1", "test-index-1", "test-index-2"]
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_root_search_split_failures() -> anyhow::Result<()> {
+        let search_request = quickwit_proto::search::SearchRequest {
+            index_id_patterns: vec!["test-index-1".to_string()],
+            query_ast: qast_json_helper("test", &["body"]),
+            max_hits: 10,
+            ..Default::default()
+        };
+        let mut mock_metastore = MockMetastoreService::new();
+        let index_metadata_1 = IndexMetadata::for_test("test-index-1", "ram:///test-index-1");
+        let index_uid_1 = index_metadata_1.index_uid.clone();
+        mock_metastore.expect_list_indexes_metadata().return_once(
+            move |_list_indexes_metadata_request: ListIndexesMetadataRequest| {
+                Ok(ListIndexesMetadataResponse::for_test(vec![
+                    index_metadata_1,
+                ]))
+            },
+        );
+        mock_metastore
+            .expect_list_splits()
+            .return_once(move |list_splits_request| {
+                let list_splits_query =
+                    list_splits_request.deserialize_list_splits_query().unwrap();
+                assert!(list_splits_query.index_uids == Some(vec![index_uid_1.clone()]));
+                let splits = vec![
+                    MockSplitBuilder::new("index-1-split-1")
+                        .with_index_uid(&index_uid_1)
+                        .build(),
+                    MockSplitBuilder::new("index-1-split-2")
+                        .with_index_uid(&index_uid_1)
+                        .build(),
+                ];
+                let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
+                Ok(ServiceStream::from(vec![Ok(splits_response)]))
+            });
+        let mut mock_search_service_1 = MockSearchService::new();
+        mock_search_service_1
+            .expect_leaf_search()
+            .withf(
+                |leaf_search_req: &quickwit_proto::search::LeafSearchRequest| {
+                    leaf_search_req.leaf_requests.len() == 1
+                        && leaf_search_req.leaf_requests[0].split_offsets.len() == 2
+                },
+            )
+            .times(1)
+            .returning(
+                |_leaf_search_req: quickwit_proto::search::LeafSearchRequest| {
+                    let partial_hits = vec![mock_partial_hit("index-1-split-1", 0u64, 1u32)];
+                    Ok(quickwit_proto::search::LeafSearchResponse {
+                        num_hits: 1,
+                        partial_hits,
+                        failed_splits: vec![{
+                            SplitSearchError {
+                                error: "some error".to_string(),
+                                split_id: "index-1-split-1".to_string(),
+                                retryable_error: true,
+                            }
+                        }],
+                        num_attempted_splits: 3,
+                        ..Default::default()
+                    })
+                },
+            );
+        mock_search_service_1
+            .expect_leaf_search()
+            .withf(
+                |leaf_search_req: &quickwit_proto::search::LeafSearchRequest| {
+                    leaf_search_req.leaf_requests.len() == 1
+                        && leaf_search_req.leaf_requests[0].split_offsets.len() == 1
+                },
+            )
+            .times(1)
+            .returning(
+                |_leaf_search_req: quickwit_proto::search::LeafSearchRequest| {
+                    Ok(quickwit_proto::search::LeafSearchResponse {
+                        num_hits: 0,
+                        partial_hits: Vec::new(),
+                        failed_splits: vec![{
+                            SplitSearchError {
+                                error: "some error".to_string(),
+                                split_id: "index-1-split-1".to_string(),
+                                retryable_error: true,
+                            }
+                        }],
+                        num_attempted_splits: 1,
+                        ..Default::default()
+                    })
+                },
+            );
+        mock_search_service_1
+            .expect_fetch_docs()
+            .times(1)
+            .returning(|fetch_docs_req| {
+                Ok(quickwit_proto::search::FetchDocsResponse {
+                    hits: get_doc_for_fetch_req(fetch_docs_req),
+                })
+            });
+        let searcher_pool = searcher_pool_for_test([("127.0.0.1:1001", mock_search_service_1)]);
+        let search_job_placer = SearchJobPlacer::new(searcher_pool);
+        let cluster_client = ClusterClient::new(search_job_placer.clone());
+        let search_response = root_search(
+            &SearcherContext::for_test(),
+            search_request,
+            MetastoreServiceClient::from_mock(mock_metastore),
+            &cluster_client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(search_response.num_hits, 1);
+        assert_eq!(search_response.hits.len(), 1);
+        assert_eq!(search_response.failed_splits.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_root_search_too_many_splits() -> anyhow::Result<()> {
+        let search_request = quickwit_proto::search::SearchRequest {
+            index_id_patterns: vec!["test-index".to_string()],
+            query_ast: qast_json_helper("test", &["body"]),
+            max_hits: 10,
+            ..Default::default()
+        };
+        let mut mock_metastore = MockMetastoreService::new();
+        let index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
+        let index_uid = index_metadata.index_uid.clone();
+        mock_metastore
+            .expect_list_indexes_metadata()
+            .returning(move |_index_ids_query| {
+                Ok(ListIndexesMetadataResponse::for_test(vec![
+                    index_metadata.clone(),
+                ]))
+            });
+        mock_metastore
+            .expect_list_splits()
+            .returning(move |_filter| {
+                let splits = vec![
+                    MockSplitBuilder::new("split1")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                    MockSplitBuilder::new("split2")
+                        .with_index_uid(&index_uid)
+                        .build(),
+                ];
+                let splits_response = ListSplitsResponse::try_from_splits(splits).unwrap();
+                Ok(ServiceStream::from(vec![Ok(splits_response)]))
+            });
+        let mock_search_service = MockSearchService::new();
+        let searcher_pool = searcher_pool_for_test([("127.0.0.1:1001", mock_search_service)]);
+        let search_job_placer = SearchJobPlacer::new(searcher_pool);
+        let cluster_client = ClusterClient::new(search_job_placer.clone());
+
+        let mut searcher_context = SearcherContext::for_test();
+        searcher_context.searcher_config.max_splits_per_search = Some(1);
+        let search_error = root_search(
+            &searcher_context,
+            search_request,
+            MetastoreServiceClient::from_mock(mock_metastore),
+            &cluster_client,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(search_error, SearchError::InvalidArgument { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_finalize_aggregation_if_any_no_aggregation_request() {
+        let search_request = SearchRequest {
+            aggregation_request: None,
+            skip_aggregation_finalization: false,
+            ..Default::default()
+        };
+        let searcher_context = SearcherContext::for_test();
+        let result =
+            finalize_aggregation_if_any(&search_request, Some(vec![1, 2, 3]), &searcher_context)
+                .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_finalize_aggregation_if_any_skip_finalization_returns_intermediate_bytes() {
+        let agg_req = r#"{"avg_price": {"avg": {"field": "price"}}}"#;
+        let intermediate_bytes = vec![42, 43, 44];
+        let search_request = SearchRequest {
+            aggregation_request: Some(agg_req.to_string()),
+            skip_aggregation_finalization: true,
+            ..Default::default()
+        };
+        let searcher_context = SearcherContext::for_test();
+        let result = finalize_aggregation_if_any(
+            &search_request,
+            Some(intermediate_bytes.clone()),
+            &searcher_context,
+        )
+        .unwrap();
+        assert_eq!(result, Some(intermediate_bytes));
+    }
+
+    #[tokio::test]
+    async fn test_finalize_aggregation_if_any_skip_finalization_none_bytes() {
+        let agg_req = r#"{"avg_price": {"avg": {"field": "price"}}}"#;
+        let search_request = SearchRequest {
+            aggregation_request: Some(agg_req.to_string()),
+            skip_aggregation_finalization: true,
+            ..Default::default()
+        };
+        let searcher_context = SearcherContext::for_test();
+        let result = finalize_aggregation_if_any(&search_request, None, &searcher_context).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_finalize_aggregation_if_any_default_finalizes() {
+        let agg_req = r#"{"avg_price": {"avg": {"field": "price"}}}"#;
+        let intermediate_results = IntermediateAggregationResults::default();
+        let intermediate_bytes = postcard::to_stdvec(&intermediate_results).unwrap();
+        let search_request = SearchRequest {
+            aggregation_request: Some(agg_req.to_string()),
+            skip_aggregation_finalization: false,
+            ..Default::default()
+        };
+        let searcher_context = SearcherContext::for_test();
+        let result = finalize_aggregation_if_any(
+            &search_request,
+            Some(intermediate_bytes.clone()),
+            &searcher_context,
+        )
+        .unwrap();
+        // Result should be Some (finalized), but different from intermediate bytes
+        assert!(result.is_some());
+        assert_ne!(result.unwrap(), intermediate_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_aggregation_if_any_false_flag_finalizes() {
+        let agg_req = r#"{"avg_price": {"avg": {"field": "price"}}}"#;
+        let intermediate_results = IntermediateAggregationResults::default();
+        let intermediate_bytes = postcard::to_stdvec(&intermediate_results).unwrap();
+        let search_request = SearchRequest {
+            aggregation_request: Some(agg_req.to_string()),
+            skip_aggregation_finalization: false,
+            ..Default::default()
+        };
+        let searcher_context = SearcherContext::for_test();
+        let result = finalize_aggregation_if_any(
+            &search_request,
+            Some(intermediate_bytes.clone()),
+            &searcher_context,
+        )
+        .unwrap();
+        assert!(result.is_some());
+        assert_ne!(result.unwrap(), intermediate_bytes);
     }
 }

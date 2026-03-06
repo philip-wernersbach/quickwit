@@ -84,7 +84,7 @@ grpc:
 
 :::warning
 We advise changing the default value of 20 MiB only if you encounter the following error:
-`Error, message length too large: found 24732228 bytes, the limit is: 20971520 bytes.` In that case, increase `max_message_size` by increments of 10 MiB until the issue disappears. This is a temporary fix: the next version of Quickwit, 0.8, will rely exclusively on gRPC streaming endpoints and handle messages of any length.
+`Error, message length too large: found 24732228 bytes, the limit is: 20971520 bytes.` In that case, increase `max_message_size` by increments of 10 MiB until the issue disappears. This is a temporary fix: the next version of Quickwit will rely exclusively on gRPC streaming endpoints and handle messages of any length.
 :::
 
 ## Storage configuration
@@ -159,6 +159,7 @@ This section contains the configuration options for an indexer. The split store 
 | `merge_concurrency` | Maximum number of merge operations that can be executed on the node at one point in time. | `(2 x num threads available) / 3` |
 | `enable_otlp_endpoint` | If true, enables the OpenTelemetry exporter endpoint to ingest logs and traces via the OpenTelemetry Protocol (OTLP). | `false` |
 | `cpu_capacity` | Advisory parameter used by the control plane. The value can expressed be in threads (e.g. `2`) or in term of millicpus (`2000m`). The control plane will attempt to schedule indexing pipelines on the different nodes proportionally to the cpu capacity advertised by the indexer. It is NOT used as a limit. All pipelines will be scheduled regardless of whether the cluster has sufficient capacity or not. The control plane does not attempt to spread the work equally when the load is well below the `cpu_capacity`. Users who need a balanced load on all of their indexer nodes can set the `cpu_capacity` to an arbitrarily low value as long as they keep it proportional to the number of threads available. | `num threads available` |
+| `enable_cooperative_indexing` | Enable sharing resources more efficiently when the number of indexes actively written to is significantly higher than the number of cores but might decrease the overall indexing throughput. | `false` |
 
 Example:
 
@@ -176,6 +177,8 @@ indexer:
 | --- | --- | --- |
 | `max_queue_memory_usage` | Maximum size in bytes of the in-memory Ingest queue. | `2GiB` |
 | `max_queue_disk_usage` | Maximum disk-space in bytes taken by the Ingest queue. The minimum size is at least `256M` and be at least `max_queue_memory_usage`. | `4GiB` |
+| `content_length_limit` | Maximum payload size uncompressed. Increasing this is discouraged, use a [file source](../ingest-data/sqs-files.md) instead. | `10MiB` |
+| `grpc_compression_algorithm` | Compression algorithm (`gzip` or `zstd`) to use for gRPC traffic between nodes for the ingest service | `None` |
 
 Example:
 
@@ -183,6 +186,8 @@ Example:
 ingest_api:
   max_queue_memory_usage: 2GiB
   max_queue_disk_usage: 4GiB
+  content_length_limit: 10MiB
+  grpc_compression_algorithm: zstd
 ```
 
 ## Searcher configuration
@@ -191,19 +196,18 @@ This section contains the configuration options for a Searcher.
 
 | Property | Description | Default value |
 | --- | --- | --- |
-| `aggregation_memory_limit` | Controls the maximum amount of memory that can be used for aggregations before aborting. This limit is per request and single leaf query (a leaf query is querying one or multiple splits concurrently). It is used to prevent excessive memory usage during the aggregation phase, which can lead to performance degradation or crashes. Since it is per request, concurrent requests can exceed the limit. | `500M`|
+| `aggregation_memory_limit` | Controls the maximum amount of memory that can be used for aggregations before aborting. This limit is per searcher node. A node may run concurrent queries, which share the limit. The first query that will hit the limit will be aborted and frees its memory. It is used to prevent excessive memory usage during the aggregation phase, which can lead to performance degradation or crashes. | `500M`|
 | `aggregation_bucket_limit` | Determines the maximum number of buckets returned to the client. | `65000` |
-| `fast_field_cache_capacity` | Fast field in memory cache capacity on a Searcher. If your filter by dates, run aggregations, range queries, or if you use the search stream API, or even for tracing, it might worth increasing this parameter. The [metrics](../reference/metrics.md) starting by `quickwit_cache_fastfields_cache` can help you make an informed choice when setting this value. | `1G` |
+| `fast_field_cache_capacity` | Fast field in memory cache capacity on a Searcher. If your filter by dates, run aggregations, range queries, or even for tracing, it might worth increasing this parameter. The [metrics](../reference/metrics.md) starting by `quickwit_cache_fastfields_cache` can help you make an informed choice when setting this value. | `1G` |
 | `split_footer_cache_capacity` | Split footer in memory cache (it is essentially the hotcache) capacity on a Searcher.| `500M` |
 | `partial_request_cache_capacity` | Partial request in memory cache capacity on a Searcher. Cache intermediate state for a request, possibly making subsequent requests faster. It can be disabled by setting the size to `0`. | `64M` |
 | `max_num_concurrent_split_searches` | Maximum number of concurrent split search requests running on a Searcher. | `100` |
-| `max_num_concurrent_split_streams` | Maximum number of concurrent split stream requests running on a Searcher. | `100` |
 | `split_cache` | Searcher split cache configuration options defined in the section below. Cache disabled if unspecified. | |
-
+| `request_timeout_secs` | The time before a search request is cancelled. This should match the timeout of the stack calling into quickwit if there is one set.  | `30` |
 
 ### Searcher split cache configuration
 
-This section contains the configuration options for the on disk searcher split cache.
+This section contains the configuration options for the on-disk searcher split cache. Files are stored in the data directory under `searcher-split-cache/`.
 
 | Property | Description | Default value |
 | --- | --- | --- |
@@ -234,7 +238,7 @@ searcher:
 Example:
 
 ```yaml
-searcher:
+jaeger:
   enable_endpoint: true
 ```
 

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -23,24 +18,25 @@ use std::collections::HashSet;
 
 use itertools::Itertools;
 use quickwit_common::binary_heap::{SortKeyMapper, TopK};
-use quickwit_doc_mapper::WarmupInfo;
+use quickwit_doc_mapper::{FastFieldWarmupInfo, WarmupInfo};
 use quickwit_proto::search::{
-    LeafSearchResponse, PartialHit, SearchRequest, SortByValue, SortOrder, SortValue,
-    SplitSearchError,
+    LeafSearchResponse, PartialHit, ResourceStats, SearchRequest, SortByValue, SortOrder,
+    SortValue, SplitSearchError,
 };
 use quickwit_proto::types::SplitId;
 use serde::Deserialize;
-use tantivy::aggregation::agg_req::{get_fast_field_names, Aggregations};
+use tantivy::aggregation::agg_req::{Aggregations, get_fast_field_names};
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
-use tantivy::aggregation::{AggregationLimits, AggregationSegmentCollector};
+use tantivy::aggregation::{AggContextParams, AggregationLimitsGuard, AggregationSegmentCollector};
 use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::columnar::{ColumnType, MonotonicallyMappableToU64};
 use tantivy::fastfield::Column;
+use tantivy::tokenizer::TokenizerManager;
 use tantivy::{DateTime, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 use crate::find_trace_ids_collector::{FindTraceIdsCollector, FindTraceIdsSegmentCollector, Span};
-use crate::top_k_collector::{specialized_top_k_segment_collector, QuickwitSegmentTopKCollector};
-use crate::GlobalDocAddress;
+use crate::top_k_collector::{QuickwitSegmentTopKCollector, specialized_top_k_segment_collector};
+use crate::{GlobalDocAddress, merge_resource_stats, merge_resource_stats_it};
 
 #[derive(Clone, Debug)]
 pub(crate) enum SortByComponent {
@@ -181,7 +177,7 @@ impl SortingFieldExtractorComponent {
             SortingFieldExtractorComponent::FastField { sort_column, .. } => {
                 sort_column.first(doc_id)
             }
-            SortingFieldExtractorComponent::Score { .. } => Some((score as f64).to_u64()),
+            SortingFieldExtractorComponent::Score => Some((score as f64).to_u64()),
         }
     }
 
@@ -343,7 +339,7 @@ impl SortingFieldExtractorComponent {
                             return None;
                         }
                         // clamp value for comparison
-                        val = val.min(1).max(0);
+                        val = val.clamp(0, 1);
                         (val == 1).to_u64()
                     }
                     (SortValue::I64(mut val), SortFieldType::Bool) => {
@@ -353,7 +349,7 @@ impl SortingFieldExtractorComponent {
                             return None;
                         }
                         // clamp value for comparison
-                        val = val.min(1).max(0);
+                        val = val.clamp(0, 1);
                         (val == 1).to_u64()
                     }
                     (SortValue::F64(mut val), SortFieldType::Bool) => {
@@ -362,7 +358,7 @@ impl SortingFieldExtractorComponent {
                         if all_values_ahead1 || all_values_ahead2 {
                             return None;
                         }
-                        val = val.min(1.0).max(0.0);
+                        val = val.clamp(0.0, 1.0);
                         (val >= 0.5).to_u64() // Is this correct?
                     }
                 };
@@ -446,8 +442,7 @@ impl TryFrom<ColumnType> for SortFieldType {
             ColumnType::DateTime => Ok(SortFieldType::DateTime),
             ColumnType::Bool => Ok(SortFieldType::Bool),
             _ => Err(TantivyError::InvalidArgument(format!(
-                "Unsupported sort field type `{:?}`.",
-                column_type
+                "Unsupported sort field type `{column_type:?}`."
             ))),
         }
     }
@@ -471,6 +466,7 @@ fn get_score_extractor(
     })
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AggregationSegmentCollectors {
     FindTraceIdsSegmentCollector(Box<FindTraceIdsSegmentCollector>),
     TantivyAggregationSegmentCollector(AggregationSegmentCollector),
@@ -586,12 +582,15 @@ impl SegmentCollector for QuickwitSegmentCollector {
             }
             None => None,
         };
+
         Ok(LeafSearchResponse {
             intermediate_aggregation_result,
             num_hits: self.num_hits,
             partial_hits,
             failed_splits: Vec::new(),
             num_attempted_splits: 1,
+            num_successful_splits: 1,
+            resource_stats: None,
         })
     }
 }
@@ -608,7 +607,8 @@ pub enum QuickwitAggregations {
 }
 
 impl QuickwitAggregations {
-    fn fast_field_names(&self) -> HashSet<String> {
+    /// Returns the list of fast fields that should be loaded for the aggregation.
+    pub fn fast_field_names(&self) -> HashSet<String> {
         match self {
             QuickwitAggregations::FindTraceIdsAggregation(collector) => {
                 collector.fast_field_names()
@@ -641,7 +641,7 @@ enum QuickwitIncrementalAggregations {
 impl QuickwitIncrementalAggregations {
     fn add(&mut self, intermediate_result: Vec<u8>) -> tantivy::Result<()> {
         match self {
-            QuickwitIncrementalAggregations::FindTraceIdsAggregation(collector, ref mut state) => {
+            QuickwitIncrementalAggregations::FindTraceIdsAggregation(collector, state) => {
                 let fruits: Vec<Span> =
                     postcard::from_bytes(&intermediate_result).map_err(map_error)?;
                 state.push(fruits);
@@ -661,21 +661,20 @@ impl QuickwitIncrementalAggregations {
     fn virtual_worst_hit(&self) -> Option<PartialHit> {
         match self {
             QuickwitIncrementalAggregations::FindTraceIdsAggregation(collector, state) => {
-                if let Some(first) = state.first() {
-                    if first.len() >= collector.num_traces {
-                        if let Some(last_elem) = first.last() {
-                            let timestamp = last_elem.span_timestamp.into_timestamp_nanos();
-                            return Some(PartialHit {
-                                sort_value: Some(SortByValue {
-                                    sort_value: Some(SortValue::I64(timestamp)),
-                                }),
-                                sort_value2: None,
-                                split_id: SplitId::new(),
-                                segment_ord: 0,
-                                doc_id: 0,
-                            });
-                        }
-                    }
+                if let Some(first) = state.first()
+                    && first.len() >= collector.num_traces
+                    && let Some(last_elem) = first.last()
+                {
+                    let timestamp = last_elem.span_timestamp.into_timestamp_nanos();
+                    return Some(PartialHit {
+                        sort_value: Some(SortByValue {
+                            sort_value: Some(SortValue::I64(timestamp)),
+                        }),
+                        sort_value2: None,
+                        split_id: SplitId::new(),
+                        segment_ord: 0,
+                        doc_id: 0,
+                    });
                 }
                 None
             }
@@ -717,7 +716,7 @@ pub(crate) struct QuickwitCollector {
     pub max_hits: usize,
     pub sort_by: SortByPair,
     pub aggregation: Option<QuickwitAggregations>,
-    pub aggregation_limits: AggregationLimits,
+    pub agg_context_params: AggContextParams,
     search_after: Option<PartialHit>,
 }
 
@@ -748,7 +747,14 @@ impl QuickwitCollector {
 
     pub fn warmup_info(&self) -> WarmupInfo {
         WarmupInfo {
-            fast_field_names: self.fast_field_names(),
+            fast_fields: self
+                .fast_field_names()
+                .into_iter()
+                .map(|name| FastFieldWarmupInfo {
+                    name,
+                    with_subfields: false,
+                })
+                .collect(),
             field_norms: self.requires_scoring(),
             ..WarmupInfo::default()
         }
@@ -780,7 +786,7 @@ impl Collector for QuickwitCollector {
                         aggs,
                         segment_reader,
                         segment_ord,
-                        &self.aggregation_limits,
+                        &self.agg_context_params,
                     )?,
                 ),
             ),
@@ -855,8 +861,10 @@ impl Collector for QuickwitCollector {
     }
 }
 
-fn map_error(err: postcard::Error) -> TantivyError {
-    TantivyError::InternalError(format!("merge result Postcard error: {err}"))
+fn map_error(error: postcard::Error) -> TantivyError {
+    TantivyError::InternalError(format!(
+        "failed to merge intermediate aggregation results: Postcard error: {error}"
+    ))
 }
 
 /// Merges a set of Leaf Results.
@@ -878,24 +886,24 @@ fn merge_intermediate_aggregation_result<'a>(
             Some(serialized)
         }
         Some(QuickwitAggregations::TantivyAggregations(_)) => {
-            let fruits: Vec<IntermediateAggregationResults> = intermediate_aggregation_results
-                .map(|intermediate_aggregation_result| {
-                    postcard::from_bytes(intermediate_aggregation_result).map_err(map_error)
-                })
-                .collect::<Result<_, _>>()?;
-
-            let mut fruit_iter = fruits.into_iter();
-            if let Some(first_fruit) = fruit_iter.next() {
-                let mut merged_fruit = first_fruit;
-                for fruit in fruit_iter {
-                    merged_fruit.merge_fruits(fruit)?;
-                }
-                let serialized = postcard::to_allocvec(&merged_fruit).map_err(map_error)?;
-
-                Some(serialized)
-            } else {
-                None
-            }
+            let merged_opt = intermediate_aggregation_results
+                .map(|bytes| postcard::from_bytes(bytes).map_err(map_error))
+                .try_fold::<_, _, Result<_, TantivyError>>(
+                    None,
+                    |acc: Option<IntermediateAggregationResults>, fruits_res| {
+                        let fruits = fruits_res?;
+                        match acc {
+                            Some(mut merged_fruits) => {
+                                merged_fruits.merge_fruits(fruits)?;
+                                Ok(Some(merged_fruits))
+                            }
+                            None => Ok(Some(fruits)),
+                        }
+                    },
+                )?;
+            let serialized =
+                postcard::to_allocvec(&merged_opt.unwrap_or_default()).map_err(map_error)?;
+            Some(serialized)
         }
         None => None,
     };
@@ -916,6 +924,11 @@ fn merge_leaf_responses(
         return Ok(leaf_responses.pop().unwrap());
     }
 
+    let resource_stats_it = leaf_responses
+        .iter()
+        .map(|leaf_response| &leaf_response.resource_stats);
+    let merged_resource_stats = merge_resource_stats_it(resource_stats_it);
+
     let merged_intermediate_aggregation_result: Option<Vec<u8>> =
         merge_intermediate_aggregation_result(
             aggregations_opt,
@@ -927,6 +940,10 @@ fn merge_leaf_responses(
         .iter()
         .map(|leaf_response| leaf_response.num_attempted_splits)
         .sum();
+    let num_successful_splits = leaf_responses
+        .iter()
+        .map(|leaf_response| leaf_response.num_successful_splits)
+        .sum::<u64>();
     let num_hits: u64 = leaf_responses
         .iter()
         .map(|leaf_response| leaf_response.num_hits)
@@ -952,6 +969,8 @@ fn merge_leaf_responses(
         partial_hits: top_k_partial_hits,
         failed_splits,
         num_attempted_splits,
+        num_successful_splits,
+        resource_stats: merged_resource_stats,
     })
 }
 
@@ -995,13 +1014,13 @@ pub(crate) fn sort_by_from_request(search_request: &SearchRequest) -> SortByPair
         .into()
     } else if num_sort_fields == 1 {
         let sort_field = &search_request.sort_fields[0];
-        let order = SortOrder::from_i32(sort_field.sort_order).unwrap_or(SortOrder::Desc);
+        let order = SortOrder::try_from(sort_field.sort_order).unwrap_or(SortOrder::Desc);
         to_sort_by_component(&sort_field.field_name, order).into()
     } else if num_sort_fields == 2 {
         let sort_field1 = &search_request.sort_fields[0];
-        let order1 = SortOrder::from_i32(sort_field1.sort_order).unwrap_or(SortOrder::Desc);
+        let order1 = SortOrder::try_from(sort_field1.sort_order).unwrap_or(SortOrder::Desc);
         let sort_field2 = &search_request.sort_fields[1];
-        let order2 = SortOrder::from_i32(sort_field2.sort_order).unwrap_or(SortOrder::Desc);
+        let order2 = SortOrder::try_from(sort_field2.sort_order).unwrap_or(SortOrder::Desc);
         SortByPair {
             first: to_sort_by_component(&sort_field1.field_name, order1),
             second: Some(to_sort_by_component(&sort_field2.field_name, order2)),
@@ -1015,7 +1034,7 @@ pub(crate) fn sort_by_from_request(search_request: &SearchRequest) -> SortByPair
 pub(crate) fn make_collector_for_split(
     split_id: SplitId,
     search_request: &SearchRequest,
-    aggregation_limits: AggregationLimits,
+    agg_context_params: AggContextParams,
 ) -> crate::Result<QuickwitCollector> {
     let aggregation = match &search_request.aggregation_request {
         Some(aggregation) => Some(serde_json::from_str(aggregation)?),
@@ -1028,7 +1047,7 @@ pub(crate) fn make_collector_for_split(
         max_hits: search_request.max_hits as usize,
         sort_by,
         aggregation,
-        aggregation_limits,
+        agg_context_params,
         search_after: search_request.search_after.clone(),
     })
 }
@@ -1036,8 +1055,15 @@ pub(crate) fn make_collector_for_split(
 /// Builds a QuickwitCollector that's only useful for merging fruits.
 pub(crate) fn make_merge_collector(
     search_request: &SearchRequest,
-    aggregation_limits: &AggregationLimits,
+    agg_limits: AggregationLimitsGuard,
 ) -> crate::Result<QuickwitCollector> {
+    // Note: at this point the tokenizer manager is not used anymore by aggregations (filter query),
+    // so we can create an empty one. So if it will ever be used, it would panic.
+    let agg_context_params = AggContextParams {
+        limits: agg_limits,
+        tokenizers: TokenizerManager::new(),
+    };
+
     let aggregation = match &search_request.aggregation_request {
         Some(aggregation) => Some(serde_json::from_str(aggregation)?),
         None => None,
@@ -1049,7 +1075,7 @@ pub(crate) fn make_merge_collector(
         max_hits: search_request.max_hits as usize,
         sort_by,
         aggregation,
-        aggregation_limits: aggregation_limits.clone(),
+        agg_context_params,
         search_after: search_request.search_after.clone(),
     })
 }
@@ -1173,7 +1199,9 @@ pub(crate) struct IncrementalCollector {
     num_hits: u64,
     failed_splits: Vec<SplitSearchError>,
     num_attempted_splits: u64,
+    num_successful_splits: u64,
     start_offset: usize,
+    resource_stats: Option<ResourceStats>,
 }
 
 impl IncrementalCollector {
@@ -1193,6 +1221,8 @@ impl IncrementalCollector {
             num_hits: 0,
             failed_splits: Vec::new(),
             num_attempted_splits: 0,
+            num_successful_splits: 0,
+            resource_stats: None,
         }
     }
 
@@ -1204,12 +1234,17 @@ impl IncrementalCollector {
             failed_splits,
             num_attempted_splits,
             intermediate_aggregation_result,
+            num_successful_splits,
+            resource_stats,
         } = leaf_response;
+
+        merge_resource_stats(&resource_stats, &mut self.resource_stats);
 
         self.num_hits += num_hits;
         self.top_k_hits.add_entries(partial_hits.into_iter());
         self.failed_splits.extend(failed_splits);
         self.num_attempted_splits += num_attempted_splits;
+        self.num_successful_splits += num_successful_splits;
         if let Some(intermediate_aggregation_result) = intermediate_aggregation_result {
             self.incremental_aggregation
                 .add(intermediate_aggregation_result)?;
@@ -1225,7 +1260,7 @@ impl IncrementalCollector {
     /// Get the worst top-hit. Can be used to skip splits if they can't possibly do better.
     ///
     /// Only returns a result if enough hits were recorded already.
-    pub(crate) fn peek_worst_hit(&self) -> Option<Cow<PartialHit>> {
+    pub(crate) fn peek_worst_hit(&self) -> Option<Cow<'_, PartialHit>> {
         if self.top_k_hits.max_len() == 0 {
             return self
                 .incremental_aggregation
@@ -1252,7 +1287,9 @@ impl IncrementalCollector {
             partial_hits,
             failed_splits: self.failed_splits,
             num_attempted_splits: self.num_attempted_splits,
+            num_successful_splits: self.num_successful_splits,
             intermediate_aggregation_result,
+            resource_stats: self.resource_stats,
         })
     }
 }
@@ -1262,15 +1299,17 @@ mod tests {
     use std::cmp::Ordering;
 
     use quickwit_proto::search::{
-        LeafSearchResponse, PartialHit, SearchRequest, SortByValue, SortField, SortOrder,
-        SortValue, SplitSearchError,
+        LeafSearchResponse, PartialHit, ResourceStats, SearchRequest, SortByValue, SortField,
+        SortOrder, SortValue, SplitSearchError,
     };
-    use quickwit_proto::types::DocMappingUid;
-    use tantivy::collector::Collector;
     use tantivy::TantivyDocument;
+    use tantivy::aggregation::agg_req::Aggregations;
+    use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
+    use tantivy::collector::Collector;
 
-    use super::{make_merge_collector, IncrementalCollector};
-    use crate::collector::top_k_partial_hits;
+    use super::{IncrementalCollector, make_merge_collector};
+    use crate::QuickwitAggregations;
+    use crate::collector::{merge_intermediate_aggregation_result, top_k_partial_hits};
 
     #[test]
     fn test_merge_partial_hits_no_tie() {
@@ -1331,62 +1370,6 @@ mod tests {
         );
     }
 
-    // TODO figure out a way to remove this boilerplate and use mockall
-    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-    struct MockDocMapper;
-
-    #[typetag::serde(name = "mock")]
-    impl quickwit_doc_mapper::DocMapper for MockDocMapper {
-        fn doc_mapping_uid(&self) -> DocMappingUid {
-            DocMappingUid::default()
-        }
-
-        // Required methods
-        fn doc_from_json_obj(
-            &self,
-            _json_obj: quickwit_doc_mapper::JsonObject,
-            _doc_len: u64,
-        ) -> Result<(u64, TantivyDocument), quickwit_doc_mapper::DocParsingError> {
-            unimplemented!()
-        }
-        fn doc_to_json(
-            &self,
-            _named_doc: std::collections::BTreeMap<String, Vec<tantivy::schema::OwnedValue>>,
-        ) -> anyhow::Result<quickwit_doc_mapper::JsonObject> {
-            unimplemented!()
-        }
-        fn schema(&self) -> tantivy::schema::Schema {
-            unimplemented!()
-        }
-        fn query(
-            &self,
-            _split_schema: tantivy::schema::Schema,
-            _query_ast: &quickwit_query::query_ast::QueryAst,
-            _with_validation: bool,
-        ) -> Result<
-            (
-                Box<dyn tantivy::query::Query>,
-                quickwit_doc_mapper::WarmupInfo,
-            ),
-            quickwit_doc_mapper::QueryParserError,
-        > {
-            unimplemented!()
-        }
-        fn default_search_fields(&self) -> &[String] {
-            unimplemented!()
-        }
-        fn max_num_partitions(&self) -> std::num::NonZeroU32 {
-            unimplemented!()
-        }
-        fn tokenizer_manager(&self) -> &quickwit_query::tokenizers::TokenizerManager {
-            unimplemented!()
-        }
-
-        fn timestamp_field_name(&self) -> Option<&str> {
-            None
-        }
-    }
-
     fn sort_dataset() -> Vec<(Option<u64>, Option<u64>)> {
         // every combination of 0..=2 + None, in random order.
         // (2, 1) is duplicated to allow testing for DocId sorting with two sort fields
@@ -1438,9 +1421,9 @@ mod tests {
     }
 
     fn make_index() -> tantivy::Index {
+        use tantivy::Index;
         use tantivy::indexer::UserOperation;
         use tantivy::schema::{NumericOptions, Schema};
-        use tantivy::Index;
 
         let dataset = sort_dataset();
 
@@ -1494,10 +1477,10 @@ mod tests {
         let reverse_int = |val: &Option<u64>| val.as_ref().map(|val| u64::MAX - val);
         let cmp_doc_id_desc = |a: &Doc, b: &Doc| b.0.cmp(&a.0);
         let cmp_doc_id_asc = |a: &Doc, b: &Doc| a.0.cmp(&b.0);
-        let cmp_1_desc = |a: &Doc, b: &Doc| b.1 .0.cmp(&a.1 .0);
-        let cmp_1_asc = |a: &Doc, b: &Doc| reverse_int(&b.1 .0).cmp(&reverse_int(&a.1 .0));
-        let cmp_2_desc = |a: &Doc, b: &Doc| b.1 .1.cmp(&a.1 .1);
-        let cmp_2_asc = |a: &Doc, b: &Doc| reverse_int(&b.1 .1).cmp(&reverse_int(&a.1 .1));
+        let cmp_1_desc = |a: &Doc, b: &Doc| b.1.0.cmp(&a.1.0);
+        let cmp_1_asc = |a: &Doc, b: &Doc| reverse_int(&b.1.0).cmp(&reverse_int(&a.1.0));
+        let cmp_2_desc = |a: &Doc, b: &Doc| b.1.1.cmp(&a.1.1);
+        let cmp_2_asc = |a: &Doc, b: &Doc| reverse_int(&b.1.1).cmp(&reverse_int(&a.1.1));
 
         {
             // the logic for sorting isn't easy to wrap one's head around. These simple tests are
@@ -1626,8 +1609,8 @@ mod tests {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        eprintln!("expected: {:#?}", expected_docids);
-                        eprintln!("got: {:#?}", got_docids);
+                        eprintln!("expected: {expected_docids:#?}");
+                        eprintln!("got: {got_docids:#?}");
                         panic!("mismatch ordering for \"{sort_str}\":{slice_len}");
                     }
                 }
@@ -1649,8 +1632,8 @@ mod tests {
 
         let reverse_int = |val: &Option<u64>| val.as_ref().map(|val| u64::MAX - val);
         let cmp_doc_id_desc = |a: &Doc, b: &Doc| b.0.cmp(&a.0);
-        let cmp_1_desc = |a: &Doc, b: &Doc| b.1 .0.cmp(&a.1 .0);
-        let cmp_2_asc = |a: &Doc, b: &Doc| reverse_int(&b.1 .1).cmp(&reverse_int(&a.1 .1));
+        let cmp_1_desc = |a: &Doc, b: &Doc| b.1.0.cmp(&a.1.0);
+        let cmp_2_asc = |a: &Doc, b: &Doc| reverse_int(&b.1.1).cmp(&reverse_int(&a.1.1));
 
         let sort_function =
             |a: &Doc, b: &Doc| cmp_1_desc(a, b).then(cmp_2_asc(a, b).then(cmp_doc_id_desc(a, b)));
@@ -1773,7 +1756,7 @@ mod tests {
         request: &SearchRequest,
         results: Vec<LeafSearchResponse>,
     ) -> LeafSearchResponse {
-        let collector = make_merge_collector(request, &Default::default()).unwrap();
+        let collector = make_merge_collector(request, Default::default()).unwrap();
         let mut incremental_collector = IncrementalCollector::new(collector.clone());
 
         let result = collector
@@ -1814,7 +1797,9 @@ mod tests {
                 }],
                 failed_splits: Vec::new(),
                 num_attempted_splits: 3,
+                num_successful_splits: 3,
                 intermediate_aggregation_result: None,
+                resource_stats: None,
             }],
         );
 
@@ -1831,7 +1816,9 @@ mod tests {
                 }],
                 failed_splits: Vec::new(),
                 num_attempted_splits: 3,
-                intermediate_aggregation_result: None
+                num_successful_splits: 3,
+                intermediate_aggregation_result: None,
+                resource_stats: None,
             }
         );
 
@@ -1868,7 +1855,9 @@ mod tests {
                     ],
                     failed_splits: Vec::new(),
                     num_attempted_splits: 3,
+                    num_successful_splits: 3,
                     intermediate_aggregation_result: None,
+                    resource_stats: None,
                 },
                 LeafSearchResponse {
                     num_hits: 10,
@@ -1885,7 +1874,9 @@ mod tests {
                         retryable_error: true,
                     }],
                     num_attempted_splits: 2,
+                    num_successful_splits: 1,
                     intermediate_aggregation_result: None,
+                    resource_stats: None,
                 },
             ],
         );
@@ -1916,7 +1907,9 @@ mod tests {
                     retryable_error: true,
                 }],
                 num_attempted_splits: 5,
-                intermediate_aggregation_result: None
+                num_successful_splits: 4,
+                intermediate_aggregation_result: None,
+                resource_stats: None,
             }
         );
 
@@ -1954,7 +1947,12 @@ mod tests {
                     ],
                     failed_splits: Vec::new(),
                     num_attempted_splits: 3,
+                    num_successful_splits: 3,
                     intermediate_aggregation_result: None,
+                    resource_stats: Some(ResourceStats {
+                        cpu_microsecs: 100,
+                        ..Default::default()
+                    }),
                 },
                 LeafSearchResponse {
                     num_hits: 10,
@@ -1971,7 +1969,12 @@ mod tests {
                         retryable_error: true,
                     }],
                     num_attempted_splits: 2,
+                    num_successful_splits: 1,
                     intermediate_aggregation_result: None,
+                    resource_stats: Some(ResourceStats {
+                        cpu_microsecs: 50,
+                        ..Default::default()
+                    }),
                 },
             ],
         );
@@ -2002,9 +2005,32 @@ mod tests {
                     retryable_error: true,
                 }],
                 num_attempted_splits: 5,
-                intermediate_aggregation_result: None
+                num_successful_splits: 4,
+                intermediate_aggregation_result: None,
+                resource_stats: Some(ResourceStats {
+                    cpu_microsecs: 150,
+                    ..Default::default()
+                }),
             }
         );
         // TODO would be nice to test aggregation too.
+    }
+
+    #[test]
+    fn test_merge_empty_intermediate_aggregation_result() {
+        let merged = merge_intermediate_aggregation_result(&None, std::iter::empty()).unwrap();
+        assert!(merged.is_none());
+
+        let aggregations_json = r#"{
+            "avg_price": { "avg": { "field": "price" } }
+        }"#;
+        let ttv_aggregations: Aggregations = serde_json::from_str(aggregations_json).unwrap();
+        let qw_aggregations = QuickwitAggregations::TantivyAggregations(ttv_aggregations);
+        let serialized =
+            merge_intermediate_aggregation_result(&Some(qw_aggregations), std::iter::empty())
+                .unwrap()
+                .unwrap();
+        let _merged: IntermediateAggregationResults = postcard::from_bytes(&serialized).unwrap();
+        // Hopefully `_merged` is empty but the API does not allow us to assert that.
     }
 }

@@ -1,30 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub(crate) mod serialize;
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use quickwit_common::uri::Uri;
 use quickwit_config::{
-    DocMapping, IndexConfig, IndexingSettings, RetentionPolicy, SearchSettings, SourceConfig,
+    DocMapping, IndexConfig, IndexingSettings, IngestSettings, RetentionPolicy, SearchSettings,
+    SourceConfig, prepare_doc_mapping_update,
 };
 use quickwit_proto::metastore::{EntityKind, MetastoreError, MetastoreResult};
 use quickwit_proto::types::{IndexUid, SourceId};
@@ -100,44 +96,43 @@ impl IndexMetadata {
         &self.index_config().index_uri
     }
 
-    /// Replaces or removes the current retention policy, returning whether a mutation occurred.
-    pub fn set_retention_policy(&mut self, retention_policy_opt: Option<RetentionPolicy>) -> bool {
-        if self.index_config.retention_policy_opt != retention_policy_opt {
-            self.index_config.retention_policy_opt = retention_policy_opt;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Replaces the current search settings, returning whether a mutation occurred.
-    pub fn set_search_settings(&mut self, search_settings: SearchSettings) -> bool {
-        if self.index_config.search_settings != search_settings {
-            self.index_config.search_settings = search_settings;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Replaces the current indexing settings, returning whether a mutation occurred.
-    pub fn set_indexing_settings(&mut self, indexing_settings: IndexingSettings) -> bool {
-        if self.index_config.indexing_settings != indexing_settings {
+    /// Updates the index config.
+    ///
+    /// Returns whether a mutation occurred.
+    pub fn update_index_config(
+        &mut self,
+        doc_mapping: DocMapping,
+        indexing_settings: IndexingSettings,
+        ingest_settings: IngestSettings,
+        search_settings: SearchSettings,
+        retention_policy_opt: Option<RetentionPolicy>,
+    ) -> MetastoreResult<bool> {
+        let (updated_doc_mapping, mut mutation_occurred) = prepare_doc_mapping_update(
+            doc_mapping,
+            &self.index_config.doc_mapping,
+            &search_settings,
+        )
+        .map_err(|error| MetastoreError::InvalidArgument {
+            message: error.to_string(),
+        })?;
+        self.index_config.doc_mapping = updated_doc_mapping;
+        if indexing_settings != self.index_config.indexing_settings {
             self.index_config.indexing_settings = indexing_settings;
-            true
-        } else {
-            false
+            mutation_occurred = true;
         }
-    }
-
-    /// Replaces the current doc mapping, returning whether a mutation occurred.
-    pub fn set_doc_mapping(&mut self, doc_mapping: DocMapping) -> bool {
-        if self.index_config.doc_mapping != doc_mapping {
-            self.index_config.doc_mapping = doc_mapping;
-            true
-        } else {
-            false
+        if ingest_settings != self.index_config.ingest_settings {
+            self.index_config.ingest_settings = ingest_settings;
+            mutation_occurred = true;
         }
+        if search_settings != self.index_config.search_settings {
+            self.index_config.search_settings = search_settings;
+            mutation_occurred = true;
+        }
+        if retention_policy_opt != self.index_config.retention_policy_opt {
+            self.index_config.retention_policy_opt = retention_policy_opt;
+            mutation_occurred = true;
+        }
+        Ok(mutation_occurred)
     }
 
     /// Adds a source to the index. Returns an error if the source already exists.
@@ -152,6 +147,24 @@ impl IndexMetadata {
                 entry.insert(source_config);
                 Ok(())
             }
+        }
+    }
+
+    /// Adds a source to the index. Returns whether a mutation occurred and an
+    /// error if the source doesn't exist.
+    pub fn update_source(&mut self, source_config: SourceConfig) -> MetastoreResult<bool> {
+        match self.sources.entry(source_config.source_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                if entry.get() == &source_config {
+                    return Ok(false);
+                }
+                entry.insert(source_config);
+                Ok(true)
+            }
+            Entry::Vacant(_) => Err(MetastoreError::NotFound(EntityKind::Source {
+                index_id: self.index_id().to_string(),
+                source_id: source_config.source_id,
+            })),
         }
     }
 
@@ -222,5 +235,98 @@ impl quickwit_config::TestableForRegression for IndexMetadata {
         assert_eq!(self.checkpoint, other.checkpoint);
         assert_eq!(self.create_timestamp, other.create_timestamp);
         assert_eq!(self.sources, other.sources);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quickwit_doc_mapper::Mode;
+    use quickwit_proto::types::DocMappingUid;
+
+    use super::*;
+
+    #[test]
+    fn test_update_index_config() {
+        let current_index_config = IndexConfig::for_test("test-index", "s3://test-index");
+        let mut current_index_metadata = IndexMetadata::new(current_index_config.clone());
+
+        let mutation_occurred = current_index_metadata
+            .update_index_config(
+                current_index_config.doc_mapping.clone(),
+                current_index_config.indexing_settings.clone(),
+                current_index_config.ingest_settings.clone(),
+                current_index_config.search_settings.clone(),
+                current_index_config.retention_policy_opt.clone(),
+            )
+            .unwrap();
+        assert!(!mutation_occurred);
+
+        let new_search_settings = SearchSettings {
+            default_search_fields: vec!["message".to_string(), "status".to_string()],
+        };
+        let mutation_occurred = current_index_metadata
+            .update_index_config(
+                current_index_config.doc_mapping.clone(),
+                current_index_config.indexing_settings.clone(),
+                current_index_config.ingest_settings.clone(),
+                new_search_settings,
+                current_index_config.retention_policy_opt.clone(),
+            )
+            .unwrap();
+        assert!(mutation_occurred);
+        assert_eq!(
+            current_index_metadata
+                .index_config()
+                .search_settings
+                .default_search_fields,
+            ["message", "status"]
+        );
+    }
+
+    #[test]
+    fn test_update_doc_mapping() {
+        let current_index_config = IndexConfig::for_test("test-index", "s3://test-index");
+        let mut current_index_metadata = IndexMetadata::new(current_index_config.clone());
+
+        let mut new_doc_mapping = current_index_config.doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.timestamp_field = Some("ts".to_string()); // This is set to `timestamp` for the current doc mapping.
+
+        current_index_metadata
+            .update_index_config(
+                new_doc_mapping,
+                current_index_config.indexing_settings.clone(),
+                current_index_config.ingest_settings.clone(),
+                current_index_config.search_settings.clone(),
+                current_index_config.retention_policy_opt.clone(),
+            )
+            .unwrap_err();
+
+        let mut new_doc_mapping = current_index_config.doc_mapping.clone();
+        let new_doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.doc_mapping_uid = new_doc_mapping_uid;
+        new_doc_mapping.mode = Mode::Strict;
+
+        let mutation_occurred = current_index_metadata
+            .update_index_config(
+                new_doc_mapping,
+                current_index_config.indexing_settings,
+                current_index_config.ingest_settings,
+                current_index_config.search_settings,
+                current_index_config.retention_policy_opt,
+            )
+            .unwrap();
+        assert!(mutation_occurred);
+        assert_eq!(
+            current_index_metadata
+                .index_config()
+                .doc_mapping
+                .doc_mapping_uid,
+            new_doc_mapping_uid
+        );
+        assert_eq!(
+            current_index_metadata.index_config().doc_mapping.mode,
+            Mode::Strict
+        );
     }
 }

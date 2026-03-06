@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use core::fmt;
 use std::io::read_to_string;
@@ -162,7 +157,10 @@ fn uri_from_s3_notification(message: &[u8], ack_id: &str) -> Result<Uri, PreProc
     let bucket = value["Records"][0]["s3"]["bucket"]["name"]
         .as_str()
         .context("invalid S3 notification: Records[0].s3.bucket.name not found")?;
-    Uri::from_str(&format!("s3://{}/{}", bucket, key)).map_err(|e| e.into())
+    let encoded_key = percent_encoding::percent_decode(key.as_bytes())
+        .decode_utf8()
+        .context("invalid S3 notification: Records[0].s3.object.key could not be url decoded")?;
+    Uri::from_str(&format!("s3://{bucket}/{encoded_key}")).map_err(|e| e.into())
 }
 
 /// A message for which we know as much of the global processing status as
@@ -348,5 +346,52 @@ mod tests {
         } else {
             panic!("Expected skippable error");
         }
+    }
+
+    #[test]
+    fn test_uri_from_s3_notification_url_decode() {
+        let test_message = r#"
+        {
+            "Records": [
+                {
+                "eventVersion": "2.1",
+                "eventSource": "aws:s3",
+                "awsRegion": "us-west-2",
+                "eventTime": "2021-05-22T09:22:41.789Z",
+                "eventName": "ObjectCreated:Put",
+                "userIdentity": {
+                    "principalId": "AWS:AIDAJDPLRKLG7UEXAMPLE"
+                },
+                "requestParameters": {
+                    "sourceIPAddress": "127.0.0.1"
+                },
+                "responseElements": {
+                    "x-amz-request-id": "C3D13FE58DE4C810",
+                    "x-amz-id-2": "FMyUVURIx7Zv2cPi/IZb9Fk1/U4QfTaVK5fahHPj/"
+                },
+                "s3": {
+                    "s3SchemaVersion": "1.0",
+                    "configurationId": "testConfigRule",
+                    "bucket": {
+                        "name": "mybucket",
+                        "ownerIdentity": {
+                            "principalId": "A3NL1KOZZKExample"
+                        },
+                        "arn": "arn:aws:s3:::mybucket"
+                    },
+                    "object": {
+                        "key": "hello%3A%3Aworld%3A%3Alogs.json",
+                        "size": 1024,
+                        "eTag": "d41d8cd98f00b204e9800998ecf8427e",
+                        "versionId": "096fKKXTRTtl3on89fVO.nfljtsv6qko",
+                        "sequencer": "0055AED6DCD90281E5"
+                    }
+                }
+                }
+            ]
+        }"#;
+        let actual_uri = uri_from_s3_notification(test_message.as_bytes(), "myackid").unwrap();
+        let expected_uri = Uri::from_str("s3://mybucket/hello::world::logs.json").unwrap();
+        assert_eq!(actual_uri, expected_uri);
     }
 }

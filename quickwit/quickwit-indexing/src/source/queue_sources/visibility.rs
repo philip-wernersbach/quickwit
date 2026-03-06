@@ -1,31 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use quickwit_actors::{
     Actor, ActorContext, ActorExitStatus, ActorHandle, ActorState, Handler, Mailbox,
 };
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use super::Queue;
 use crate::source::SourceContext;
@@ -40,7 +35,7 @@ pub(super) struct VisibilitySettings {
     pub deadline_for_default_extension: Duration,
     /// Rhe timeout for the visibility extension request
     pub request_timeout: Duration,
-    /// an extra margin that is substracted from the expected deadline when
+    /// an extra margin that is subtracted from the expected deadline when
     /// asserting whether we are still in time to extend the visibility
     pub request_margin: Duration,
 }
@@ -145,9 +140,9 @@ impl VisibilityTaskHandle {
         &self.ack_id
     }
 
-    pub async fn request_last_extension(self, extension: Duration) -> anyhow::Result<()> {
+    pub async fn request_last_extension(self) -> anyhow::Result<()> {
         self.mailbox
-            .ask_for_res(RequestLastExtension { extension })
+            .ask_for_res(RequestLastExtension)
             .await
             .map_err(|e| anyhow!(e))?;
         Ok(())
@@ -208,12 +203,10 @@ impl Handler<Loop> for VisibilityTask {
     }
 }
 
-/// Ensures that the visibility of the message is extended until the given
-/// deadline and then stops the extension loop.
+/// Ensures that the visibility of the message is extended using
+/// deadline_for_last_extension and then stops the extension loop.
 #[derive(Debug)]
-struct RequestLastExtension {
-    extension: Duration,
-}
+struct RequestLastExtension;
 
 #[async_trait]
 impl Handler<RequestLastExtension> for VisibilityTask {
@@ -221,13 +214,16 @@ impl Handler<RequestLastExtension> for VisibilityTask {
 
     async fn handle(
         &mut self,
-        message: RequestLastExtension,
+        _message: RequestLastExtension,
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
-        let last_deadline = Instant::now() + message.extension;
+        let deadline_for_last_extension = self.visibility_settings.deadline_for_last_extension;
+        let last_deadline = Instant::now() + deadline_for_last_extension;
         self.last_extension_requested = true;
         if last_deadline > self.current_deadline {
-            Ok(self.extend_visibility(ctx, message.extension).await)
+            Ok(self
+                .extend_visibility(ctx, deadline_for_last_extension)
+                .await)
         } else {
             Ok(Ok(()))
         }
@@ -264,7 +260,7 @@ mod tests {
         // spawn task
         let visibility_settings = VisibilitySettings {
             deadline_for_default_extension: Duration::from_secs(1),
-            deadline_for_last_extension: Duration::from_secs(20),
+            deadline_for_last_extension: Duration::from_secs(5),
             deadline_for_receive: Duration::from_secs(1),
             request_timeout: Duration::from_millis(100),
             request_margin: Duration::from_millis(100),
@@ -282,11 +278,7 @@ mod tests {
         let next_deadline = queue.next_visibility_deadline(&ack_id).unwrap();
         assert!(initial_deadline < next_deadline);
         assert!(!handle.extension_failed());
-        // request last extension
-        handle
-            .request_last_extension(Duration::from_secs(5))
-            .await
-            .unwrap();
+        handle.request_last_extension().await.unwrap();
         assert!(
             Instant::now() + Duration::from_secs(4)
                 < queue.next_visibility_deadline(&ack_id).unwrap()

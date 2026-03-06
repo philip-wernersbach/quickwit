@@ -1,32 +1,23 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::any::type_name;
 use std::fmt;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
-use futures::Future;
-use pin_project::pin_project;
 use tokio::time::Sleep;
-use tower::retry::{Policy, Retry};
 use tower::Layer;
+use tower::retry::{Policy, Retry};
 use tracing::debug;
 
 use crate::retry::{RetryParams, Retryable};
@@ -71,61 +62,37 @@ impl From<RetryParams> for RetryPolicy {
     }
 }
 
-#[pin_project]
-pub struct RetryFuture {
-    retry_policy: RetryPolicy,
-    #[pin]
-    sleep_fut: Sleep,
-}
-
-impl Future for RetryFuture {
-    type Output = RetryPolicy;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        this.sleep_fut.poll(cx).map(|_| *this.retry_policy)
-    }
-}
-
 impl<R, T, E> Policy<R, T, E> for RetryPolicy
 where
     R: Clone,
     E: fmt::Debug + Retryable,
 {
-    type Future = RetryFuture;
+    type Future = Sleep;
 
-    fn retry(&self, _request: &R, result: Result<&T, &E>) -> Option<Self::Future> {
+    fn retry(&mut self, _request: &mut R, result: &mut Result<T, E>) -> Option<Self::Future> {
         match result {
             Ok(_) => None,
             Err(error) => {
-                let num_attempts = self.num_attempts + 1;
+                self.num_attempts += 1;
 
-                if !error.is_retryable() || num_attempts >= self.retry_params.max_attempts {
+                if !error.is_retryable() || self.num_attempts >= self.retry_params.max_attempts {
                     None
                 } else {
-                    let delay = self.retry_params.compute_delay(num_attempts);
+                    let delay = self.retry_params.compute_delay(self.num_attempts);
                     debug!(
-                        num_attempts=%num_attempts,
+                        num_attempts=%self.num_attempts,
                         delay_millis=%delay.as_millis(),
                         error=?error,
                         "{} request failed, retrying.", type_name::<R>()
                     );
-                    let retry_policy = Self {
-                        num_attempts,
-                        retry_params: self.retry_params,
-                    };
                     let sleep_fut = tokio::time::sleep(delay);
-                    let retry_fut = RetryFuture {
-                        retry_policy,
-                        sleep_fut,
-                    };
-                    Some(retry_fut)
+                    Some(sleep_fut)
                 }
             }
         }
     }
 
-    fn clone_request(&self, request: &R) -> Option<R> {
+    fn clone_request(&mut self, request: &R) -> Option<R> {
         Some(request.clone())
     }
 }
@@ -134,8 +101,9 @@ where
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
-    use futures::future::{ready, Ready};
+    use futures::future::{Ready, ready};
     use tower::{Layer, Service, ServiceExt};
 
     use super::*;

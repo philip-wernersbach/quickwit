@@ -1,52 +1,53 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import { useEffect, useRef, useState } from 'react';
-import MonacoEditor from 'react-monaco-editor';
-import * as monacoEditor from 'monaco-editor/esm/vs/editor/editor.api';
-import { LANGUAGE_CONFIG, LanguageFeatures, createIndexCompletionProvider } from './config';
-import { SearchComponentProps } from '../../utils/SearchComponentProps';
-import { EDITOR_THEME } from '../../utils/theme';
-import { Box } from '@mui/material';
+import { Editor } from "@monaco-editor/react";
+import { Box } from "@mui/material";
+import * as monacoEditor from "monaco-editor/esm/vs/editor/editor.api";
+import React, { useEffect, useRef, useState } from "react";
+import { SearchComponentProps } from "../../utils/SearchComponentProps";
+import { EDITOR_THEME } from "../../utils/theme";
+import {
+  createIndexCompletionProvider,
+  LANGUAGE_CONFIG,
+  LanguageFeatures,
+} from "./config";
 
-const QUICKWIT_EDITOR_THEME_ID = 'quickwit-light';
+const QUICKWIT_EDITOR_THEME_ID = "quickwit-light";
 
 function getLanguageId(indexId: string | null): string {
   if (indexId === null) {
-    return '';
+    return "";
   }
   return `${indexId}-query-language`;
 }
 
 export function QueryEditor(props: SearchComponentProps) {
   const monacoRef = useRef<null | typeof monacoEditor>(null);
-  const [languageId, setLanguageId] = useState<string>('');
+  const [languageId, setLanguageId] = useState<string>("");
   const runSearchRef = useRef(props.runSearch);
   const searchRequestRef = useRef(props.searchRequest);
-  const defaultValue = props.searchRequest.query === null ? `// Select an index and type your query. Example: field_name:"phrase query"` : props.searchRequest.query;
+  const defaultValue =
+    props.searchRequest.query === null
+      ? `// Select an index and type your query. Example: field_name:"phrase query"`
+      : props.searchRequest.query;
   let resize: () => void;
 
-  /* eslint-disable  @typescript-eslint/no-explicit-any */
   function handleEditorDidMount(editor: any, monaco: any) {
     monacoRef.current = monaco;
     editor.addAction({
-      id: 'SEARCH',
+      id: "SEARCH",
       label: "Run search",
       keybindings: [
         monaco.KeyCode.F9,
@@ -55,27 +56,44 @@ export function QueryEditor(props: SearchComponentProps) {
       run: () => {
         runSearchRef.current(searchRequestRef.current);
       },
-    })
+    });
     resize = () => {
-      editor.layout({width: Math.max(window.innerWidth - (260+180+2*24), 200), height: 84});
-    }
-    window.addEventListener('resize', resize);
+      editor.layout({
+        width: Math.max(window.innerWidth - (260 + 180 + 2 * 24), 200),
+        height: 84,
+      });
+    };
+    window.addEventListener("resize", resize);
   }
 
-  function handleEditorWillUnmount() {
-    window.removeEventListener('resize', resize);
-  }
+  React.useEffect(() => {
+    return () => window.removeEventListener("resize", resize);
+  });
 
   useEffect(() => {
     const updatedLanguageId = getLanguageId(props.searchRequest.indexId);
-    if (monacoRef.current !== null && updatedLanguageId !== '' && props.index !== null) {
+    if (
+      monacoRef.current !== null &&
+      updatedLanguageId !== "" &&
+      props.index !== null
+    ) {
       const monaco = monacoRef.current;
-      if (!monaco.languages.getLanguages().some(({ id }: {id :string }) => id === updatedLanguageId)) {
-        console.log('register language', updatedLanguageId);
-        monaco.languages.register({'id': updatedLanguageId});
-        monaco.languages.setMonarchTokensProvider(updatedLanguageId, LanguageFeatures())
+      if (
+        !monaco.languages
+          .getLanguages()
+          .some(({ id }: { id: string }) => id === updatedLanguageId)
+      ) {
+        console.log("register language", updatedLanguageId);
+        monaco.languages.register({ id: updatedLanguageId });
+        monaco.languages.setMonarchTokensProvider(
+          updatedLanguageId,
+          LanguageFeatures(),
+        );
         if (props.index != null) {
-          monaco.languages.registerCompletionItemProvider(updatedLanguageId, createIndexCompletionProvider(props.index.metadata));
+          monaco.languages.registerCompletionItemProvider(
+            updatedLanguageId,
+            createIndexCompletionProvider(props.index.metadata),
+          );
           monaco.languages.setLanguageConfiguration(
             updatedLanguageId,
             LANGUAGE_CONFIG,
@@ -93,7 +111,9 @@ export function QueryEditor(props: SearchComponentProps) {
   }, [monacoRef, props.runSearch]);
 
   function handleEditorChange(value: any) {
-    const updatedSearchRequest = Object.assign({}, props.searchRequest, {query: value});
+    const updatedSearchRequest = Object.assign({}, props.searchRequest, {
+      query: value,
+    });
     searchRequestRef.current = updatedSearchRequest;
     props.onSearchRequestUpdate(updatedSearchRequest);
   }
@@ -103,16 +123,15 @@ export function QueryEditor(props: SearchComponentProps) {
   }
 
   return (
-    <Box sx={{ height: '100px', py: 1}} >
-      <MonacoEditor
-        editorWillMount={handleEditorWillMount}
-        editorDidMount={handleEditorDidMount}
-        editorWillUnmount={handleEditorWillUnmount}
+    <Box sx={{ height: "100px", py: 1 }}>
+      <Editor
+        beforeMount={handleEditorWillMount}
+        onMount={handleEditorDidMount}
         onChange={handleEditorChange}
         language={languageId}
         value={defaultValue}
         options={{
-          fontFamily: 'monospace',
+          fontFamily: "monospace",
           minimap: {
             enabled: false,
           },
@@ -120,8 +139,8 @@ export function QueryEditor(props: SearchComponentProps) {
           fontSize: 14,
           fixedOverflowWidgets: true,
           scrollBeyondLastLine: false,
-      }}
-      theme={QUICKWIT_EDITOR_THEME_ID}
+        }}
+        theme={QUICKWIT_EDITOR_THEME_ID}
       />
     </Box>
   );

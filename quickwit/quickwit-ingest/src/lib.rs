@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![deny(clippy::disallowed_methods)]
 
@@ -23,6 +18,7 @@ mod doc_batch;
 pub mod error;
 mod ingest_api_service;
 #[path = "codegen/ingest_service.rs"]
+#[allow(clippy::disallowed_methods)]
 mod ingest_service;
 mod ingest_v2;
 mod memory_capacity;
@@ -35,7 +31,7 @@ mod queue;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 pub use doc_batch::*;
 pub use error::IngestServiceError;
 pub use ingest_api_service::{GetMemoryCapacity, GetPartitionId, IngestApiService};
@@ -88,7 +84,7 @@ pub async fn init_ingest_api(
     Ok(ingest_api_service)
 }
 
-/// Returns the instance of the single IngestApiService via a copy of it's Mailbox.
+/// Returns the instance of the single IngestApiService via a copy of its Mailbox.
 pub async fn get_ingest_api_service(
     queues_dir_path: &Path,
 ) -> anyhow::Result<Mailbox<IngestApiService>> {
@@ -113,16 +109,6 @@ pub async fn start_ingest_api_service(
 ) -> anyhow::Result<Mailbox<IngestApiService>> {
     let queues_dir_path = data_dir_path.join(QUEUES_DIR_NAME);
     init_ingest_api(universe, &queues_dir_path, config).await
-}
-
-impl CommitType {
-    pub fn to_query_parameter(&self) -> Option<&'static [(&'static str, &'static str)]> {
-        match self {
-            CommitType::Auto => None,
-            CommitType::WaitFor => Some(&[("commit", "wait_for")]),
-            CommitType::Force => Some(&[("commit", "force")]),
-        }
-    }
 }
 
 #[macro_export]

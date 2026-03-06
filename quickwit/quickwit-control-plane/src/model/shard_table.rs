@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
@@ -23,6 +18,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
 use fnv::{FnvHashMap, FnvHashSet};
+use quickwit_common::metrics::index_label;
 use quickwit_common::rate_limiter::{RateLimiter, RateLimiterSettings};
 use quickwit_common::tower::ConstantRate;
 use quickwit_ingest::{RateMibPerSec, ShardInfo, ShardInfos};
@@ -30,7 +26,7 @@ use quickwit_proto::ingest::{Shard, ShardState};
 use quickwit_proto::types::{IndexUid, NodeId, ShardId, SourceId, SourceUid};
 use tracing::{error, info, warn};
 
-/// Limits the number of shards that can be opened for scaling up a source to 5 per minute.
+/// Limits the number of scale up operations that can happen to a source to 5 per minute.
 const SCALING_UP_RATE_LIMITER_SETTINGS: RateLimiterSettings = RateLimiterSettings {
     burst_limit: 5,
     rate_limit: ConstantRate::new(5, Duration::from_secs(60)),
@@ -46,7 +42,9 @@ const SCALING_DOWN_RATE_LIMITER_SETTINGS: RateLimiterSettings = RateLimiterSetti
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ScalingMode {
-    Up,
+    /// Scale up by adding this number of shards
+    Up(usize),
+    /// Scale down by removing one shard
     Down,
 }
 
@@ -105,11 +103,37 @@ impl ShardTableEntry {
         self.shard_entries.is_empty()
     }
 
-    fn num_open_shards(&self) -> usize {
-        self.shard_entries
-            .values()
-            .filter(|shard_entry| shard_entry.is_open())
-            .count()
+    fn shards_stats(&self) -> ShardStats {
+        let mut num_open_shards = 0;
+        let mut num_closed_shards = 0;
+        let mut short_term_ingestion_rate_sum = 0;
+        let mut long_term_ingestion_rate_sum = 0;
+
+        for shard_entry in self.shard_entries.values() {
+            if shard_entry.is_open() {
+                num_open_shards += 1;
+                short_term_ingestion_rate_sum += shard_entry.short_term_ingestion_rate.0 as usize;
+                long_term_ingestion_rate_sum += shard_entry.long_term_ingestion_rate.0 as usize;
+            } else if shard_entry.is_closed() {
+                num_closed_shards += 1;
+            }
+        }
+        let avg_short_term_ingestion_rate = if num_open_shards > 0 {
+            short_term_ingestion_rate_sum as f32 / num_open_shards as f32
+        } else {
+            0.0
+        };
+        let avg_long_term_ingestion_rate = if num_open_shards > 0 {
+            long_term_ingestion_rate_sum as f32 / num_open_shards as f32
+        } else {
+            0.0
+        };
+        ShardStats {
+            num_open_shards,
+            num_closed_shards,
+            avg_short_term_ingestion_rate,
+            avg_long_term_ingestion_rate,
+        }
     }
 }
 
@@ -141,7 +165,7 @@ impl<'a> ShardLocations<'a> {
 // A table that keeps track of the existing shards for each index and source,
 // and for each ingester, the list of shards it is supposed to host.
 //
-// (All mutable methods must maintain the two consistent)
+// (All mutable methods must maintain these two invariants.)
 #[derive(Debug, Default)]
 pub(crate) struct ShardTable {
     table_entries: FnvHashMap<SourceUid, ShardTableEntry>,
@@ -175,7 +199,7 @@ fn remove_shard_from_ingesters_internal(
 impl ShardTable {
     /// Returns a ShardLocations object that maps each shard to the list of ingesters hosting it.
     /// All shards are considered regardless of their state (including unavailable).
-    pub fn shard_locations(&self) -> ShardLocations {
+    pub fn shard_locations(&self) -> ShardLocations<'_> {
         let mut shard_locations = ShardLocations::default();
         for (ingester_id, source_shards) in &self.ingester_shards {
             for shard_ids in source_shards.values() {
@@ -278,13 +302,13 @@ impl ShardTable {
         };
         let table_entry = ShardTableEntry::default();
         let previous_table_entry_opt = self.table_entries.insert(source_uid, table_entry);
-        if let Some(previous_table_entry) = previous_table_entry_opt {
-            if !previous_table_entry.is_empty() {
-                error!(
-                    "shard table entry for index `{}` and source `{}` already exists",
-                    index_uid.index_id, source_id
-                );
-            }
+        if let Some(previous_table_entry) = previous_table_entry_opt
+            && !previous_table_entry.is_empty()
+        {
+            error!(
+                "shard table entry for index `{}` and source `{}` already exists",
+                index_uid.index_id, source_id
+            );
         }
         self.check_invariant();
     }
@@ -427,18 +451,45 @@ impl ShardTable {
     }
 
     pub fn update_shard_metrics_for_source_uid(&self, source_uid: &SourceUid) {
-        let num_open_shards: usize =
-            if let Some(shard_table_entry) = self.table_entries.get(source_uid) {
-                shard_table_entry.num_open_shards()
-            } else {
-                0
-            };
-        let index_label =
-            quickwit_common::metrics::index_label(source_uid.index_uid.index_id.as_str());
+        let Some(table_entry) = self.table_entries.get(source_uid) else {
+            return;
+        };
+        let index_id = source_uid.index_uid.index_id.as_str();
+        let index_label = index_label(index_id);
+
+        // If `index_label(index_id)` returns `index_id`, then per-index metrics are enabled and we
+        // can update the metrics for this specific index.
+        if index_label == index_id {
+            let shard_stats = table_entry.shards_stats();
+            crate::metrics::CONTROL_PLANE_METRICS
+                .open_shards
+                .with_label_values([index_label])
+                .set(shard_stats.num_open_shards as i64);
+            crate::metrics::CONTROL_PLANE_METRICS
+                .closed_shards
+                .with_label_values([index_label])
+                .set(shard_stats.num_closed_shards as i64);
+            return;
+        }
+        // Per-index metrics are disabled, so we update the metrics for all sources.
+        let mut num_open_shards = 0;
+        let mut num_closed_shards = 0;
+
+        for shard_entry in self.all_shards() {
+            if shard_entry.is_open() {
+                num_open_shards += 1;
+            } else if shard_entry.is_closed() {
+                num_closed_shards += 1;
+            }
+        }
         crate::metrics::CONTROL_PLANE_METRICS
-            .open_shards_total
+            .open_shards
             .with_label_values([index_label])
             .set(num_open_shards as i64);
+        crate::metrics::CONTROL_PLANE_METRICS
+            .closed_shards
+            .with_label_values([index_label])
+            .set(num_closed_shards as i64);
     }
 
     pub fn update_shards(
@@ -446,71 +497,51 @@ impl ShardTable {
         source_uid: &SourceUid,
         shard_infos: &ShardInfos,
     ) -> ShardStats {
-        let mut num_open_shards = 0;
-        let mut short_term_ingestion_rate_sum = RateMibPerSec::default();
-        let mut long_term_ingestion_rate_sum = RateMibPerSec::default();
+        let Some(table_entry) = self.table_entries.get_mut(source_uid) else {
+            return ShardStats::default();
+        };
+        for shard_info in shard_infos {
+            let ShardInfo {
+                shard_id,
+                shard_state,
+                short_term_ingestion_rate,
+                long_term_ingestion_rate,
+            } = shard_info;
 
-        if let Some(table_entry) = self.table_entries.get_mut(source_uid) {
-            for shard_info in shard_infos {
-                let ShardInfo {
-                    shard_id,
-                    shard_state,
-                    short_term_ingestion_rate,
-                    long_term_ingestion_rate,
-                } = shard_info;
-
-                if let Some(shard_entry) = table_entry.shard_entries.get_mut(shard_id) {
-                    shard_entry.short_term_ingestion_rate = *short_term_ingestion_rate;
-                    shard_entry.long_term_ingestion_rate = *long_term_ingestion_rate;
-                    // `ShardInfos` are broadcasted via Chitchat and eventually consistent. As a
-                    // result, we can only trust the `Closed` state, which is final.
-                    if shard_state.is_closed() {
-                        shard_entry.set_shard_state(ShardState::Closed);
-                    }
-                }
-            }
-            for shard_entry in table_entry.shard_entries.values() {
-                if shard_entry.is_open() {
-                    num_open_shards += 1;
-                    short_term_ingestion_rate_sum += shard_entry.short_term_ingestion_rate;
-                    long_term_ingestion_rate_sum += shard_entry.long_term_ingestion_rate;
+            if let Some(shard_entry) = table_entry.shard_entries.get_mut(shard_id) {
+                shard_entry.short_term_ingestion_rate = *short_term_ingestion_rate;
+                shard_entry.long_term_ingestion_rate = *long_term_ingestion_rate;
+                // `ShardInfos` are broadcasted via Chitchat and eventually consistent. As a
+                // result, we can only trust the `Closed` state, which is final.
+                if shard_state.is_closed() {
+                    shard_entry.set_shard_state(ShardState::Closed);
                 }
             }
         }
-        let avg_short_term_ingestion_rate = if num_open_shards > 0 {
-            short_term_ingestion_rate_sum.0 as f32 / num_open_shards as f32
-        } else {
-            0.0
-        };
-
-        let avg_long_term_ingestion_rate = if num_open_shards > 0 {
-            long_term_ingestion_rate_sum.0 as f32 / num_open_shards as f32
-        } else {
-            0.0
-        };
-
-        ShardStats {
-            num_open_shards,
-            avg_short_term_ingestion_rate,
-            avg_long_term_ingestion_rate,
-        }
+        table_entry.shards_stats()
     }
 
     /// Sets the state of the shards identified by their index UID, source ID, and shard IDs to
     /// `Closed`.
     pub fn close_shards(&mut self, source_uid: &SourceUid, shard_ids: &[ShardId]) -> Vec<ShardId> {
+        let Some(table_entry) = self.table_entries.get_mut(source_uid) else {
+            return Vec::new();
+        };
         let mut closed_shard_ids = Vec::new();
 
-        if let Some(table_entry) = self.table_entries.get_mut(source_uid) {
-            for shard_id in shard_ids {
-                if let Some(shard_entry) = table_entry.shard_entries.get_mut(shard_id) {
-                    if !shard_entry.is_closed() {
-                        shard_entry.set_shard_state(ShardState::Closed);
-                        closed_shard_ids.push(shard_id.clone());
-                    }
-                } else {
-                    info!(shard=%shard_id, "ignoring attempt to close shard: it is unknown (probably because it has been deleted)");
+        for shard_id in shard_ids {
+            if let Some(shard_entry) = table_entry.shard_entries.get_mut(shard_id) {
+                if !shard_entry.is_closed() {
+                    shard_entry.set_shard_state(ShardState::Closed);
+                    closed_shard_ids.push(shard_id.clone());
                 }
+            } else {
+                info!(
+                    index_id=%source_uid.index_uid.index_id,
+                    source_id=%source_uid.source_id,
+                    %shard_id,
+                    "ignoring attempt to close shard: it is unknown (probably because it has been deleted)"
+                );
             }
         }
         self.update_shard_metrics_for_source_uid(source_uid);
@@ -519,14 +550,15 @@ impl ShardTable {
 
     /// Removes the shards identified by their index UID, source ID, and shard IDs.
     pub fn delete_shards(&mut self, source_uid: &SourceUid, shard_ids: &[ShardId]) {
+        let Some(table_entry) = self.table_entries.get_mut(source_uid) else {
+            return;
+        };
         let mut shard_entries_to_remove: Vec<ShardEntry> = Vec::new();
-        if let Some(table_entry) = self.table_entries.get_mut(source_uid) {
-            for shard_id in shard_ids {
-                if let Some(shard_entry) = table_entry.shard_entries.remove(shard_id) {
-                    shard_entries_to_remove.push(shard_entry);
-                } else {
-                    warn!(shard=%shard_id, "deleting a non-existing shard");
-                }
+        for shard_id in shard_ids {
+            if let Some(shard_entry) = table_entry.shard_entries.remove(shard_id) {
+                shard_entries_to_remove.push(shard_entry);
+            } else {
+                warn!(shard=%shard_id, "deleting a non-existing shard");
             }
         }
         for shard_entry in shard_entries_to_remove {
@@ -536,46 +568,40 @@ impl ShardTable {
                 &mut self.ingester_shards,
             );
         }
-        self.update_shard_metrics_for_source_uid(source_uid);
         self.check_invariant();
+        self.update_shard_metrics_for_source_uid(source_uid);
     }
 
     pub fn acquire_scaling_permits(
         &mut self,
         source_uid: &SourceUid,
         scaling_mode: ScalingMode,
-        num_permits: u64,
     ) -> Option<bool> {
         let table_entry = self.table_entries.get_mut(source_uid)?;
         let scaling_rate_limiter = match scaling_mode {
-            ScalingMode::Up => &mut table_entry.scaling_up_rate_limiter,
+            ScalingMode::Up(_) => &mut table_entry.scaling_up_rate_limiter,
             ScalingMode::Down => &mut table_entry.scaling_down_rate_limiter,
         };
-        Some(scaling_rate_limiter.acquire(num_permits))
+        Some(scaling_rate_limiter.acquire(1))
     }
 
     pub fn drain_scaling_permits(&mut self, source_uid: &SourceUid, scaling_mode: ScalingMode) {
         if let Some(table_entry) = self.table_entries.get_mut(source_uid) {
             let scaling_rate_limiter = match scaling_mode {
-                ScalingMode::Up => &mut table_entry.scaling_up_rate_limiter,
+                ScalingMode::Up(_) => &mut table_entry.scaling_up_rate_limiter,
                 ScalingMode::Down => &mut table_entry.scaling_down_rate_limiter,
             };
             scaling_rate_limiter.drain();
         }
     }
 
-    pub fn release_scaling_permits(
-        &mut self,
-        source_uid: &SourceUid,
-        scaling_mode: ScalingMode,
-        num_permits: u64,
-    ) {
+    pub fn release_scaling_permits(&mut self, source_uid: &SourceUid, scaling_mode: ScalingMode) {
         if let Some(table_entry) = self.table_entries.get_mut(source_uid) {
             let scaling_rate_limiter = match scaling_mode {
-                ScalingMode::Up => &mut table_entry.scaling_up_rate_limiter,
+                ScalingMode::Up(_) => &mut table_entry.scaling_up_rate_limiter,
                 ScalingMode::Down => &mut table_entry.scaling_down_rate_limiter,
             };
-            scaling_rate_limiter.release(num_permits);
+            scaling_rate_limiter.release(1);
         }
     }
 }
@@ -583,7 +609,10 @@ impl ShardTable {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ShardStats {
     pub num_open_shards: usize,
+    pub num_closed_shards: usize,
+    /// Average short-term ingestion rate (MiB/s) over all open shards.
     pub avg_short_term_ingestion_rate: f32,
+    /// Average long-term ingestion rate (MiB/s) over all open shards.
     pub avg_long_term_ingestion_rate: f32,
 }
 
@@ -1057,26 +1086,30 @@ mod tests {
             index_uid: index_uid.clone(),
             source_id: source_id.clone(),
         };
-        assert!(shard_table
-            .acquire_scaling_permits(&source_uid, ScalingMode::Up, 1)
-            .is_none());
+        assert!(
+            shard_table
+                .acquire_scaling_permits(&source_uid, ScalingMode::Up(1))
+                .is_none()
+        );
 
         shard_table.add_source(&index_uid, &source_id);
 
         let previous_available_permits = shard_table
             .table_entries
-            .get(&source_uid)
+            .get_mut(&source_uid)
             .unwrap()
             .scaling_up_rate_limiter
             .available_permits();
 
-        assert!(shard_table
-            .acquire_scaling_permits(&source_uid, ScalingMode::Up, 1)
-            .unwrap());
+        assert!(
+            shard_table
+                .acquire_scaling_permits(&source_uid, ScalingMode::Up(1))
+                .unwrap()
+        );
 
         let new_available_permits = shard_table
             .table_entries
-            .get(&source_uid)
+            .get_mut(&source_uid)
             .unwrap()
             .scaling_up_rate_limiter
             .available_permits();
@@ -1095,26 +1128,30 @@ mod tests {
             index_uid: index_uid.clone(),
             source_id: source_id.clone(),
         };
-        assert!(shard_table
-            .acquire_scaling_permits(&source_uid, ScalingMode::Down, 1)
-            .is_none());
+        assert!(
+            shard_table
+                .acquire_scaling_permits(&source_uid, ScalingMode::Down)
+                .is_none()
+        );
 
         shard_table.add_source(&index_uid, &source_id);
 
         let previous_available_permits = shard_table
             .table_entries
-            .get(&source_uid)
+            .get_mut(&source_uid)
             .unwrap()
             .scaling_down_rate_limiter
             .available_permits();
 
-        assert!(shard_table
-            .acquire_scaling_permits(&source_uid, ScalingMode::Down, 1)
-            .unwrap());
+        assert!(
+            shard_table
+                .acquire_scaling_permits(&source_uid, ScalingMode::Down)
+                .unwrap()
+        );
 
         let new_available_permits = shard_table
             .table_entries
-            .get(&source_uid)
+            .get_mut(&source_uid)
             .unwrap()
             .scaling_down_rate_limiter
             .available_permits();
@@ -1137,20 +1174,22 @@ mod tests {
         };
         let previous_available_permits = shard_table
             .table_entries
-            .get(&source_uid)
+            .get_mut(&source_uid)
             .unwrap()
             .scaling_up_rate_limiter
             .available_permits();
 
-        assert!(shard_table
-            .acquire_scaling_permits(&source_uid, ScalingMode::Up, 1)
-            .unwrap());
+        assert!(
+            shard_table
+                .acquire_scaling_permits(&source_uid, ScalingMode::Up(1))
+                .unwrap()
+        );
 
-        shard_table.release_scaling_permits(&source_uid, ScalingMode::Up, 1);
+        shard_table.release_scaling_permits(&source_uid, ScalingMode::Up(1));
 
         let new_available_permits = shard_table
             .table_entries
-            .get(&source_uid)
+            .get_mut(&source_uid)
             .unwrap()
             .scaling_up_rate_limiter
             .available_permits();
@@ -1173,20 +1212,22 @@ mod tests {
         };
         let previous_available_permits = shard_table
             .table_entries
-            .get(&source_uid)
+            .get_mut(&source_uid)
             .unwrap()
             .scaling_up_rate_limiter
             .available_permits();
 
-        assert!(shard_table
-            .acquire_scaling_permits(&source_uid, ScalingMode::Down, 1)
-            .unwrap());
+        assert!(
+            shard_table
+                .acquire_scaling_permits(&source_uid, ScalingMode::Down)
+                .unwrap()
+        );
 
-        shard_table.release_scaling_permits(&source_uid, ScalingMode::Down, 1);
+        shard_table.release_scaling_permits(&source_uid, ScalingMode::Down);
 
         let new_available_permits = shard_table
             .table_entries
-            .get(&source_uid)
+            .get_mut(&source_uid)
             .unwrap()
             .scaling_up_rate_limiter
             .available_permits();
@@ -1215,9 +1256,11 @@ mod tests {
             &[&node1, &node2]
         );
         // If the shard is not listed, we do not panic but just return an empty list.
-        assert!(shard_locations
-            .get_shard_locations(&unlisted_shard)
-            .is_empty());
+        assert!(
+            shard_locations
+                .get_shard_locations(&unlisted_shard)
+                .is_empty()
+        );
     }
 
     #[test]

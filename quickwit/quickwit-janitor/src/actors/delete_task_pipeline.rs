@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -181,6 +176,7 @@ impl DeleteTaskPipeline {
             UploaderType::DeleteUploader,
             self.metastore.clone(),
             merge_policy,
+            index_config.retention_policy_opt.clone(),
             split_store.clone(),
             SplitsUpdateMailbox::Publisher(publisher_mailbox),
             self.max_concurrent_split_uploads,
@@ -287,13 +283,13 @@ mod tests {
     use quickwit_actors::{Handler, Universe};
     use quickwit_common::pubsub::EventBroker;
     use quickwit_common::temp_dir::TempDirectory;
-    use quickwit_indexing::actors::MergeSchedulerService;
     use quickwit_indexing::TestSandbox;
+    use quickwit_indexing::actors::MergeSchedulerService;
     use quickwit_metastore::{ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitState};
     use quickwit_proto::metastore::{DeleteQuery, ListSplitsRequest, MetastoreService};
     use quickwit_proto::search::{LeafSearchRequest, LeafSearchResponse};
     use quickwit_search::{
-        searcher_pool_for_test, MockSearchService, SearchError, SearchJobPlacer,
+        MockSearchService, SearchError, SearchJobPlacer, searcher_pool_for_test,
     };
 
     use super::{ActorContext, ActorExitStatus, DeleteTaskPipeline, OBSERVE_PIPELINE_INTERVAL};

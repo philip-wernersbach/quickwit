@@ -1,41 +1,35 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use hyper::StatusCode;
 use quickwit_common::rate_limited_error;
-use quickwit_config::INGEST_V2_SOURCE_ID;
+use quickwit_config::{INGEST_V2_SOURCE_ID, validate_identifier};
 use quickwit_ingest::IngestRequestV2Builder;
+use quickwit_proto::ingest::CommitTypeV2;
 use quickwit_proto::ingest::router::{
     IngestFailureReason, IngestResponseV2, IngestRouterService, IngestRouterServiceClient,
 };
-use quickwit_proto::ingest::CommitTypeV2;
 use quickwit_proto::types::{DocUid, IndexId};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use warp::hyper::StatusCode;
 
 use super::model::ElasticException;
+use crate::Body;
 use crate::elasticsearch_api::model::{BulkAction, ElasticBulkOptions, ElasticsearchError};
 use crate::ingest_api::lines;
-use crate::Body;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ElasticBulkResponse {
@@ -78,6 +72,7 @@ type ElasticDocId = String;
 
 #[derive(Debug)]
 struct DocHandle {
+    doc_position: usize,
     doc_uid: DocUid,
     es_doc_id: Option<ElasticDocId>,
     // Whether the document failed to parse. When the struct is instantiated, this value is set to
@@ -95,7 +90,8 @@ pub(crate) async fn elastic_bulk_ingest_v2(
     let mut ingest_request_builder = IngestRequestV2Builder::default();
     let mut lines = lines(&body.content).enumerate();
     let mut per_subrequest_doc_handles: HashMap<u32, Vec<DocHandle>> = HashMap::new();
-
+    let mut action_count = 0;
+    let mut invalid_index_id_items = Vec::new();
     while let Some((line_no, line)) = lines.next() {
         let action = serde_json::from_slice::<BulkAction>(line).map_err(|error| {
             ElasticsearchError::new(
@@ -126,13 +122,25 @@ pub(crate) async fn elastic_bulk_ingest_v2(
                     Some(ElasticException::ActionRequestValidation),
                 )
             })?;
+
+        // Validate index ID early because propagating back the right error (400)
+        // from deeper ingest layers is harder
+        if validate_identifier("", &index_id).is_err() {
+            let invalid_item = make_invalid_index_id_item(index_id.clone(), meta.es_doc_id);
+            invalid_index_id_items.push((action_count, invalid_item));
+            action_count += 1;
+            continue;
+        }
+
         let (subrequest_id, doc_uid) = ingest_request_builder.add_doc(index_id, doc);
 
         let doc_handle = DocHandle {
+            doc_position: action_count,
             doc_uid,
             es_doc_id: meta.es_doc_id,
             is_parse_failure: false,
         };
+        action_count += 1;
         per_subrequest_doc_handles
             .entry(subrequest_id)
             .or_default()
@@ -140,9 +148,6 @@ pub(crate) async fn elastic_bulk_ingest_v2(
     }
     let commit_type: CommitTypeV2 = bulk_options.refresh.into();
 
-    if commit_type != CommitTypeV2::Auto {
-        warn!("ingest API v2 does not support the `refresh` parameter (yet)");
-    }
     let ingest_request_opt = ingest_request_builder.build(INGEST_V2_SOURCE_ID, commit_type);
 
     let Some(ingest_request) = ingest_request_opt else {
@@ -152,15 +157,24 @@ pub(crate) async fn elastic_bulk_ingest_v2(
         rate_limited_error!(limit_per_min=6, err=?err, "router error");
         err
     })?;
-    make_elastic_bulk_response_v2(ingest_response, per_subrequest_doc_handles, now)
+    make_elastic_bulk_response_v2(
+        ingest_response,
+        per_subrequest_doc_handles,
+        now,
+        action_count,
+        invalid_index_id_items,
+    )
 }
 
+#[allow(clippy::result_large_err)]
 fn make_elastic_bulk_response_v2(
     ingest_response_v2: IngestResponseV2,
     mut per_subrequest_doc_handles: HashMap<u32, Vec<DocHandle>>,
     now: Instant,
+    action_count: usize,
+    invalid_index_id_items: Vec<(usize, ElasticBulkItem)>,
 ) -> Result<ElasticBulkResponse, ElasticsearchError> {
-    let mut actions: Vec<ElasticBulkAction> = Vec::new();
+    let mut positioned_actions: Vec<(usize, ElasticBulkAction)> = Vec::with_capacity(action_count);
     let mut errors = false;
 
     // Populate the items for each `IngestSuccess` subresponse. They may be partially successful and
@@ -176,9 +190,8 @@ fn make_elastic_bulk_response_v2(
             &mut per_subrequest_doc_handles,
             success.subrequest_id,
         )
-        .map_err(|err| {
+        .inspect_err(|_| {
             rate_limited_error!(limit_per_min=6, index_id=%index_id, "could not find subrequest id");
-            err
         })?;
         doc_handles.sort_unstable_by(|left, right| left.doc_uid.cmp(&right.doc_uid));
 
@@ -186,8 +199,6 @@ fn make_elastic_bulk_response_v2(
         for parse_failure in success.parse_failures {
             errors = true;
 
-            // Since the generated doc UIDs are monotonically increasing, and inserted in order, we
-            // can find doc handles using binary search.
             let failed_doc_uid = parse_failure.doc_uid();
             let doc_handle_idx = doc_handles
                 .binary_search_by_key(&failed_doc_uid, |doc_handle| doc_handle.doc_uid)
@@ -217,7 +228,7 @@ fn make_elastic_bulk_response_v2(
                 error: Some(error),
             };
             let action = ElasticBulkAction::Index(item);
-            actions.push(action);
+            positioned_actions.push((doc_handle.doc_position, action));
         }
         // Populate the remaining successful items.
         for mut doc_handle in doc_handles {
@@ -231,7 +242,7 @@ fn make_elastic_bulk_response_v2(
                 error: None,
             };
             let action = ElasticBulkAction::Index(item);
-            actions.push(action);
+            positioned_actions.push((doc_handle.doc_position, action));
         }
     }
     // Repeat the operation for each `IngestFailure` subresponse.
@@ -240,16 +251,14 @@ fn make_elastic_bulk_response_v2(
 
         // Find the doc handles for the subrequest.
         let doc_handles =
-            remove_doc_handles(&mut per_subrequest_doc_handles, failure.subrequest_id).map_err(
-                |err| {
+            remove_doc_handles(&mut per_subrequest_doc_handles, failure.subrequest_id)
+                .inspect_err(|_| {
                     rate_limited_error!(
                         limit_per_min = 6,
                         subrequest = failure.subrequest_id,
                         "failed to find error subrequest"
                     );
-                    err
-                },
-            )?;
+                })?;
 
         // Populate the response items with one error per doc handle.
         let (exception, reason, status) = match failure.reason() {
@@ -271,6 +280,11 @@ fn make_elastic_bulk_response_v2(
             IngestFailureReason::ShardRateLimited => (
                 ElasticException::RateLimited,
                 format!("shard rate limiting [{}]", failure.index_id),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            IngestFailureReason::NoShardsAvailable => (
+                ElasticException::RateLimited,
+                format!("no shards available [{}]", failure.index_id),
                 StatusCode::TOO_MANY_REQUESTS,
             ),
             reason => {
@@ -300,13 +314,31 @@ fn make_elastic_bulk_response_v2(
                 error: Some(error),
             };
             let action = ElasticBulkAction::Index(item);
-            actions.push(action);
+            positioned_actions.push((doc_handle.doc_position, action));
         }
     }
     assert!(
         per_subrequest_doc_handles.is_empty(),
         "doc handles should be empty"
     );
+
+    for (position, item) in invalid_index_id_items {
+        errors = true;
+        let action = ElasticBulkAction::Index(item);
+        positioned_actions.push((position, action));
+    }
+
+    assert_eq!(
+        positioned_actions.len(),
+        action_count,
+        "request and response action count should match"
+    );
+    positioned_actions.sort_unstable_by_key(|(idx, _)| *idx);
+    let actions = positioned_actions
+        .into_iter()
+        .map(|(_, action)| action)
+        .collect();
+
     let took_millis = now.elapsed().as_millis() as u64;
 
     let bulk_response = ElasticBulkResponse {
@@ -317,6 +349,7 @@ fn make_elastic_bulk_response_v2(
     Ok(bulk_response)
 }
 
+#[allow(clippy::result_large_err)]
 fn remove_doc_handles(
     per_subrequest_doc_handles: &mut HashMap<u32, Vec<DocHandle>>,
     subrequest_id: u32,
@@ -332,8 +365,23 @@ fn remove_doc_handles(
         })
 }
 
+fn make_invalid_index_id_item(index_id: String, es_doc_id: Option<String>) -> ElasticBulkItem {
+    let error = ElasticBulkError {
+        index_id: Some(index_id.clone()),
+        exception: ElasticException::IllegalArgument,
+        reason: format!("invalid index id [{index_id}]"),
+    };
+    ElasticBulkItem {
+        index_id,
+        es_doc_id,
+        status: StatusCode::BAD_REQUEST,
+        error: Some(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use bytesize::ByteSize;
     use quickwit_proto::ingest::router::{
         IngestFailure, IngestFailureReason, IngestResponseV2, IngestSuccess,
         MockIngestRouterService,
@@ -382,8 +430,9 @@ mod tests {
 
     fn es_compat_bulk_handler_v2(
         ingest_router: IngestRouterServiceClient,
+        content_length_limit: ByteSize,
     ) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
-        elastic_bulk_filter()
+        elastic_bulk_filter(content_length_limit)
             .and(with_arg(ingest_router))
             .then(|body, bulk_options, ingest_router| {
                 elastic_bulk_ingest_v2(None, body, bulk_options, ingest_router)
@@ -442,7 +491,7 @@ mod tests {
                 })
             });
         let ingest_router = IngestRouterServiceClient::from_mock(mock_ingest_router);
-        let handler = es_compat_bulk_handler_v2(ingest_router);
+        let handler = es_compat_bulk_handler_v2(ingest_router, ByteSize::mb(10));
 
         let payload = r#"
             {"create": {"_index": "my-index-1", "_id" : "1"}}
@@ -494,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn test_bulk_api_accepts_empty_requests() {
         let ingest_router = IngestRouterServiceClient::mocked();
-        let handler = es_compat_bulk_handler_v2(ingest_router);
+        let handler = es_compat_bulk_handler_v2(ingest_router, ByteSize::mb(10));
 
         let response = warp::test::request()
             .path("/_elastic/_bulk")
@@ -539,7 +588,7 @@ mod tests {
                 })
             });
         let ingest_router = IngestRouterServiceClient::from_mock(mock_ingest_router);
-        let handler = es_compat_bulk_handler_v2(ingest_router);
+        let handler = es_compat_bulk_handler_v2(ingest_router, ByteSize::mb(10));
 
         let payload = r#"
 
@@ -562,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn test_bulk_api_handles_malformed_requests() {
         let ingest_router = IngestRouterServiceClient::mocked();
-        let handler = es_compat_bulk_handler_v2(ingest_router);
+        let handler = es_compat_bulk_handler_v2(ingest_router, ByteSize::mb(10));
 
         let payload = r#"
             {"create": {"_index": "my-index-1", "_id" : "1"},}
@@ -663,7 +712,7 @@ mod tests {
                 })
             });
         let ingest_router = IngestRouterServiceClient::from_mock(mock_ingest_router);
-        let handler = es_compat_bulk_handler_v2(ingest_router);
+        let handler = es_compat_bulk_handler_v2(ingest_router, ByteSize::mb(10));
 
         let payload = r#"
             {"index": {"_index": "my-index-1", "_id" : "1"}}
@@ -687,11 +736,13 @@ mod tests {
     }
 
     #[test]
-    fn test_make_elastic_bulk_response_v2() {
+    fn test_bulk_api_make_elastic_bulk_response_v2() {
         let response = make_elastic_bulk_response_v2(
             IngestResponseV2::default(),
             HashMap::new(),
             Instant::now(),
+            0,
+            Vec::new(),
         )
         .unwrap();
 
@@ -724,11 +775,13 @@ mod tests {
                 0,
                 vec![
                     DocHandle {
+                        doc_position: 0,
                         doc_uid: DocUid::for_test(0),
                         es_doc_id: Some("0".to_string()),
                         is_parse_failure: false,
                     },
                     DocHandle {
+                        doc_position: 1,
                         doc_uid: DocUid::for_test(1),
                         es_doc_id: Some("1".to_string()),
                         is_parse_failure: false,
@@ -738,25 +791,24 @@ mod tests {
             (
                 1,
                 vec![DocHandle {
+                    doc_position: 2,
                     doc_uid: DocUid::for_test(2),
                     es_doc_id: Some("2".to_string()),
                     is_parse_failure: false,
                 }],
             ),
         ]);
-        let mut response = make_elastic_bulk_response_v2(
+        let response = make_elastic_bulk_response_v2(
             ingest_response_v2,
             per_request_doc_handles,
             Instant::now(),
+            3,
+            Vec::new(),
         )
         .unwrap();
 
         assert!(response.errors);
         assert_eq!(response.actions.len(), 3);
-
-        response
-            .actions
-            .sort_unstable_by(|left, right| left.es_doc_id().cmp(&right.es_doc_id()));
 
         assert_eq!(response.actions[0].index_id(), "test-index-foo");
         assert_eq!(response.actions[0].es_doc_id(), Some("0"));
@@ -780,5 +832,119 @@ mod tests {
         assert_eq!(error.index_id.as_ref().unwrap(), "test-index-bar");
         assert_eq!(error.exception, ElasticException::IndexNotFound);
         assert_eq!(error.reason, "no such index [test-index-bar]");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_api_refresh_parameter() {
+        let mut mock_ingest_router = MockIngestRouterService::new();
+        mock_ingest_router
+            .expect_ingest()
+            .once()
+            .returning(|ingest_request| {
+                assert_eq!(ingest_request.commit_type(), CommitTypeV2::WaitFor);
+                Ok(IngestResponseV2 {
+                    successes: vec![IngestSuccess {
+                        subrequest_id: 0,
+                        index_uid: Some(IndexUid::for_test("my-index-1", 0)),
+                        source_id: INGEST_V2_SOURCE_ID.to_string(),
+                        shard_id: Some(ShardId::from(1)),
+                        replication_position_inclusive: Some(Position::offset(1u64)),
+                        num_ingested_docs: 2,
+                        parse_failures: Vec::new(),
+                    }],
+                    failures: Vec::new(),
+                })
+            });
+        let ingest_router = IngestRouterServiceClient::from_mock(mock_ingest_router);
+        let handler = es_compat_bulk_handler_v2(ingest_router, ByteSize::mb(10));
+
+        let payload = r#"
+            {"create": {"_index": "my-index-1", "_id" : "1"}}
+            {"ts": 1, "message": "my-message-1"}
+        "#;
+        warp::test::request()
+            .path("/_elastic/_bulk?refresh=wait_for")
+            .method("POST")
+            .body(payload)
+            .reply(&handler)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_bulk_api_invalid_index_id() {
+        let mut mock_ingest_router = MockIngestRouterService::new();
+        mock_ingest_router
+            .expect_ingest()
+            .once()
+            .returning(|ingest_request| {
+                assert_eq!(ingest_request.subrequests.len(), 2);
+                Ok(IngestResponseV2 {
+                    successes: vec![
+                        IngestSuccess {
+                            subrequest_id: 0,
+                            index_uid: Some(IndexUid::for_test("my-index-1", 0)),
+                            source_id: INGEST_V2_SOURCE_ID.to_string(),
+                            shard_id: Some(ShardId::from(1)),
+                            replication_position_inclusive: Some(Position::offset(1u64)),
+                            num_ingested_docs: 2,
+                            parse_failures: Vec::new(),
+                        },
+                        IngestSuccess {
+                            subrequest_id: 1,
+                            index_uid: Some(IndexUid::for_test("my-index-2", 0)),
+                            source_id: INGEST_V2_SOURCE_ID.to_string(),
+                            shard_id: Some(ShardId::from(1)),
+                            replication_position_inclusive: Some(Position::offset(0u64)),
+                            num_ingested_docs: 1,
+                            parse_failures: Vec::new(),
+                        },
+                    ],
+                    failures: Vec::new(),
+                })
+            });
+        let ingest_router = IngestRouterServiceClient::from_mock(mock_ingest_router);
+        let handler = es_compat_bulk_handler_v2(ingest_router, ByteSize::mb(10));
+
+        let payload = r#"
+            {"create": {"_index": "my-index-1"}}
+            {"ts": 1, "message": "my-message-1"}
+            {"create": {"_index": "bad!"}}
+            {"ts": 1, "message": "my-message-2"}
+            {"create": {"_index": "my-index-2", "_id" : "1"}}
+            {"ts": 1, "message": "my-message-3"}
+
+        "#;
+        let response = warp::test::request()
+            .path("/_elastic/_bulk")
+            .method("POST")
+            .body(payload)
+            .reply(&handler)
+            .await;
+        assert_eq!(response.status(), 200);
+
+        let bulk_response: ElasticBulkResponse = serde_json::from_slice(response.body()).unwrap();
+        assert!(bulk_response.errors);
+
+        let items = bulk_response
+            .actions
+            .into_iter()
+            .map(|action| match action {
+                ElasticBulkAction::Create(item) => item,
+                ElasticBulkAction::Index(item) => item,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 3);
+
+        assert_eq!(items[0].index_id, "my-index-1");
+        assert!(items[0].es_doc_id.is_none());
+        assert_eq!(items[0].status, StatusCode::CREATED);
+
+        assert_eq!(items[1].index_id, "bad!");
+        assert!(items[1].es_doc_id.is_none());
+        assert_eq!(items[1].status, StatusCode::BAD_REQUEST);
+
+        assert_eq!(items[2].index_id, "my-index-2");
+        assert_eq!(items[2].es_doc_id.as_ref().unwrap(), "1");
+        assert_eq!(items[2].status, StatusCode::CREATED);
     }
 }

@@ -1,32 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
-use once_cell::sync::Lazy;
-pub use prometheus::{
-    exponential_buckets, linear_buckets, Histogram, HistogramTimer,
-    HistogramVec as PrometheusHistogramVec, IntCounter, IntCounterVec as PrometheusIntCounterVec,
-    IntGauge, IntGaugeVec as PrometheusIntGaugeVec,
-};
 use prometheus::{Gauge, HistogramOpts, Opts, TextEncoder};
+pub use prometheus::{
+    Histogram, HistogramTimer, HistogramVec as PrometheusHistogramVec, IntCounter,
+    IntCounterVec as PrometheusIntCounterVec, IntGauge, IntGaugeVec as PrometheusIntGaugeVec,
+    exponential_buckets, linear_buckets,
+};
 
 #[derive(Clone)]
 pub struct HistogramVec<const N: usize> {
@@ -45,6 +39,26 @@ pub struct IntCounterVec<const N: usize> {
 }
 
 impl<const N: usize> IntCounterVec<N> {
+    pub fn new(
+        name: &str,
+        help: &str,
+        subsystem: &str,
+        const_labels: &[(&str, &str)],
+        label_names: [&str; N],
+    ) -> IntCounterVec<N> {
+        let owned_const_labels: HashMap<String, String> = const_labels
+            .iter()
+            .map(|(label_name, label_value)| (label_name.to_string(), label_value.to_string()))
+            .collect();
+        let counter_opts = Opts::new(name, help)
+            .namespace("quickwit")
+            .subsystem(subsystem)
+            .const_labels(owned_const_labels);
+        let underlying = PrometheusIntCounterVec::new(counter_opts, &label_names)
+            .expect("failed to create counter vec");
+        IntCounterVec { underlying }
+    }
+
     pub fn with_label_values(&self, label_values: [&str; N]) -> IntCounter {
         self.underlying.with_label_values(&label_values)
     }
@@ -90,25 +104,6 @@ pub fn new_counter(
     counter
 }
 
-pub fn new_counter_with_labels(
-    name: &str,
-    help: &str,
-    subsystem: &str,
-    const_labels: &[(&str, &str)],
-) -> IntCounter {
-    let owned_const_labels: HashMap<String, String> = const_labels
-        .iter()
-        .map(|(label_name, label_value)| (label_name.to_string(), label_value.to_string()))
-        .collect();
-    let counter_opts = Opts::new(name, help)
-        .namespace("quickwit")
-        .subsystem(subsystem)
-        .const_labels(owned_const_labels);
-    let counter = IntCounter::with_opts(counter_opts).expect("failed to create counter");
-    prometheus::register(Box::new(counter.clone())).expect("failed to register counter");
-    counter
-}
-
 pub fn new_counter_vec<const N: usize>(
     name: &str,
     help: &str,
@@ -116,21 +111,10 @@ pub fn new_counter_vec<const N: usize>(
     const_labels: &[(&str, &str)],
     label_names: [&str; N],
 ) -> IntCounterVec<N> {
-    let owned_const_labels: HashMap<String, String> = const_labels
-        .iter()
-        .map(|(label_name, label_value)| (label_name.to_string(), label_value.to_string()))
-        .collect();
-    let counter_opts = Opts::new(name, help)
-        .namespace("quickwit")
-        .subsystem(subsystem)
-        .const_labels(owned_const_labels);
-    let underlying = PrometheusIntCounterVec::new(counter_opts, &label_names)
-        .expect("failed to create counter vec");
-
-    let collector = Box::new(underlying.clone());
+    let int_counter_vec = IntCounterVec::new(name, help, subsystem, const_labels, label_names);
+    let collector = Box::new(int_counter_vec.underlying.clone());
     prometheus::register(collector).expect("failed to register counter vec");
-
-    IntCounterVec { underlying }
+    int_counter_vec
 }
 
 pub fn new_float_gauge(
@@ -236,7 +220,7 @@ pub struct GaugeGuard<'a> {
     delta: i64,
 }
 
-impl<'a> std::fmt::Debug for GaugeGuard<'a> {
+impl std::fmt::Debug for GaugeGuard<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.delta.fmt(f)
     }
@@ -262,7 +246,7 @@ impl<'a> GaugeGuard<'a> {
     }
 }
 
-impl<'a> Drop for GaugeGuard<'a> {
+impl Drop for GaugeGuard<'_> {
     fn drop(&mut self) {
         self.gauge.sub(self.delta)
     }
@@ -453,16 +437,17 @@ impl InFlightDataGauges {
     }
 }
 
-/// This function returns `index_name` or projects it to `<any>` if per-index metrics are disabled.
-pub fn index_label(index_name: &str) -> &str {
-    static PER_INDEX_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
-    let per_index_metrics_enabled: bool = *PER_INDEX_METRICS_ENABLED
-        .get_or_init(|| !crate::get_bool_from_env("QW_DISABLE_PER_INDEX_METRICS", false));
-    if per_index_metrics_enabled {
-        index_name
+/// This function returns `index_id` as is if per-index metrics are enabled, or projects it to
+/// `"__any__"` otherwise.
+pub fn index_label(index_id: &str) -> &str {
+    static PER_INDEX_METRICS_ENABLED: LazyLock<bool> =
+        LazyLock::new(|| !crate::get_bool_from_env("QW_DISABLE_PER_INDEX_METRICS", false));
+
+    if *PER_INDEX_METRICS_ENABLED {
+        index_id
     } else {
         "__any__"
     }
 }
 
-pub static MEMORY_METRICS: Lazy<MemoryMetrics> = Lazy::new(MemoryMetrics::default);
+pub static MEMORY_METRICS: LazyLock<MemoryMetrics> = LazyLock::new(MemoryMetrics::default);

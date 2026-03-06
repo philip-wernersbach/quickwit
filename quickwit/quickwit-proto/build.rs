@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::path::PathBuf;
 
@@ -27,7 +22,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // services.
     //
     // Cluster service.
+    let mut prost_config = prost_build::Config::default();
+    prost_config.file_descriptor_set_path("src/codegen/quickwit/cluster_descriptor.bin");
+
     Codegen::builder()
+        .with_prost_config(prost_config)
         .with_protos(&["protos/quickwit/cluster.proto"])
         .with_output_dir("src/codegen/quickwit")
         .with_result_type_path("crate::cluster::ClusterResult")
@@ -38,6 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Control plane.
     let mut prost_config = prost_build::Config::default();
+    prost_config.file_descriptor_set_path("src/codegen/quickwit/control_plane_descriptor.bin");
+
     prost_config
         .extern_path(
             ".quickwit.common.DocMappingUid",
@@ -57,7 +58,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Developer service.
     let mut prost_config = prost_build::Config::default();
-    prost_config.bytes(["GetDebugInfoResponse.debug_info_json"]);
+    prost_config
+        .bytes(["GetDebugInfoResponse.debug_info_json"])
+        .file_descriptor_set_path("src/codegen/quickwit/developer_descriptor.bin");
 
     Codegen::builder()
         .with_prost_config(prost_config)
@@ -77,7 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "crate::types::PipelineUid",
         )
         .extern_path(".quickwit.common.IndexUid", "crate::types::IndexUid")
-        .extern_path(".quickwit.ingest.ShardId", "crate::types::ShardId");
+        .extern_path(".quickwit.ingest.ShardId", "crate::types::ShardId")
+        .file_descriptor_set_path("src/codegen/quickwit/indexing_descriptor.bin");
 
     Codegen::builder()
         .with_prost_config(prost_config)
@@ -112,7 +116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(
             "DeleteQuery.end_timestamp",
             "#[serde(skip_serializing_if = \"Option::is_none\")]",
-        );
+        )
+        .file_descriptor_set_path("src/codegen/quickwit/metastore_descriptor.bin");
 
     Codegen::builder()
         .with_prost_config(prost_config)
@@ -142,7 +147,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".quickwit.common.IndexUid", "crate::types::IndexUid")
         .extern_path(".quickwit.ingest.Position", "crate::types::Position")
         .extern_path(".quickwit.ingest.ShardId", "crate::types::ShardId")
-        .type_attribute("Shard", "#[derive(Eq)]")
         .field_attribute(
             "Shard.follower_id",
             "#[serde(default, skip_serializing_if = \"Option::is_none\")]",
@@ -162,7 +166,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(
             "Shard.update_timestamp",
             "#[serde(default = \"super::compatibility_shard_update_timestamp\")]",
-        );
+        )
+        .file_descriptor_set_path("src/codegen/quickwit/ingest_descriptor.bin");
 
     Codegen::builder()
         .with_prost_config(prost_config)
@@ -180,32 +185,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Search service.
     let mut prost_config = prost_build::Config::default();
-    prost_config.protoc_arg("--experimental_allow_proto3_optional");
+    prost_config
+        .file_descriptor_set_path("src/codegen/quickwit/search_descriptor.bin")
+        .protoc_arg("--experimental_allow_proto3_optional");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .enum_attribute(".", "#[serde(rename_all=\"snake_case\")]")
-        .type_attribute(".", "#[derive(Serialize, Deserialize, utoipa::ToSchema)]")
-        .type_attribute("PartialHit", "#[derive(Eq, Hash)]")
+        .type_attribute(
+            ".",
+            "#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]",
+        )
         .type_attribute("PartialHit.sort_value", "#[derive(Copy)]")
-        .type_attribute("SearchRequest", "#[derive(Eq, Hash)]")
-        .type_attribute("ListFieldSerialized", "#[derive(Eq)]")
         .type_attribute("SortByValue", "#[derive(Ord, PartialOrd)]")
-        .type_attribute("SortField", "#[derive(Eq, Hash)]")
+        .type_attribute("SearchRequest", "#[derive(Hash, Eq)]")
+        .type_attribute("PartialHit", "#[derive(Hash, Eq)]")
         .out_dir("src/codegen/quickwit")
-        .compile_with_config(prost_config, &["protos/quickwit/search.proto"], &["protos"])?;
+        .compile_with_config(
+            prost_config,
+            &[std::path::PathBuf::from("protos/quickwit/search.proto")],
+            &[std::path::PathBuf::from("protos")],
+        )?;
 
     // Jaeger proto
     let protos = find_protos("protos/third-party/jaeger");
 
     let mut prost_config = prost_build::Config::default();
-    prost_config.type_attribute("Operation", "#[derive(Eq, Ord, PartialOrd)]");
+    prost_config.type_attribute("Operation", "#[derive(Ord, PartialOrd)]");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .out_dir("src/codegen/jaeger")
         .compile_with_config(
             prost_config,
             &protos,
-            &["protos/third-party/jaeger", "protos/third-party"],
+            &[
+                std::path::PathBuf::from("protos/third-party/jaeger"),
+                std::path::PathBuf::from("protos/third-party"),
+            ],
         )?;
 
     // OTEL proto
@@ -213,15 +228,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     prost_config.protoc_arg("--experimental_allow_proto3_optional");
 
     let protos = find_protos("protos/third-party/opentelemetry");
-    tonic_build::configure()
-        .type_attribute(".", "#[derive(Serialize, Deserialize)]")
+    tonic_prost_build::configure()
+        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute("StatusCode", r#"#[serde(rename_all = "snake_case")]"#)
         .type_attribute(
             "ExportLogsServiceResponse",
             r#"#[derive(utoipa::ToSchema)]"#,
         )
         .out_dir("src/codegen/opentelemetry")
-        .compile_with_config(prost_config, &protos, &["protos/third-party"])?;
+        .compile_with_config(
+            prost_config,
+            &protos,
+            &[std::path::PathBuf::from("protos/third-party")],
+        )?;
     Ok(())
 }
 

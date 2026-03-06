@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashSet;
 use std::mem::size_of;
@@ -41,6 +36,8 @@ pub(crate) const READINESS_KEY: &str = "readiness";
 pub(crate) const READINESS_VALUE_READY: &str = "READY";
 pub(crate) const READINESS_VALUE_NOT_READY: &str = "NOT_READY";
 
+pub(crate) const AVAILABILITY_ZONE_KEY: &str = "availability_zone";
+
 pub const INDEXING_CPU_CAPACITY_KEY: &str = "indexing_cpu_capacity";
 
 pub(crate) trait NodeStateExt {
@@ -49,6 +46,8 @@ pub(crate) trait NodeStateExt {
     fn is_ready(&self) -> bool;
 
     fn size_bytes(&self) -> usize;
+
+    fn availability_zone(&self) -> Option<String>;
 }
 
 impl NodeStateExt for NodeState {
@@ -79,6 +78,10 @@ impl NodeStateExt for NodeState {
             .map(|(key, value)| key.len() + value.value.len() + SIZE_OF_VERSION + SIZE_OF_TOMBSTONE)
             .sum()
     }
+
+    fn availability_zone(&self) -> Option<String> {
+        self.get(AVAILABILITY_ZONE_KEY).map(|az| az.to_string())
+    }
 }
 
 /// Cluster member.
@@ -106,6 +109,8 @@ pub struct ClusterMember {
     /// Indexing cpu capacity of the node expressed in milli cpu.
     pub indexing_cpu_capacity: CpuCapacity,
     pub is_ready: bool,
+    /// Availability zone the node is running in, if enabled.
+    pub availability_zone: Option<String>,
 }
 
 impl ClusterMember {
@@ -154,6 +159,7 @@ pub(crate) fn build_cluster_member(
         .map(|enabled_services_str| {
             parse_enabled_services_str(enabled_services_str, &chitchat_id.node_id)
         })?;
+    let availability_zone = node_state.availability_zone();
     let grpc_advertise_addr = node_state.grpc_advertise_addr()?;
     let indexing_tasks = parse_indexing_tasks(node_state);
     let indexing_cpu_capacity = parse_indexing_cpu_capacity(node_state);
@@ -166,6 +172,7 @@ pub(crate) fn build_cluster_member(
         grpc_advertise_addr,
         indexing_tasks,
         indexing_cpu_capacity,
+        availability_zone,
     };
     Ok(member)
 }

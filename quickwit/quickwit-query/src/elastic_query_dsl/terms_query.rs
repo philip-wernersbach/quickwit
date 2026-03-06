@@ -1,30 +1,25 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::{BTreeSet, HashMap};
 
 use serde::Deserialize;
 
-use crate::elastic_query_dsl::bool_query::BoolQuery;
 use crate::elastic_query_dsl::one_field_map::OneFieldMap;
-use crate::elastic_query_dsl::term_query::term_query_from_field_value;
 use crate::elastic_query_dsl::{ConvertibleToQueryAst, ElasticQueryDslInner};
 use crate::not_nan_f32::NotNaNf32;
-use crate::query_ast::QueryAst;
+use crate::query_ast::{QueryAst, TermSetQuery};
 
 #[derive(PartialEq, Eq, Debug, Deserialize, Clone)]
 #[serde(try_from = "TermsQueryForSerialization")]
@@ -44,15 +39,34 @@ struct TermsQueryForSerialization {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum OneOrMany {
-    One(String),
-    Many(Vec<String>),
+enum TermValue {
+    I64(i64),
+    U64(u64),
+    Str(String),
 }
+
+impl From<TermValue> for String {
+    fn from(term_value: TermValue) -> String {
+        match term_value {
+            TermValue::I64(val) => val.to_string(),
+            TermValue::U64(val) => val.to_string(),
+            TermValue::Str(val) => val,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(TermValue),
+    Many(Vec<TermValue>),
+}
+
 impl From<OneOrMany> for Vec<String> {
     fn from(one_or_many: OneOrMany) -> Vec<String> {
         match one_or_many {
-            OneOrMany::One(one_value) => vec![one_value],
-            OneOrMany::Many(values) => values,
+            OneOrMany::One(one_value) => vec![String::from(one_value)],
+            OneOrMany::Many(values) => values.into_iter().map(String::from).collect(),
         }
     }
 }
@@ -73,15 +87,14 @@ impl TryFrom<TermsQueryForSerialization> for TermsQuery {
 
 impl ConvertibleToQueryAst for TermsQuery {
     fn convert_to_query_ast(self) -> anyhow::Result<QueryAst> {
-        let term_queries: Vec<ElasticQueryDslInner> = self
-            .values
-            .into_iter()
-            .map(|value| term_query_from_field_value(self.field.clone(), value))
-            .map(ElasticQueryDslInner::from)
-            .collect();
-        let mut union = BoolQuery::union(term_queries);
-        union.boost = self.boost;
-        union.convert_to_query_ast()
+        let mut terms_per_field = HashMap::new();
+        let values_set: BTreeSet<String> = self.values.into_iter().collect();
+        terms_per_field.insert(self.field, values_set);
+
+        let term_set_query = TermSetQuery { terms_per_field };
+        let query_ast: QueryAst = term_set_query.into();
+
+        Ok(query_ast.boost(self.boost))
     }
 }
 
@@ -112,6 +125,14 @@ mod tests {
         let terms_query: TermsQuery = serde_json::from_str(terms_query_json).unwrap();
         assert_eq!(&terms_query.field, "user.id");
         assert_eq!(&terms_query.values[..], &["hello".to_string()]);
+    }
+
+    #[test]
+    fn test_terms_query_not_string() {
+        let terms_query_json = r#"{ "user.id": [1, 2] }"#;
+        let terms_query: TermsQuery = serde_json::from_str(terms_query_json).unwrap();
+        assert_eq!(&terms_query.field, "user.id");
+        assert_eq!(&terms_query.values[..], &["1".to_string(), "2".to_string()]);
     }
 
     #[test]

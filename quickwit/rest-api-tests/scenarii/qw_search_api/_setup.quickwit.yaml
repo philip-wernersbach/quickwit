@@ -30,8 +30,8 @@ endpoint: simple/ingest
 params:
   commit: force
 ndjson:
-  - {"ts": 1684993001, "not_fast": 1684993001}
-  - {"ts": 1684993002, "not_fast": 1684993002}
+  - {"ts": 1684993001, "not_fast": 1684993001, "auto_date": "2023-05-25T10:00:00Z"}
+  - {"ts": 1684993002, "not_fast": 1684993002, "auto_date": "2023-05-25T11:00:00Z"}
 ---
 # Ingest documents split #2
 method: POST
@@ -45,40 +45,56 @@ ndjson:
   - {"not_fast": 1684993003}
 ---
 method: DELETE
-endpoint: indexes/tagged
+endpoint: indexes/nested
 status_code: null
 ---
 method: POST
 endpoint: indexes/
 json:
   version: "0.7"
-  index_id: tagged
+  index_id: nested
   doc_mapping:
+    index_field_presence: true
+    # default mode is dynamic
     field_mappings:
-      - name: seq
-        type: u64
-      - name: tag
-        type: u64
-    tag_fields: ["tag"]
+      - name: json_text
+        type: json
+        indexed: true
+      - name: json_fast
+        type: json
+        stored: true
+        fast: true
+      - name: object_multi
+        type: object
+        field_mappings:
+          - name: object_text_field
+            type: text
+          - name: object_fast_field
+            type: u64
+            fast: true
+      - name: text_fast
+        type: text
+        fast: true
+        indexed: false
+      - name: text_raw
+        type: text
+        fast: false
+        indexed: true
+        tokenizer: raw
+
 ---
 method: POST
-endpoint: tagged/ingest
+endpoint: nested/ingest
 params:
   commit: force
 ndjson:
-  - {"seq": 1, "tag": 1}
-  - {"seq": 2, "tag": 2}
----method: POST
-endpoint: tagged/ingest
-params:
-  commit: force
-ndjson:
-  - {"seq": 1, "tag": 1}
-  - {"seq": 3, "tag": null}
----
-method: POST
-endpoint: tagged/ingest
-params:
-  commit: force
-ndjson:
-  - {"seq": 4, "tag": 1}
+  - {"json_text": {"field_a": "hello", "field_b": "world"}}
+  - {"json_text": {"field_a": "hi"}}
+  - {"json_fast": {"field_c": 1}}
+  - {"object_multi": {"object_text_field": "multi hello"}}
+  - {"object_multi": {"object_fast_field": 1}}
+  - {"object_multi": {"object_fast_field": 2}}
+  - {"text_raw": "indexed-with-raw-tokenizer-dashes"}
+  - {"text_raw": "indexed with raw tokenizer dashes"}
+  - {"text_fast": "fast-text-value-dashes"}
+  - {"text_fast": "fast text value whitespaces"}

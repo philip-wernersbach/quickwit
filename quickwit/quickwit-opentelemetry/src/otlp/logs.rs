@@ -1,34 +1,27 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
-use std::collections::{btree_set, BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use prost::Message;
-use quickwit_common::rate_limited_error;
 use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_common::uri::Uri;
-use quickwit_config::{load_index_config_from_user_config, ConfigFormat, IndexConfig};
+use quickwit_config::{ConfigFormat, IndexConfig, load_index_config_from_user_config};
 use quickwit_ingest::{CommitType, JsonDocBatchV2Builder};
-use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::ingest::DocBatchV2;
+use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::opentelemetry::proto::collector::logs::v1::logs_service_server::LogsService;
 use quickwit_proto::opentelemetry::proto::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -36,18 +29,19 @@ use quickwit_proto::opentelemetry::proto::collector::logs::v1::{
 use quickwit_proto::types::{DocUidGenerator, IndexId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 use tracing::field::Empty;
-use tracing::{error, instrument, warn, Span as RuntimeSpan};
+use tracing::{Span as RuntimeSpan, error, instrument, warn};
 
 use super::{
-    extract_otel_index_id_from_metadata, ingest_doc_batch_v2, is_zero, parse_log_record_body,
     OtelSignal, SpanId, TraceId, TryFromSpanIdError, TryFromTraceIdError,
+    extract_otel_index_id_from_metadata, ingest_doc_batch_v2, is_zero, parse_log_record_body,
 };
 use crate::otlp::extract_attributes;
 use crate::otlp::metrics::OTLP_SERVICE_METRICS;
 
-pub const OTEL_LOGS_INDEX_ID: &str = "otel-logs-v0_7";
+pub const OTEL_LOGS_INDEX_ID: &str = "otel-logs-v0_9";
 
 const OTEL_LOGS_INDEX_CONFIG: &str = r#"
 version: 0.8
@@ -147,9 +141,7 @@ pub enum OtlpLogsError {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogRecord {
     pub timestamp_nanos: u64,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_timestamp_nanos: Option<u64>,
+    pub observed_timestamp_nanos: u64,
     #[serde(default)]
     #[serde(skip_serializing_if = "String::is_empty")]
     pub service_name: String,
@@ -194,36 +186,6 @@ pub struct LogRecord {
     #[serde(skip_serializing_if = "is_zero")]
     pub scope_dropped_attributes_count: u32,
 }
-
-/// A wrapper around `LogRecord` that implements `Ord` to allow insertion of log records into a
-/// `BTreeSet`.
-#[derive(Debug)]
-struct OrdLogRecord(LogRecord);
-
-impl Ord for OrdLogRecord {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .service_name
-            .cmp(&other.0.service_name)
-            .then(self.0.timestamp_nanos.cmp(&other.0.timestamp_nanos))
-    }
-}
-
-impl PartialOrd for OrdLogRecord {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for OrdLogRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.timestamp_nanos == other.0.timestamp_nanos
-            && self.0.service_name == other.0.service_name
-            && self.0.body == other.0.body
-    }
-}
-
-impl Eq for OrdLogRecord {}
 
 struct ParsedLogRecords {
     doc_batch: DocBatchV2,
@@ -298,19 +260,21 @@ impl OtlpGrpcLogsService {
     }
 
     #[instrument(skip_all, parent = parent_span, fields(num_log_records = Empty, num_bytes = Empty, num_parse_errors = Empty))]
+    #[allow(clippy::result_large_err)]
     fn parse_logs(
         request: ExportLogsServiceRequest,
         parent_span: RuntimeSpan,
-    ) -> Result<ParsedLogRecords, Status> {
-        let (log_records, mut num_parse_errors) = parse_otlp_logs(request)?;
+    ) -> tonic::Result<ParsedLogRecords> {
+        let log_records = parse_otlp_logs(request)?;
+        let mut num_parse_errors = 0;
         let num_log_records = log_records.len() as u64;
         let mut error_message = String::new();
 
-        let mut doc_batch_builder = JsonDocBatchV2Builder::default();
+        let mut doc_batch_builder = JsonDocBatchV2Builder::with_num_docs(num_log_records as usize);
         let mut doc_uid_generator = DocUidGenerator::default();
         for log_record in log_records {
             let doc_uid = doc_uid_generator.next_doc_uid();
-            if let Err(error) = doc_batch_builder.add_doc(doc_uid, log_record.0) {
+            if let Err(error) = doc_batch_builder.add_doc(doc_uid, log_record) {
                 error!(error=?error, "failed to JSON serialize span");
                 error_message = format!("failed to JSON serialize span: {error:?}");
                 num_parse_errors += 1;
@@ -398,21 +362,24 @@ impl LogsService for OtlpGrpcLogsService {
     }
 }
 
-fn parse_otlp_logs(
-    request: ExportLogsServiceRequest,
-) -> Result<(BTreeSet<OrdLogRecord>, u64), OtlpLogsError> {
-    let mut log_records = BTreeSet::new();
-    let mut num_parse_errors = 0;
+fn parse_otlp_logs(request: ExportLogsServiceRequest) -> Result<Vec<LogRecord>, OtlpLogsError> {
+    let num_log_records = request
+        .resource_logs
+        .iter()
+        .flat_map(|resource_log| resource_log.scope_logs.iter())
+        .map(|scope_logs| scope_logs.log_records.len())
+        .sum();
+    let mut log_records = Vec::with_capacity(num_log_records);
 
-    for resource_log in request.resource_logs {
+    for resource_logs in request.resource_logs {
         let mut resource_attributes = extract_attributes(
-            resource_log
+            resource_logs
                 .resource
                 .clone()
                 .map(|rsrc| rsrc.attributes)
                 .unwrap_or_default(),
         );
-        let resource_dropped_attributes_count = resource_log
+        let resource_dropped_attributes_count = resource_logs
             .resource
             .map(|rsrc| rsrc.dropped_attributes_count)
             .unwrap_or(0);
@@ -421,41 +388,52 @@ fn parse_otlp_logs(
             Some(JsonValue::String(value)) => value.to_string(),
             _ => "unknown_service".to_string(),
         };
-        for scope_log in resource_log.scope_logs {
-            let scope_name = scope_log
+        for scope_logs in resource_logs.scope_logs {
+            let scope_name = scope_logs
                 .scope
                 .as_ref()
                 .map(|scope| &scope.name)
                 .filter(|name| !name.is_empty());
-            let scope_version = scope_log
+            let scope_version = scope_logs
                 .scope
                 .as_ref()
                 .map(|scope| &scope.version)
                 .filter(|version| !version.is_empty());
             let scope_attributes = extract_attributes(
-                scope_log
+                scope_logs
                     .scope
                     .clone()
                     .map(|scope| scope.attributes)
                     .unwrap_or_default(),
             );
-            let scope_dropped_attributes_count = scope_log
+            let scope_dropped_attributes_count = scope_logs
                 .scope
                 .as_ref()
                 .map(|scope| scope.dropped_attributes_count)
                 .unwrap_or(0);
 
-            for log_record in scope_log.log_records {
-                if log_record.time_unix_nano == 0 {
-                    rate_limited_error!(limit_per_min = 10, "skipping record");
-                    num_parse_errors += 1;
-                    continue;
-                }
-                let observed_timestamp_nanos = if log_record.observed_time_unix_nano != 0 {
-                    Some(log_record.observed_time_unix_nano)
+            for log_record in scope_logs.log_records {
+                let observed_timestamp_nanos = if log_record.observed_time_unix_nano == 0 {
+                    // As per OTEL model spec, this field SHOULD be set once the
+                    // event is observed by OpenTelemetry. If it's not set, we
+                    // consider ourselves as the first OTEL observers.
+                    OffsetDateTime::now_utc().unix_timestamp_nanos() as u64
                 } else {
-                    None
+                    log_record.observed_time_unix_nano
                 };
+
+                let timestamp_nanos = if log_record.time_unix_nano == 0 {
+                    observed_timestamp_nanos
+                } else {
+                    // When only one timestamp is supported by a recipients, the
+                    // OTEL spec recommends using the `Timestamp` field if
+                    // present, otherwise `ObservedTimestamp`. Even though our
+                    // model supports multiple timestamps, we have only one
+                    // field that that can be our `timestamp_field` and it
+                    // should be the one that is commonly used for queries.
+                    log_record.time_unix_nano
+                };
+
                 let trace_id = if log_record.trace_id.iter().any(|&byte| byte != 0) {
                     let trace_id = TraceId::try_from(log_record.trace_id)?;
                     Some(trace_id)
@@ -481,7 +459,7 @@ fn parse_otlp_logs(
                 let dropped_attributes_count = log_record.dropped_attributes_count;
 
                 let log_record = LogRecord {
-                    timestamp_nanos: log_record.time_unix_nano,
+                    timestamp_nanos,
                     observed_timestamp_nanos,
                     service_name: service_name.clone(),
                     severity_text,
@@ -499,16 +477,16 @@ fn parse_otlp_logs(
                     scope_attributes: scope_attributes.clone(),
                     scope_dropped_attributes_count,
                 };
-                log_records.insert(OrdLogRecord(log_record));
+                log_records.push(log_record);
             }
         }
     }
-    Ok((log_records, num_parse_errors))
+    Ok(log_records)
 }
 
 /// An iterator of JSON OTLP log records for use in the doc processor.
 pub struct JsonLogIterator {
-    logs: btree_set::IntoIter<OrdLogRecord>,
+    logs: std::vec::IntoIter<LogRecord>,
     current_log_idx: usize,
     num_logs: usize,
     avg_log_size: usize,
@@ -516,7 +494,7 @@ pub struct JsonLogIterator {
 }
 
 impl JsonLogIterator {
-    fn new(logs: BTreeSet<OrdLogRecord>, num_bytes: usize) -> Self {
+    fn new(logs: Vec<LogRecord>, num_bytes: usize) -> Self {
         let num_logs = logs.len();
         let avg_log_size = num_bytes.checked_div(num_logs).unwrap_or(0);
         let avg_log_size_rem = avg_log_size + num_bytes.checked_rem(num_logs).unwrap_or(0);
@@ -535,9 +513,10 @@ impl Iterator for JsonLogIterator {
     type Item = (JsonValue, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let log_opt = self.logs.next().map(|OrdLogRecord(log)| {
-            serde_json::to_value(log).expect("`LogRecord` should be JSON serializable")
-        });
+        let log_opt = self
+            .logs
+            .next()
+            .map(|log| serde_json::to_value(log).expect("`LogRecord` should be JSON serializable"));
         if log_opt.is_some() {
             self.current_log_idx += 1;
         }
@@ -551,19 +530,19 @@ impl Iterator for JsonLogIterator {
 
 pub fn parse_otlp_logs_json(payload_json: &[u8]) -> Result<JsonLogIterator, OtlpLogsError> {
     let request: ExportLogsServiceRequest = serde_json::from_slice(payload_json)?;
-    let (log_records, _num_parse_errors) = parse_otlp_logs(request)?;
+    let log_records = parse_otlp_logs(request)?;
     Ok(JsonLogIterator::new(log_records, payload_json.len()))
 }
 
 pub fn parse_otlp_logs_protobuf(payload_proto: &[u8]) -> Result<JsonLogIterator, OtlpLogsError> {
     let request = ExportLogsServiceRequest::decode(payload_proto)?;
-    let (log_records, _num_parse_errors) = parse_otlp_logs(request)?;
+    let log_records = parse_otlp_logs(request)?;
     Ok(JsonLogIterator::new(log_records, payload_proto.len()))
 }
 
 #[cfg(test)]
 mod tests {
-    use quickwit_metastore::{metastore_for_test, CreateIndexRequestExt};
+    use quickwit_metastore::{CreateIndexRequestExt, metastore_for_test};
     use quickwit_proto::metastore::{CreateIndexRequest, MetastoreService};
 
     use super::*;

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
@@ -23,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use fail::fail_point;
 use itertools::Itertools;
@@ -47,7 +42,7 @@ use tantivy::index::SegmentId;
 use tantivy::tokenizer::TokenizerManager;
 use tantivy::{DateTime, Directory, Index, IndexMeta, IndexWriter, SegmentReader};
 use tokio::runtime::Handle;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::actors::Packager;
 use crate::controlled_directory::ControlledDirectory;
@@ -58,7 +53,7 @@ use crate::models::{IndexedSplit, IndexedSplitBatch, MergeScratch, PublishLock, 
 pub struct MergeExecutor {
     pipeline_id: MergePipelineId,
     metastore: MetastoreServiceClient,
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
     io_controls: IoControls,
     merge_packager_mailbox: Mailbox<Packager>,
 }
@@ -95,16 +90,35 @@ impl Handler<MergeScratch> for MergeExecutor {
         let start = Instant::now();
         let merge_task = merge_scratch.merge_task;
         let indexed_split_opt: Option<IndexedSplit> = match merge_task.operation_type {
-            MergeOperationType::Merge => Some(
-                self.process_merge(
-                    merge_task.merge_split_id.clone(),
-                    merge_task.splits.clone(),
-                    merge_scratch.tantivy_dirs,
-                    merge_scratch.merge_scratch_directory,
-                    ctx,
-                )
-                .await?,
-            ),
+            MergeOperationType::Merge => {
+                let merge_res = self
+                    .process_merge(
+                        merge_task.merge_split_id.clone(),
+                        merge_task.splits.clone(),
+                        merge_scratch.tantivy_dirs,
+                        merge_scratch.merge_scratch_directory,
+                        ctx,
+                    )
+                    .await;
+                match merge_res {
+                    Ok(indexed_split) => Some(indexed_split),
+                    Err(err) => {
+                        // A failure in a merge is a bit special.
+                        //
+                        // Instead of failing the pipeline, we just log it.
+                        // The idea is to limit the risk associated with a potential split of death.
+                        //
+                        // Such a split is now not tracked by the merge planner and won't undergo a
+                        // merge until the merge pipeline is restarted.
+                        //
+                        // With a merge policy that marks splits as mature after a day or so, this
+                        // limits the noise associated to those failed
+                        // merges.
+                        error!(task=?merge_task, err=?err, "failed to merge splits");
+                        return Ok(());
+                    }
+                }
+            }
             MergeOperationType::DeleteAndMerge => {
                 assert_eq!(
                     merge_task.splits.len(),
@@ -288,7 +302,7 @@ impl MergeExecutor {
     pub fn new(
         pipeline_id: MergePipelineId,
         metastore: MetastoreServiceClient,
-        doc_mapper: Arc<dyn DocMapper>,
+        doc_mapper: Arc<DocMapper>,
         io_controls: IoControls,
         merge_packager_mailbox: Mailbox<Packager>,
     ) -> Self {
@@ -469,7 +483,7 @@ impl MergeExecutor {
         union_index_meta: IndexMeta,
         split_directories: Vec<Box<dyn Directory>>,
         delete_tasks: Vec<DeleteTask>,
-        doc_mapper_opt: Option<Arc<dyn DocMapper>>,
+        doc_mapper_opt: Option<Arc<DocMapper>>,
         output_path: &Path,
         ctx: &ActorContext<MergeExecutor>,
     ) -> anyhow::Result<ControlledDirectory> {
@@ -520,7 +534,7 @@ impl MergeExecutor {
                     parsed_query_ast
                 );
                 let (query, _) =
-                    doc_mapper.query(union_index.schema(), &parsed_query_ast, false)?;
+                    doc_mapper.query(union_index.schema(), parsed_query_ast, false, None)?;
                 index_writer.delete_query(query)?;
             }
             debug!("commit-delete-operations");
@@ -545,7 +559,7 @@ impl MergeExecutor {
 
         debug!(segment_ids=?segment_ids,"merging-segments");
         // TODO it would be nice if tantivy could let us run the merge in the current thread.
-        index_writer.merge(&segment_ids).wait()?;
+        index_writer.merge(&segment_ids).await?;
 
         Ok(output_directory)
     }
@@ -580,7 +594,7 @@ mod tests {
 
     use super::*;
     use crate::merge_policy::{MergeOperation, MergeTask};
-    use crate::{get_tantivy_directory_from_split_bundle, new_split_id, TestSandbox};
+    use crate::{TestSandbox, get_tantivy_directory_from_split_bundle, new_split_id};
 
     #[tokio::test]
     async fn test_merge_executor() -> anyhow::Result<()> {
@@ -825,7 +839,8 @@ mod tests {
             let documents_left = searcher
                 .search(
                     &tantivy::query::AllQuery,
-                    &tantivy::collector::TopDocs::with_limit(result_docs.len() + 1),
+                    &tantivy::collector::TopDocs::with_limit(result_docs.len() + 1)
+                        .order_by_score(),
                 )?
                 .into_iter()
                 .map(|(_, doc_address)| {

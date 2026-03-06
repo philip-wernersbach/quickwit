@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Fail points are a form of code instrumentation that allow errors and other behaviors
 //! to be injected dynamically at runtime, primarily for testing purposes. Fail
@@ -40,7 +35,6 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use fail::FailScenario;
-use quickwit_actors::ActorExitStatus;
 use quickwit_common::io::IoControls;
 use quickwit_common::rand::append_random_suffix;
 use quickwit_common::split_file;
@@ -48,7 +42,7 @@ use quickwit_common::temp_dir::TempDirectory;
 use quickwit_indexing::actors::MergeExecutor;
 use quickwit_indexing::merge_policy::{MergeOperation, MergeTask};
 use quickwit_indexing::models::MergeScratch;
-use quickwit_indexing::{get_tantivy_directory_from_split_bundle, TestSandbox};
+use quickwit_indexing::{TestSandbox, get_tantivy_directory_from_split_bundle};
 use quickwit_metastore::{
     ListSplitsQuery, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitMetadata,
     SplitState,
@@ -315,7 +309,7 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
         merge_packager_mailbox,
     );
 
-    let (merge_executor_mailbox, merge_executor_handle) =
+    let (merge_executor_mailbox, _merge_executor_handle) =
         universe.spawn_builder().spawn(merge_executor);
 
     // We want to make sure that the processing of the message gets
@@ -339,14 +333,15 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
         after_universe_kill_clone.wait();
     })
     .unwrap();
+    fail::cfg(
+        "after-merge-split",
+        "panic(merge should be failed by directory kill switch)",
+    )
+    .unwrap();
     merge_executor_mailbox.send_message(merge_scratch).await?;
     before_universe_kill.wait();
     universe.kill();
     after_universe_kill.wait();
-    fail::cfg("before-merge-split", "off").unwrap();
-
-    let (exit_status, _) = merge_executor_handle.join().await;
-    assert!(matches!(exit_status, ActorExitStatus::Failure(_)));
     universe.quit().await;
 
     Ok(())

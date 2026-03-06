@@ -18,13 +18,15 @@ bytes = { workspace = true }
 bytesize = { workspace = true }
 fnv = { workspace = true }
 futures = { workspace = true }
+http-body-util = { workspace = true}
 hyper = { workspace = true }
 lru = { workspace = true }
 md5 = { workspace = true }
+mini-moka = { workspace = true }
 mockall = { workspace = true, optional = true }
 once_cell = { workspace = true }
 pin-project = { workspace = true }
-rand = { workspace = true }
+quick_cache = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -43,6 +45,7 @@ aws-sdk-s3 = { workspace = true }
 aws-smithy-types = { workspace = true }
 
 azure_core = { workspace = true, optional = true }
+azure_identity = { workspace = true, optional = true }
 azure_storage = { workspace = true, optional = true }
 azure_storage_blobs = { workspace = true, optional = true }
 
@@ -52,10 +55,10 @@ quickwit-config = { workspace = true }
 quickwit-proto = { workspace = true }
 
 opendal = { workspace = true, optional = true }
-reqsign = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
+http = { workspace = true }
 mockall = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
@@ -69,8 +72,10 @@ quickwit-common = { workspace = true, features = ["testsuite"] }
 [features]
 azure = [
   "azure_core",
+  "azure_identity",
   "azure_storage",
   "azure_storage_blobs",
+  "azure_core/hmac_rust",
   "azure_core/enable_reqwest_rustls",
   "azure_storage/enable_reqwest_rustls",
   "azure_storage_blobs/enable_reqwest_rustls",
@@ -82,8 +87,6 @@ integration-testsuite = [
   "azure_core/azurite_workaround",
   "azure_storage_blobs/azurite_workaround",
   "gcs",                                    # Stands for Google cloud storage.
-  "dep:reqsign",
-  "reqsign/services-google",
   "dep:reqwest",
 ]
 testsuite = ["mockall"]

@@ -1,39 +1,34 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::str::FromStr;
 
-use anyhow::{bail, Context};
-use clap::{arg, ArgMatches, Command};
+use anyhow::{Context, bail};
+use clap::{ArgMatches, Command, arg};
 use colored::Colorize;
 use itertools::Itertools;
 use quickwit_common::uri::Uri;
-use quickwit_config::{validate_identifier, ConfigFormat, SourceConfig};
+use quickwit_config::{ConfigFormat, SourceConfig, validate_identifier};
 use quickwit_metastore::checkpoint::SourceCheckpoint;
 use quickwit_proto::types::{IndexId, SourceId};
-use quickwit_storage::{load_file, StorageResolver};
+use quickwit_storage::{StorageResolver, load_file};
 use serde_json::Value as JsonValue;
 use tabled::{Table, Tabled};
 use tracing::debug;
 
 use crate::checklist::GREEN_COLOR;
-use crate::{client_args, make_table, prompt_confirmation, ClientArgs};
+use crate::{ClientArgs, client_args, make_table, prompt_confirmation};
 
 pub fn build_source_command() -> Command {
     Command::new("source")
@@ -48,6 +43,22 @@ pub fn build_source_command() -> Command {
                         .required(true),
                     arg!(--"source-config" <SOURCE_CONFIG> "Path to source config file. Please, refer to the documentation for more details.")
                         .required(true),
+                ])
+            )
+        .subcommand(
+            Command::new("update")
+                .about("Updates an existing source.")
+                .args(&[
+                    arg!(--index <INDEX_ID> "ID of the target index")
+                        .display_order(1)
+                        .required(true),
+                    arg!(--source <SOURCE_ID> "ID of the source")
+                        .display_order(2)
+                        .required(true),
+                    arg!(--"source-config" <SOURCE_CONFIG> "Path to source config file. Please, refer to the documentation for more details.")
+                        .required(true),
+                    arg!(--"create" "Create the index if it does not already exists.")
+                        .required(false),
                 ])
             )
         .subcommand(
@@ -148,6 +159,15 @@ pub struct CreateSourceArgs {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub struct UpdateSourceArgs {
+    pub client_args: ClientArgs,
+    pub index_id: IndexId,
+    pub source_id: SourceId,
+    pub source_config_uri: Uri,
+    pub create: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct ToggleSourceArgs {
     pub client_args: ClientArgs,
     pub index_id: IndexId,
@@ -187,6 +207,7 @@ pub struct ResetCheckpointArgs {
 #[derive(Debug, Eq, PartialEq)]
 pub enum SourceCliCommand {
     CreateSource(CreateSourceArgs),
+    UpdateSource(UpdateSourceArgs),
     ToggleSource(ToggleSourceArgs),
     DeleteSource(DeleteSourceArgs),
     DescribeSource(DescribeSourceArgs),
@@ -198,6 +219,7 @@ impl SourceCliCommand {
     pub async fn execute(self) -> anyhow::Result<()> {
         match self {
             Self::CreateSource(args) => create_source_cli(args).await,
+            Self::UpdateSource(args) => update_source_cli(args).await,
             Self::ToggleSource(args) => toggle_source_cli(args).await,
             Self::DeleteSource(args) => delete_source_cli(args).await,
             Self::DescribeSource(args) => describe_source_cli(args).await,
@@ -212,6 +234,7 @@ impl SourceCliCommand {
             .context("failed to parse source subcommand")?;
         match subcommand.as_str() {
             "create" => Self::parse_create_args(submatches).map(Self::CreateSource),
+            "update" => Self::parse_update_args(submatches).map(Self::UpdateSource),
             "enable" => {
                 Self::parse_toggle_source_args(&subcommand, submatches).map(Self::ToggleSource)
             }
@@ -241,6 +264,29 @@ impl SourceCliCommand {
             client_args,
             index_id,
             source_config_uri,
+        })
+    }
+
+    fn parse_update_args(mut matches: ArgMatches) -> anyhow::Result<UpdateSourceArgs> {
+        let client_args = ClientArgs::parse(&mut matches)?;
+        let index_id = matches
+            .remove_one::<String>("index")
+            .expect("`index` should be a required arg.");
+        let source_id = matches
+            .remove_one::<String>("source")
+            .expect("`source` should be a required arg.");
+        let source_config_uri = matches
+            .remove_one::<String>("source-config")
+            .map(|uri_str| Uri::from_str(&uri_str))
+            .expect("`source-config` should be a required arg.")?;
+        let create = matches.get_flag("create");
+
+        Ok(UpdateSourceArgs {
+            client_args,
+            index_id,
+            source_id,
+            source_config_uri,
+            create,
         })
     }
 
@@ -339,6 +385,28 @@ async fn create_source_cli(args: CreateSourceArgs) -> anyhow::Result<()> {
         .create(source_config_str, config_format)
         .await?;
     println!("{} Source successfully created.", "✔".color(GREEN_COLOR));
+    Ok(())
+}
+
+async fn update_source_cli(args: UpdateSourceArgs) -> anyhow::Result<()> {
+    debug!(args=?args, "update-source");
+    println!("❯ Updating source...");
+    let storage_resolver = StorageResolver::unconfigured();
+    let source_config_content = load_file(&storage_resolver, &args.source_config_uri).await?;
+    let source_config_str: &str = std::str::from_utf8(&source_config_content)
+        .with_context(|| format!("source config is not utf-8: {}", args.source_config_uri))?;
+    let config_format = ConfigFormat::sniff_from_uri(&args.source_config_uri)?;
+    let qw_client = args.client_args.client();
+    qw_client
+        .sources(&args.index_id)
+        .update(
+            &args.source_id,
+            source_config_str,
+            config_format,
+            args.create,
+        )
+        .await?;
+    println!("{} Source successfully updated.", "✔".color(GREEN_COLOR));
     Ok(())
 }
 
@@ -560,7 +628,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::cli::{build_cli, CliCommand};
+    use crate::cli::{CliCommand, build_cli};
 
     #[test]
     fn test_flatten_json() {
@@ -600,6 +668,33 @@ mod tests {
                 client_args: ClientArgs::default(),
                 index_id: "hdfs-logs".to_string(),
                 source_config_uri: Uri::from_str("file:///source-conf.yaml").unwrap(),
+            }));
+        assert_eq!(command, expected_command);
+    }
+
+    #[test]
+    fn test_parse_update_source_args() {
+        let app = build_cli().no_binary_name(true);
+        let matches = app
+            .try_get_matches_from(vec![
+                "source",
+                "update",
+                "--index",
+                "hdfs-logs",
+                "--source",
+                "kafka-foo",
+                "--source-config",
+                "/source-conf.yaml",
+            ])
+            .unwrap();
+        let command = CliCommand::parse_cli_args(matches).unwrap();
+        let expected_command =
+            CliCommand::Source(SourceCliCommand::UpdateSource(UpdateSourceArgs {
+                client_args: ClientArgs::default(),
+                index_id: "hdfs-logs".to_string(),
+                source_id: "kafka-foo".to_string(),
+                source_config_uri: Uri::from_str("file:///source-conf.yaml").unwrap(),
+                create: false,
             }));
         assert_eq!(command, expected_command);
     }
@@ -727,12 +822,10 @@ mod tests {
 
     #[test]
     fn test_make_describe_source_tables() {
-        assert!(make_describe_source_tables(
-            SourceCheckpoint::default(),
-            [],
-            "source-does-not-exist"
-        )
-        .is_err());
+        assert!(
+            make_describe_source_tables(SourceCheckpoint::default(), [], "source-does-not-exist")
+                .is_err()
+        );
 
         let checkpoint: SourceCheckpoint = vec![("shard-000", ""), ("shard-001", "1234567890")]
             .into_iter()
@@ -742,7 +835,7 @@ mod tests {
             .collect();
         let sources = vec![SourceConfig {
             source_id: "foo-source".to_string(),
-            num_pipelines: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params: SourceParams::file_from_str("path/to/file").unwrap(),
             transform_config: None,
@@ -803,7 +896,7 @@ mod tests {
         let sources = [
             SourceConfig {
                 source_id: "foo-source".to_string(),
-                num_pipelines: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::MIN,
                 enabled: true,
                 source_params: SourceParams::stdin(),
                 transform_config: None,
@@ -811,7 +904,7 @@ mod tests {
             },
             SourceConfig {
                 source_id: "bar-source".to_string(),
-                num_pipelines: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::MIN,
                 enabled: true,
                 source_params: SourceParams::stdin(),
                 transform_config: None,

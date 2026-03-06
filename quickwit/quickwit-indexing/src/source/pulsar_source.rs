@@ -1,27 +1,22 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -36,14 +31,14 @@ use quickwit_config::{PulsarSourceAuth, PulsarSourceParams};
 use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
 use quickwit_proto::metastore::SourceType;
 use quickwit_proto::types::{IndexUid, Position};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::actors::DocProcessor;
 use crate::source::{
-    BatchBuilder, Source, SourceActor, SourceContext, SourceRuntime, TypedSourceFactory,
-    BATCH_NUM_BYTES_LIMIT, EMIT_BATCHES_TIMEOUT,
+    BATCH_NUM_BYTES_LIMIT, BatchBuilder, EMIT_BATCHES_TIMEOUT, Source, SourceActor, SourceContext,
+    SourceRuntime, TypedSourceFactory,
 };
 
 type PulsarConsumer = Consumer<PulsarMessage, TokioExecutor>;
@@ -223,7 +218,7 @@ impl Source for PulsarSource {
     ) -> Result<Duration, ActorExitStatus> {
         let now = Instant::now();
         let mut batch_builder = BatchBuilder::new(SourceType::Pulsar);
-        let deadline = time::sleep(EMIT_BATCHES_TIMEOUT);
+        let deadline = time::sleep(*EMIT_BATCHES_TIMEOUT);
         tokio::pin!(deadline);
 
         loop {
@@ -271,7 +266,16 @@ impl Source for PulsarSource {
     }
 
     fn name(&self) -> String {
-        format!("{:?}", self)
+        format!("{self:?}")
+    }
+
+    async fn finalize(
+        &mut self,
+        _exit_status: &ActorExitStatus,
+        _ctx: &SourceContext,
+    ) -> anyhow::Result<()> {
+        self.pulsar_consumer.close().await?;
+        Ok(())
     }
 
     fn observable_state(&self) -> JsonValue {
@@ -420,9 +424,7 @@ async fn connect_pulsar(params: &PulsarSourceParams) -> anyhow::Result<Pulsar<To
             builder = builder.with_auth_provider(OAuth2Authentication::client_credentials(auth));
         }
     }
-
     let pulsar: Pulsar<_> = builder.build().await?;
-
     Ok(pulsar)
 }
 
@@ -443,7 +445,7 @@ mod pulsar_broker_tests {
     use std::ops::Range;
 
     use futures::future::join_all;
-    use quickwit_actors::{ActorHandle, Inbox, Universe, HEARTBEAT};
+    use quickwit_actors::{ActorHandle, HEARTBEAT, Inbox, Universe};
     use quickwit_common::rand::append_random_suffix;
     use quickwit_config::{SourceConfig, SourceInputFormat, SourceParams};
     use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpointDelta};
@@ -455,7 +457,7 @@ mod pulsar_broker_tests {
     use crate::source::pulsar_source::{msg_id_from_position, msg_id_to_position};
     use crate::source::test_setup_helper::setup_index;
     use crate::source::tests::SourceRuntimeBuilder;
-    use crate::source::{quickwit_supported_sources, RawDocBatch, SuggestTruncate};
+    use crate::source::{RawDocBatch, SuggestTruncate, quickwit_supported_sources};
 
     static PULSAR_URI: &str = "pulsar://localhost:6650";
     static PULSAR_ADMIN_URI: &str = "http://localhost:8081";
@@ -491,7 +493,7 @@ mod pulsar_broker_tests {
         let source_id = append_random_suffix("test-pulsar-source--source");
         let source_config = SourceConfig {
             source_id: source_id.clone(),
-            num_pipelines: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params: SourceParams::Pulsar(PulsarSourceParams {
                 topics: topics.into_iter().map(|v| v.as_ref().to_string()).collect(),
@@ -525,10 +527,7 @@ mod pulsar_broker_tests {
 
     impl TopicData {
         fn num_bytes(&self) -> usize {
-            self.messages
-                .iter()
-                .map(|v| v.as_bytes().len())
-                .sum::<usize>()
+            self.messages.iter().map(|v| v.len()).sum::<usize>()
         }
 
         fn len(&self) -> usize {

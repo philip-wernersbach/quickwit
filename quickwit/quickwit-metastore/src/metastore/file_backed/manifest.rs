@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -23,11 +18,12 @@ use std::path::Path;
 use itertools::Itertools;
 use quickwit_common::uri::Uri;
 use quickwit_config::{IndexTemplate, IndexTemplateId};
-use quickwit_proto::metastore::{serde_utils, MetastoreError, MetastoreResult};
+use quickwit_proto::metastore::{MetastoreError, MetastoreResult, serde_utils};
 use quickwit_proto::types::{DocMappingUid, IndexId};
 use quickwit_storage::{OwnedBytes, Storage, StorageError, StorageErrorKind, StorageResult};
 use serde::{Deserialize, Serialize};
 use tracing::error;
+use uuid::Uuid;
 
 pub(super) const MANIFEST_FILE_NAME: &str = "manifest.json";
 
@@ -45,6 +41,7 @@ impl LegacyManifest {
         Manifest {
             indexes: self.indexes,
             templates: HashMap::new(),
+            identity: Uuid::nil(),
         }
     }
 }
@@ -69,6 +66,7 @@ pub(crate) struct Manifest {
     // The templates are serialized as a sorted `Vec<IndexTemplate>` so the btree map is
     // unnecessary here and we can pass the hash map as is to the `MetastoreState`
     pub templates: HashMap<IndexTemplateId, IndexTemplate>,
+    pub identity: Uuid,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,6 +106,8 @@ impl From<VersionedManifest> for Manifest {
 struct ManifestV0_8 {
     indexes: BTreeMap<IndexId, IndexStatus>,
     templates: Vec<IndexTemplate>,
+    #[serde(default, skip_serializing_if = "Uuid::is_nil")]
+    identity: Uuid,
 }
 
 impl From<Manifest> for ManifestV0_8 {
@@ -120,6 +120,7 @@ impl From<Manifest> for ManifestV0_8 {
         ManifestV0_8 {
             indexes: manifest.indexes,
             templates,
+            identity: manifest.identity,
         }
     }
 }
@@ -132,7 +133,11 @@ impl From<ManifestV0_8> for Manifest {
             .into_iter()
             .map(|template| (template.template_id.clone(), template))
             .collect();
-        Manifest { indexes, templates }
+        Manifest {
+            indexes,
+            templates,
+            identity: manifest.identity,
+        }
     }
 }
 
@@ -149,7 +154,11 @@ impl quickwit_config::TestableForRegression for Manifest {
             "test-template-1".to_string(),
             IndexTemplate::sample_for_regression(),
         );
-        Manifest { indexes, templates }
+        Manifest {
+            indexes,
+            templates,
+            identity: Uuid::nil(),
+        }
     }
 
     fn assert_equality(&self, other: &Self) {
@@ -325,7 +334,11 @@ mod tests {
                 IndexTemplate::for_test("test-template-2", &["test-index-bar*"], 200),
             ),
         ]);
-        let manifest = Manifest { indexes, templates };
+        let manifest = Manifest {
+            indexes,
+            templates,
+            identity: Uuid::nil(),
+        };
         let manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
         let manifest_deserialized: Manifest = serde_json::from_str(&manifest_json).unwrap();
         assert_eq!(manifest, manifest_deserialized);

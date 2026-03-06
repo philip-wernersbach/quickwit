@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -82,7 +77,7 @@ pub struct Builder<'a> {
     num_rand_chars: usize,
 }
 
-impl<'a> Default for Builder<'a> {
+impl Default for Builder<'_> {
     fn default() -> Self {
         Self {
             parts: Default::default(),
@@ -324,7 +319,7 @@ mod tests {
             builder.join(part);
         }
         let prefix = builder.prefix().unwrap();
-        assert_eq!(expected_path, prefix, "parts: {:?} len: {:?}", parts, size);
+        assert_eq!(expected_path, prefix, "parts: {parts:?} len: {size:?}");
     }
 
     fn assert_prefix_err(expected_err: &str, parts: Vec<&str>, size: usize) {
@@ -340,16 +335,16 @@ mod tests {
 
     #[test]
     fn test_prefix_random() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let template = "A".repeat(100);
         for _ in 0..10000 {
-            let rand_bytes = rng.gen::<usize>() % 4;
-            let parts_num = rng.gen::<usize>() % 10;
+            let rand_bytes = rng.random_range(0..4);
+            let parts_num = rng.random_range(0..10);
             let mut builder = Builder::default();
             builder.rand_bytes(rand_bytes);
             let mut max_size = 0;
             for _ in 0..parts_num {
-                let size = 1 + rand::random::<usize>() % 10;
+                let size = 1 + rng.random_range(0..10);
                 builder.join(&template[0..size]);
                 max_size += size + 1;
             }
@@ -365,23 +360,21 @@ mod tests {
                 }
             };
             let limit_threshold = parts_num + separator_count + rand_bytes;
-            if parts_num > 0 && rng.gen::<bool>() {
-                builder.max_length(rand::random::<usize>() % limit_threshold);
+            if parts_num > 0 && rng.random() {
+                builder.max_length(rng.random_range(0..limit_threshold));
                 assert_eq!(
                     "the filename limit is too small",
                     builder.prefix().unwrap_err().to_string()
                 );
             } else {
-                let len = limit_threshold + rand::random::<usize>() % 100;
+                let len = limit_threshold + rng.random_range(0..100);
                 builder.max_length(len);
-                let builder_debug = format!("{:?}, len {}", builder, len);
+                let builder_debug = format!("{builder:?}, len {len}");
                 let builder_prefix = builder.prefix().unwrap();
                 assert_eq!(
                     builder_prefix.len(),
                     cmp::min(len - rand_bytes, max_size),
-                    "{} -> {}",
-                    builder_debug,
-                    builder_prefix
+                    "{builder_debug} -> {builder_prefix}"
                 );
             }
         }

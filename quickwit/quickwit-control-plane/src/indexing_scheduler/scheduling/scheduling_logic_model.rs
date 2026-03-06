@@ -1,24 +1,19 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::num::NonZeroU32;
 
 use quickwit_proto::indexing::CpuCapacity;
@@ -94,9 +89,11 @@ impl SchedulingProblem {
         indexer_cpu_capacities: Vec<CpuCapacity>,
     ) -> SchedulingProblem {
         assert!(!indexer_cpu_capacities.is_empty());
-        assert!(indexer_cpu_capacities
-            .iter()
-            .all(|cpu_capacity| cpu_capacity.cpu_millis() > 0));
+        assert!(
+            indexer_cpu_capacities
+                .iter()
+                .all(|cpu_capacity| cpu_capacity.cpu_millis() > 0)
+        );
         // TODO assert for affinity.
         SchedulingProblem {
             sources: Vec::new(),
@@ -212,7 +209,12 @@ impl IndexerAssignment {
             .unwrap_or(0u32)
     }
 
+    /// Add shards to a source (noop of `num_shards` is 0).
     pub fn add_shards(&mut self, source_ord: u32, num_shards: u32) {
+        // No need to fill indexer_assignments with empty assignments.
+        if num_shards == 0 {
+            return;
+        }
         *self.num_shards_per_source.entry(source_ord).or_default() += num_shards;
     }
 
@@ -232,15 +234,18 @@ impl IndexerAssignment {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct SchedulingSolution {
     pub indexer_assignments: Vec<IndexerAssignment>,
+    // used for tests
+    pub capacity_scaling_iterations: usize,
 }
 
 impl SchedulingSolution {
     pub fn with_num_indexers(num_indexers: usize) -> SchedulingSolution {
         SchedulingSolution {
             indexer_assignments: (0..num_indexers).map(IndexerAssignment::new).collect(),
+            capacity_scaling_iterations: 0,
         }
     }
     pub fn num_indexers(&self) -> usize {

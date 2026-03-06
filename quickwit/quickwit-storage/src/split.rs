@@ -1,36 +1,29 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
-use std::io::{self, SeekFrom};
+use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use aws_sdk_s3::primitives::{ByteStream, SdkBody};
-use futures::{stream, Stream, StreamExt};
-use hyper::body::{Body, Bytes};
+use aws_sdk_s3::primitives::{ByteStream, FsBuilder, Length, SdkBody};
+use futures::{Stream, StreamExt, stream};
+use hyper::body::{Bytes, Frame};
 use pin_project::pin_project;
 use quickwit_common::shared_consts::SPLIT_FIELDS_FILE_NAME;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 
 use crate::bundle_storage::BundleStorageFileOffsetsVersions;
 use crate::{BundleStorageFileOffsets, PutPayload, VersionedComponent};
@@ -48,7 +41,7 @@ async fn range_byte_stream_from_payloads(
     payloads: &[Box<dyn PutPayload>],
     range: Range<u64>,
 ) -> io::Result<ByteStream> {
-    let mut bytestreams: Vec<_> = Vec::new();
+    let mut bytestreams: Vec<ByteStream> = Vec::new();
 
     let payloads_and_ranges =
         chunk_payload_ranges(payloads, range.start as usize..range.end as usize);
@@ -61,8 +54,12 @@ async fn range_byte_stream_from_payloads(
         );
     }
 
-    let body = Body::wrap_stream(stream::iter(bytestreams).map(StreamAdaptor).flatten());
-    let concat_stream = ByteStream::new(SdkBody::from_body_0_4(body));
+    let body = stream::iter(bytestreams)
+        .map(StreamAdaptor)
+        .flatten()
+        .map(|result| result.map(Frame::data));
+    let stream_body = http_body_util::StreamBody::new(body);
+    let concat_stream = ByteStream::new(SdkBody::from_body_1_x(stream_body));
     Ok(concat_stream)
 }
 
@@ -120,18 +117,19 @@ impl PutPayload for FilePayload {
     async fn range_byte_stream(&self, range: Range<u64>) -> io::Result<ByteStream> {
         assert!(!range.is_empty());
         assert!(range.end <= self.len);
-        let mut file = tokio::fs::File::open(&self.path).await?;
+
+        let len = range.end - range.start;
+        let mut fs_builder = FsBuilder::new().path(&self.path);
+
         if range.start > 0 {
-            file.seek(SeekFrom::Start(range.start)).await?;
+            fs_builder = fs_builder.offset(range.start);
         }
+        fs_builder = fs_builder.length(Length::Exact(len));
 
-        let body = if range.end == self.len {
-            Body::wrap_stream(ReaderStream::new(file))
-        } else {
-            Body::wrap_stream(ReaderStream::new(file.take(range.end - range.start)))
-        };
-
-        Ok(ByteStream::new(SdkBody::from_body_0_4(body)))
+        fs_builder
+            .build()
+            .await
+            .map_err(|error| io::Error::other(format!("failed to create byte stream: {error}")))
     }
 }
 
@@ -180,7 +178,7 @@ impl SplitPayloadBuilder {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Invalid file name in path {:?}", path),
+                    format!("Invalid file name in path {path:?}"),
                 )
             })?;
 
@@ -309,6 +307,8 @@ mod tests {
         split_streamer: &SplitPayload,
         range: Range<u64>,
     ) -> anyhow::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt as _;
+
         let mut data = Vec::new();
         split_streamer
             .range_byte_stream(range)

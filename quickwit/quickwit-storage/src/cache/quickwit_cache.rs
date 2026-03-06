@@ -1,31 +1,27 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use quickwit_config::CacheConfig;
 
+use crate::OwnedBytes;
 use crate::cache::{MemorySizedCache, StorageCache};
 use crate::metrics::CacheMetrics;
-use crate::OwnedBytes;
 
 const FULL_SLICE: Range<usize> = 0..usize::MAX;
 
@@ -42,16 +38,15 @@ impl From<Vec<(&'static str, Arc<dyn StorageCache>)>> for QuickwitCache {
 }
 
 impl QuickwitCache {
-    /// Creates a [`QuickwitCache`] with a cache on fast fields
-    /// with a capacity of `fast_field_cache_capacity`.
-    pub fn new(fast_field_cache_capacity: usize) -> Self {
+    /// Creates a [`QuickwitCache`] with a cache on fast fields.
+    pub fn new(cache_config: &CacheConfig) -> Self {
         let mut quickwit_cache = QuickwitCache::empty();
         let fast_field_cache_counters: &'static CacheMetrics =
             &crate::STORAGE_METRICS.fast_field_cache;
         quickwit_cache.add_route(
             ".fast",
-            Arc::new(SimpleCache::with_capacity_in_bytes(
-                fast_field_cache_capacity,
+            Arc::new(SimpleCache::from_config(
+                cache_config,
                 fast_field_cache_counters,
             )),
         );
@@ -122,15 +117,9 @@ struct SimpleCache {
 }
 
 impl SimpleCache {
-    fn with_capacity_in_bytes(
-        capacity_in_bytes: usize,
-        cache_counters: &'static CacheMetrics,
-    ) -> Self {
+    fn from_config(cache_config: &CacheConfig, cache_counters: &'static CacheMetrics) -> Self {
         SimpleCache {
-            slice_cache: MemorySizedCache::with_capacity_in_bytes(
-                capacity_in_bytes,
-                cache_counters,
-            ),
+            slice_cache: MemorySizedCache::from_config(cache_config, cache_counters),
         }
     }
 }

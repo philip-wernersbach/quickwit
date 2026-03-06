@@ -1,33 +1,28 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::ops::Bound;
-use std::str::FromStr;
 
 use quickwit_datetime::StrptimeParser;
 use serde::Deserialize;
+use time::format_description::well_known::Rfc3339;
 
-use crate::elastic_query_dsl::one_field_map::OneFieldMap;
+use crate::JsonLiteral;
 use crate::elastic_query_dsl::ConvertibleToQueryAst;
+use crate::elastic_query_dsl::one_field_map::OneFieldMap;
 use crate::not_nan_f32::NotNaNf32;
 use crate::query_ast::QueryAst;
-use crate::JsonLiteral;
 
 #[derive(Deserialize, Debug, Default, Eq, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +39,14 @@ pub struct RangeQueryParams {
     boost: Option<NotNaNf32>,
     #[serde(default)]
     format: Option<JsonLiteral>,
+    #[serde(default)]
+    from: Option<JsonLiteral>,
+    #[serde(default)]
+    to: Option<JsonLiteral>,
+    #[serde(default)]
+    include_lower: Option<bool>,
+    #[serde(default)]
+    include_upper: Option<bool>,
 }
 
 pub type RangeQuery = OneFieldMap<RangeQueryParams>;
@@ -58,11 +61,37 @@ impl ConvertibleToQueryAst for RangeQuery {
             lte,
             boost,
             format,
+            from,
+            to,
+            include_lower,
+            include_upper,
         } = self.value;
-        let (gt, gte, lt, lte) = if let Some(JsonLiteral::String(fmt)) = format {
-            let parser = StrptimeParser::from_str(&fmt).map_err(|reason| {
-                anyhow::anyhow!("failed to create parser from : {}; reason: {}", fmt, reason)
-            })?;
+
+        let (mut gt, mut gte, mut lt, mut lte) = (gt, gte, lt, lte);
+        if let Some(from_val) = from
+            && gt.is_none()
+            && gte.is_none()
+        {
+            if include_lower.unwrap_or(true) {
+                gte = Some(from_val);
+            } else {
+                gt = Some(from_val);
+            }
+        }
+        if let Some(to_val) = to
+            && lt.is_none()
+            && lte.is_none()
+        {
+            if include_upper.unwrap_or(true) {
+                lte = Some(to_val);
+            } else {
+                lt = Some(to_val);
+            }
+        }
+
+        let (gt, gte, lt, lte) = if let Some(JsonLiteral::String(java_date_format)) = format {
+            let parser = StrptimeParser::from_java_datetime_format(&java_date_format)
+                .map_err(|err| anyhow::anyhow!("failed to parse range query date format. {err}"))?;
             (
                 gt.map(|v| parse_and_convert(v, &parser)).transpose()?,
                 gte.map(|v| parse_and_convert(v, &parser)).transpose()?,
@@ -102,7 +131,8 @@ fn parse_and_convert(literal: JsonLiteral, parser: &StrptimeParser) -> anyhow::R
         let parsed_date_time = parser
             .parse_date_time(&date_time_str)
             .map_err(|reason| anyhow::anyhow!("Failed to parse date time: {}", reason))?;
-        Ok(JsonLiteral::String(parsed_date_time.to_string()))
+        let parsed_date_time_rfc3339 = parsed_date_time.format(&Rfc3339)?;
+        Ok(JsonLiteral::String(parsed_date_time_rfc3339))
     } else {
         Ok(literal)
     }
@@ -110,39 +140,109 @@ fn parse_and_convert(literal: JsonLiteral, parser: &StrptimeParser) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::ops::Bound;
 
-    use quickwit_datetime::StrptimeParser;
-
-    use crate::elastic_query_dsl::range_query::parse_and_convert;
+    use super::{RangeQuery as ElasticRangeQuery, RangeQueryParams as ElasticRangeQueryParams};
     use crate::JsonLiteral;
+    use crate::elastic_query_dsl::ConvertibleToQueryAst;
+    use crate::query_ast::{QueryAst, RangeQuery};
 
     #[test]
-    fn test_parse_and_convert() -> anyhow::Result<()> {
-        let parser = StrptimeParser::from_str("%Y-%m-%d %H:%M:%S").unwrap();
+    fn test_date_range_query_with_format() {
+        let range_query_params = ElasticRangeQueryParams {
+            gt: Some(JsonLiteral::String("2021-01-03T13:32:43".to_string())),
+            gte: None,
+            lt: None,
+            lte: None,
+            boost: None,
+            format: JsonLiteral::String("yyyy-MM-dd['T'HH:mm:ss]".to_string()).into(),
+            ..Default::default()
+        };
+        let range_query: ElasticRangeQuery = ElasticRangeQuery {
+            field: "date".to_string(),
+            value: range_query_params,
+        };
+        let range_query_ast = range_query.convert_to_query_ast().unwrap();
+        assert!(matches!(
+            range_query_ast,
+            QueryAst::Range(RangeQuery {
+                field,
+                lower_bound: Bound::Excluded(lower_bound),
+                upper_bound: Bound::Unbounded,
+            })
+            if field == "date" && lower_bound == JsonLiteral::String("2021-01-03T13:32:43Z".to_string())
+        ));
+    }
 
-        // valid datetime
-        let input = JsonLiteral::String("2022-12-30 05:45:00".to_string());
-        let result = parse_and_convert(input, &parser)?;
-        assert_eq!(
-            result,
-            JsonLiteral::String("2022-12-30 5:45:00.0 +00:00:00".to_string())
-        );
+    fn into_json_number(n: u64) -> JsonLiteral {
+        JsonLiteral::Number(serde_json::Number::from(n))
+    }
 
-        // invalid datetime
-        let input = JsonLiteral::String("invalid datetime".to_string());
-        let result = parse_and_convert(input, &parser);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to parse date time"));
+    #[test]
+    fn test_range_query_with_from_to_inclusive() {
+        let range_json =
+            r#"{"score": {"from": 50, "to": 100, "include_lower": true, "include_upper": true}}"#;
+        let range_query: ElasticRangeQuery = serde_json::from_str(range_json).unwrap();
+        let ast = range_query.convert_to_query_ast().unwrap();
+        let QueryAst::Range(rq) = ast else {
+            panic!("expected Range, got {ast:?}");
+        };
+        assert_eq!(rq.field, "score");
+        assert_eq!(rq.lower_bound, Bound::Included(into_json_number(50)));
+        assert_eq!(rq.upper_bound, Bound::Included(into_json_number(100)));
+    }
 
-        // non_string(number) input
-        let input = JsonLiteral::Number(27.into());
-        let result = parse_and_convert(input.clone(), &parser)?;
-        assert_eq!(result, input);
+    #[test]
+    fn test_range_query_with_from_to_exclusive() {
+        let range_json =
+            r#"{"score": {"from": 50, "to": 100, "include_lower": false, "include_upper": false}}"#;
+        let range_query: ElasticRangeQuery = serde_json::from_str(range_json).unwrap();
+        let ast = range_query.convert_to_query_ast().unwrap();
+        let QueryAst::Range(rq) = ast else {
+            panic!("expected Range, got {ast:?}");
+        };
+        assert_eq!(rq.field, "score");
+        assert_eq!(rq.lower_bound, Bound::Excluded(into_json_number(50)));
+        assert_eq!(rq.upper_bound, Bound::Excluded(into_json_number(100)));
+    }
 
-        Ok(())
+    #[test]
+    fn test_range_query_with_from_to_defaults() {
+        let range_json = r#"{"score": {"from": 50, "to": 100}}"#;
+        let range_query: ElasticRangeQuery = serde_json::from_str(range_json).unwrap();
+        let ast = range_query.convert_to_query_ast().unwrap();
+        let QueryAst::Range(rq) = ast else {
+            panic!("expected Range, got {ast:?}");
+        };
+        assert_eq!(rq.field, "score");
+        assert_eq!(rq.lower_bound, Bound::Included(into_json_number(50)));
+        assert_eq!(rq.upper_bound, Bound::Included(into_json_number(100)));
+    }
+
+    #[test]
+    fn test_date_range_query_with_strict_date_optional_time_format() {
+        let range_query_params = ElasticRangeQueryParams {
+            gt: None,
+            gte: None,
+            lt: None,
+            lte: Some(JsonLiteral::String("2024-09-28T10:22:55.797Z".to_string())),
+            boost: None,
+            format: JsonLiteral::String("strict_date_optional_time".to_string()).into(),
+            ..Default::default()
+        };
+        let range_query: ElasticRangeQuery = ElasticRangeQuery {
+            field: "timestamp".to_string(),
+            value: range_query_params,
+        };
+        let range_query_ast = range_query.convert_to_query_ast().unwrap();
+        assert!(matches!(
+            range_query_ast,
+            QueryAst::Range(RangeQuery {
+                field,
+                lower_bound: Bound::Unbounded,
+                upper_bound: Bound::Included(upper_bound),
+            })
+            if field == "timestamp" && upper_bound == JsonLiteral::String("2024-09-28T10:22:55.797Z".to_string())
+        ));
     }
 }

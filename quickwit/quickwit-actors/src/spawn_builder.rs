@@ -1,22 +1,18 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -26,7 +22,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info};
 
 use crate::envelope::Envelope;
-use crate::mailbox::{create_mailbox, Inbox};
+use crate::mailbox::{Inbox, create_mailbox};
 use crate::registry::{ActorJoinHandle, ActorRegistry};
 use crate::scheduler::{NoAdvanceTimeGuard, SchedulerClient};
 use crate::supervisor::Supervisor;
@@ -221,6 +217,26 @@ impl<A: Actor + Default> SpawnBuilder<A> {
     }
 }
 
+enum ActorExitPhase {
+    Initializing,
+    Handling { message: &'static str },
+    Running,
+    OnDrainedMessaged,
+    Completed,
+}
+
+impl fmt::Debug for ActorExitPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ActorExitPhase::Initializing => write!(f, "initializing"),
+            ActorExitPhase::Handling { message } => write!(f, "handling({message})"),
+            ActorExitPhase::Running => write!(f, "running"),
+            ActorExitPhase::OnDrainedMessaged => write!(f, "on_drained_messages"),
+            ActorExitPhase::Completed => write!(f, "completed"),
+        }
+    }
+}
+
 /// Receives an envelope from either the high priority queue or the low priority queue.
 ///
 /// In the paused state, the actor will only attempt to receive high priority messages.
@@ -255,10 +271,10 @@ impl<A: Actor> ActorExecutionEnv<A> {
         self.actor.get_mut().initialize(&self.ctx).await
     }
 
-    async fn process_messages(&mut self) -> ActorExitStatus {
+    async fn process_messages(&mut self) -> (ActorExitStatus, ActorExitPhase) {
         loop {
-            if let Err(exit_status) = self.process_all_available_messages().await {
-                return exit_status;
+            if let Err((exit_status, exit_phase)) = self.process_all_available_messages().await {
+                return (exit_status, exit_phase);
             }
         }
     }
@@ -266,22 +282,25 @@ impl<A: Actor> ActorExecutionEnv<A> {
     async fn process_one_message(
         &mut self,
         mut envelope: Envelope<A>,
-    ) -> Result<(), ActorExitStatus> {
+    ) -> Result<(), (ActorExitStatus, ActorExitPhase)> {
         self.yield_and_check_if_killed().await?;
         envelope
             .handle_message(self.actor.get_mut(), &self.ctx)
-            .await?;
+            .await
+            .map_err(|(exit_status, message)| {
+                (exit_status, ActorExitPhase::Handling { message })
+            })?;
         Ok(())
     }
 
-    async fn yield_and_check_if_killed(&mut self) -> Result<(), ActorExitStatus> {
+    async fn yield_and_check_if_killed(&mut self) -> Result<(), (ActorExitStatus, ActorExitPhase)> {
         if self.ctx.kill_switch().is_dead() {
-            return Err(ActorExitStatus::Killed);
+            return Err((ActorExitStatus::Killed, ActorExitPhase::Running));
         }
         if self.actor.get_mut().yield_after_each_message() {
             self.ctx.yield_now().await;
             if self.ctx.kill_switch().is_dead() {
-                return Err(ActorExitStatus::Killed);
+                return Err((ActorExitStatus::Killed, ActorExitPhase::Running));
             }
         } else {
             self.ctx.record_progress();
@@ -289,7 +308,9 @@ impl<A: Actor> ActorExecutionEnv<A> {
         Ok(())
     }
 
-    async fn process_all_available_messages(&mut self) -> Result<(), ActorExitStatus> {
+    async fn process_all_available_messages(
+        &mut self,
+    ) -> Result<(), (ActorExitStatus, ActorExitPhase)> {
         self.yield_and_check_if_killed().await?;
         let envelope = recv_envelope(&mut self.inbox, &self.ctx).await;
         self.process_one_message(envelope).await?;
@@ -309,7 +330,11 @@ impl<A: Actor> ActorExecutionEnv<A> {
                     break;
                 }
             }
-            self.actor.get_mut().on_drained_messages(&self.ctx).await?;
+            self.actor
+                .get_mut()
+                .on_drained_messages(&self.ctx)
+                .await
+                .map_err(|exit_status| (exit_status, ActorExitPhase::OnDrainedMessaged))?;
         }
         if self.ctx.mailbox().is_last_mailbox() {
             // We double check here that the mailbox does not contain any messages,
@@ -319,8 +344,7 @@ impl<A: Actor> ActorExecutionEnv<A> {
             if self.inbox.is_empty() {
                 // No one will be able to send us more messages.
                 // We can exit the actor.
-                info!(actor = self.ctx.actor_instance_id(), "no more messages");
-                return Err(ActorExitStatus::Success);
+                return Err((ActorExitStatus::Success, ActorExitPhase::Completed));
             }
         }
 
@@ -344,23 +368,6 @@ impl<A: Actor> ActorExecutionEnv<A> {
             return ActorExitStatus::Panicked;
         }
         exit_status
-    }
-
-    fn process_exit_status(&self, exit_status: &ActorExitStatus) {
-        match &exit_status {
-            ActorExitStatus::Success
-            | ActorExitStatus::Quit
-            | ActorExitStatus::DownstreamClosed
-            | ActorExitStatus::Killed => {}
-            ActorExitStatus::Failure(err) => {
-                error!(cause=?err, exit_status=?exit_status, "actor-failure");
-            }
-            ActorExitStatus::Panicked => {
-                error!(exit_status=?exit_status, "actor-failure");
-            }
-        }
-        info!(actor_id = %self.ctx.actor_instance_id(), exit_status = %exit_status, "actor-exit");
-        self.ctx.exit(exit_status);
     }
 }
 
@@ -387,19 +394,32 @@ async fn actor_loop<A: Actor>(
     let initialize_exit_status_res: Result<(), ActorExitStatus> = actor_env.initialize().await;
     drop(no_advance_time_guard);
 
-    let after_process_exit_status = if let Err(initialize_exit_status) = initialize_exit_status_res
-    {
-        // We do not process messages if initialize yield an error.
-        // We still call finalize however!
-        initialize_exit_status
-    } else {
-        actor_env.process_messages().await
+    let (after_process_exit_status, exit_phase) =
+        if let Err(initialize_exit_status) = initialize_exit_status_res {
+            // We do not process messages if initialize yield an error.
+            // We still call finalize however!
+            (initialize_exit_status, ActorExitPhase::Initializing)
+        } else {
+            actor_env.process_messages().await
+        };
+
+    let actor_id = actor_env.ctx.actor_instance_id();
+    match after_process_exit_status {
+        ActorExitStatus::Success
+        | ActorExitStatus::Quit
+        | ActorExitStatus::DownstreamClosed
+        | ActorExitStatus::Killed => {
+            info!(actor_id, phase = ?exit_phase, exit_status = ?after_process_exit_status, "actor-exit");
+        }
+        ActorExitStatus::Failure(_) | ActorExitStatus::Panicked => {
+            error!(actor_id, phase = ?exit_phase, exit_status = ?after_process_exit_status, "actor-exit");
+        }
     };
 
     // TODO the no advance time guard for finalize has a race condition. Ideally we would
     // like to have the guard before we drop the last envelope.
     let final_exit_status = actor_env.finalize(after_process_exit_status).await;
     // The last observation is collected on `ActorExecutionEnv::Drop`.
-    actor_env.process_exit_status(&final_exit_status);
+    actor_env.ctx.exit(&final_exit_status);
     final_exit_status
 }

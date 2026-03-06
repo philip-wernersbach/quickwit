@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,14 +63,26 @@ impl RuntimesConfig {
     }
 
     pub fn with_num_cpus(num_cpus: usize) -> Self {
-        // Non blocking task are supposed to be io intensive, and not require many threads...
-        let num_threads_non_blocking = if num_cpus > 6 { 2 } else { 1 };
+        // Non blocking task are supposed to be io intensive, and not require many threads.
         // On the other hand the blocking actors are cpu intensive. We allocate
         // almost all of the threads to them.
-        let num_threads_blocking = (num_cpus - num_threads_non_blocking).max(1);
-        RuntimesConfig {
-            num_threads_non_blocking,
-            num_threads_blocking,
+        match num_cpus {
+            0..=3 => {
+                // We do not have enough vCPUs to allocate a full thread to
+                // non-blocking.
+                RuntimesConfig {
+                    num_threads_non_blocking: 1,
+                    num_threads_blocking: num_cpus,
+                }
+            }
+            4..=6 => RuntimesConfig {
+                num_threads_non_blocking: 1,
+                num_threads_blocking: num_cpus - 1,
+            },
+            7.. => RuntimesConfig {
+                num_threads_non_blocking: 2,
+                num_threads_blocking: num_cpus - 2,
+            },
         }
     }
 }
@@ -90,7 +97,7 @@ impl Default for RuntimesConfig {
 fn start_runtimes(config: RuntimesConfig) -> HashMap<RuntimeType, Runtime> {
     let mut runtimes = HashMap::with_capacity(2);
 
-    let disable_lifo_slot = crate::get_bool_from_env("QW_DISABLE_TOKIO_LIFO_SLOT", false);
+    let disable_lifo_slot = crate::get_bool_from_env("QW_DISABLE_TOKIO_LIFO_SLOT", true);
 
     let mut blocking_runtime_builder = tokio::runtime::Builder::new_multi_thread();
     if disable_lifo_slot {
@@ -237,7 +244,7 @@ mod tests {
     #[test]
     fn test_runtimes_with_given_num_cpus_3() {
         let runtime = RuntimesConfig::with_num_cpus(3);
-        assert_eq!(runtime.num_threads_blocking, 2);
+        assert_eq!(runtime.num_threads_blocking, 3);
         assert_eq!(runtime.num_threads_non_blocking, 1);
     }
 }

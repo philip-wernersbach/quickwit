@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -33,11 +28,11 @@ use tantivy::schema::document::CompactDocValue;
 use tantivy::schema::{Document as DocumentTrait, Field, TantivyDocument, Value};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{ReloadPolicy, Score, Searcher, Term};
-use tracing::{error, Instrument};
+use tracing::{Instrument, error};
 
 use crate::leaf::open_index_with_caches;
 use crate::service::SearcherContext;
-use crate::{convert_document_to_json_string, GlobalDocAddress};
+use crate::{GlobalDocAddress, convert_document_to_json_string};
 
 const SNIPPET_MAX_NUM_CHARS: usize = 150;
 
@@ -48,7 +43,7 @@ async fn fetch_docs_to_map(
     mut global_doc_addrs: Vec<GlobalDocAddress>,
     index_storage: Arc<dyn Storage>,
     splits: &[SplitIdAndFooterOffsets],
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
     snippet_request_opt: Option<&SnippetRequest>,
 ) -> anyhow::Result<HashMap<GlobalDocAddress, Document>> {
     let mut split_fetch_docs_futures = Vec::new();
@@ -115,7 +110,7 @@ pub async fn fetch_docs(
     partial_hits: Vec<PartialHit>,
     index_storage: Arc<dyn Storage>,
     splits: &[SplitIdAndFooterOffsets],
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
     snippet_request_opt: Option<&SnippetRequest>,
 ) -> anyhow::Result<FetchDocsResponse> {
     let global_doc_addrs: Vec<GlobalDocAddress> = partial_hits
@@ -134,14 +129,14 @@ pub async fn fetch_docs(
     .await?;
 
     let hits: Vec<quickwit_proto::search::LeafHit> = partial_hits
-        .iter()
+        .into_iter()
         .flat_map(|partial_hit| {
-            let global_doc_addr = GlobalDocAddress::from_partial_hit(partial_hit);
+            let global_doc_addr = GlobalDocAddress::from_partial_hit(&partial_hit);
             if let Some((_, document)) = global_doc_addr_to_doc_json.remove_entry(&global_doc_addr)
             {
                 Some(quickwit_proto::search::LeafHit {
                     leaf_json: document.content_json,
-                    partial_hit: Some(partial_hit.clone()),
+                    partial_hit: Some(partial_hit),
                     leaf_snippet_json: document.snippet_json,
                 })
             } else {
@@ -168,18 +163,18 @@ async fn fetch_docs_in_split(
     mut global_doc_addrs: Vec<GlobalDocAddress>,
     index_storage: Arc<dyn Storage>,
     split: &SplitIdAndFooterOffsets,
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
     snippet_request_opt: Option<&SnippetRequest>,
 ) -> anyhow::Result<Vec<(GlobalDocAddress, Document)>> {
     global_doc_addrs.sort_by_key(|doc| doc.doc_addr);
     // Opens the index without the ephemeral unbounded cache, this cache is indeed not useful
     // when fetching docs as we will fetch them only once.
-    let mut index = open_index_with_caches(
+    let (mut index, _) = open_index_with_caches(
         &searcher_context,
         index_storage,
         split,
         Some(doc_mapper.tokenizer_manager()),
-        false,
+        None,
     )
     .await
     .context("open-index-for-split")?;
@@ -213,8 +208,7 @@ async fn fetch_docs_in_split(
                 .context("searcher-doc-async")?;
 
             let named_field_doc = doc.to_named_doc(moved_searcher.schema());
-            let content_json =
-                convert_document_to_json_string(named_field_doc, &*moved_doc_mapper)?;
+            let content_json = convert_document_to_json_string(named_field_doc, &moved_doc_mapper)?;
             if fields_snippet_generator_opt_clone.is_none() {
                 return Ok((
                     global_doc_addr,
@@ -304,13 +298,13 @@ impl FieldsSnippetGenerator {
 // Creates FieldsSnippetGenerator.
 async fn create_fields_snippet_generator(
     searcher: &Searcher,
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
     snippet_request: &SnippetRequest,
 ) -> anyhow::Result<FieldsSnippetGenerator> {
     let schema = searcher.schema();
     let query_ast_resolved = serde_json::from_str(&snippet_request.query_ast_resolved)
         .context("failed to deserialize QueryAst")?;
-    let (query, _) = doc_mapper.query(schema.clone(), &query_ast_resolved, false)?;
+    let (query, _) = doc_mapper.query(schema.clone(), query_ast_resolved, false, None)?;
     let mut snippet_generators = HashMap::new();
     for field_name in &snippet_request.snippet_fields {
         let field = schema.get_field(field_name)?;

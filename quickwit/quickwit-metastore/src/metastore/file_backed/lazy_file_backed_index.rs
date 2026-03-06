@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -27,7 +22,7 @@ use tokio::sync::{Mutex, OnceCell};
 use tracing::error;
 
 use super::file_backed_index::FileBackedIndex;
-use super::store_operations::{load_index, METASTORE_FILE_NAME};
+use super::store_operations::{METASTORE_FILE_NAME, load_index};
 
 /// Lazy [`FileBackedIndex`]. It loads a `FileBackedIndex` on demand. When the index is first
 /// loaded, it optionally spawns a task to periodically poll the storage and update the index.
@@ -49,15 +44,15 @@ impl LazyFileBackedIndex {
         let index_mutex_opt = file_backed_index.map(|index| Arc::new(Mutex::new(index)));
         // If the polling interval is configured and the index is already loaded,
         // spawn immediately the polling task
-        if let Some(index_mutex) = &index_mutex_opt {
-            if let Some(polling_interval) = polling_interval_opt {
-                spawn_index_metadata_polling_task(
-                    storage.clone(),
-                    index_id.clone(),
-                    Arc::downgrade(index_mutex),
-                    polling_interval,
-                );
-            }
+        if let Some(index_mutex) = &index_mutex_opt
+            && let Some(polling_interval) = polling_interval_opt
+        {
+            spawn_index_metadata_polling_task(
+                storage.clone(),
+                index_id.clone(),
+                Arc::downgrade(index_mutex),
+                polling_interval,
+            );
         }
         Self {
             index_id,

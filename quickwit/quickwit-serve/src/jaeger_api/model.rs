@@ -1,32 +1,27 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 
-use base64::prelude::{Engine, BASE64_STANDARD};
-use hyper::StatusCode;
+use base64::prelude::{BASE64_STANDARD, Engine};
 use itertools::Itertools;
 use prost_types::{Duration, Timestamp};
 use quickwit_proto::jaeger::api_v2::{KeyValue, Log, Process, Span, SpanRef, ValueType};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use serde_with::serde_as;
+use warp::hyper::StatusCode;
 
 pub(super) const DEFAULT_NUMBER_OF_TRACES: i32 = 20;
 
@@ -55,9 +50,11 @@ pub struct TracesSearchQueryParams {
     pub service: Option<String>,
     #[serde(default)]
     pub operation: Option<String>,
+    // these are microsecond precision
     pub start: Option<i64>,
     pub end: Option<i64>,
     pub tags: Option<String>,
+    // these are unit-suffixed numbers. in practice we only support precision up to the ms
     pub min_duration: Option<String>,
     pub max_duration: Option<String>,
     pub lookback: Option<String>,
@@ -108,7 +105,7 @@ impl JaegerTrace {
                 span.process_id = Some(process_id.clone());
             } else {
                 process_counter += 1;
-                current_process.key = format!("p{}", process_counter);
+                current_process.key = format!("p{process_counter}");
                 span.process_id = Some(current_process.key.clone());
                 process_map.insert(current_process.key.clone(), current_process.clone());
                 service_name_to_process_id.insert(
@@ -344,7 +341,7 @@ fn convert_duration_to_microsecs(duration: Duration) -> i64 {
 mod tests {
     use quickwit_proto::jaeger::api_v2::Log;
 
-    use crate::jaeger_api::model::{build_jaeger_traces, JaegerSpan};
+    use crate::jaeger_api::model::{JaegerSpan, build_jaeger_traces};
 
     #[test]
     fn test_convert_grpc_jaeger_spans_into_jaeger_ui_model() {

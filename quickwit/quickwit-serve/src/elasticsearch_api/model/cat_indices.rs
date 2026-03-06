@@ -1,28 +1,23 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashSet;
 use std::ops::AddAssign;
 
-use hyper::StatusCode;
 use quickwit_metastore::{IndexMetadata, SplitMetadata};
 use serde::{Deserialize, Serialize, Serializer};
+use warp::hyper::StatusCode;
 
 use super::ElasticsearchError;
 use crate::simple_list::{from_simple_list, to_simple_list};
@@ -58,15 +53,13 @@ pub struct CatIndexQueryParams {
     pub v: Option<bool>,
 }
 impl CatIndexQueryParams {
+    #[allow(clippy::result_large_err)]
     pub fn validate(&self) -> Result<(), ElasticsearchError> {
         if let Some(format) = &self.format {
             if format.to_lowercase() != "json" {
                 return Err(ElasticsearchError::new(
                     StatusCode::BAD_REQUEST,
-                    format!(
-                        "Format {:?} is not supported. Only format=json is supported.",
-                        format
-                    ),
+                    format!("Format {format:?} is not supported. Only format=json is supported."),
                     None,
                 ));
             }
@@ -80,7 +73,7 @@ impl CatIndexQueryParams {
         let unsupported_parameter_error = |field: &str| {
             ElasticsearchError::new(
                 StatusCode::BAD_REQUEST,
-                format!("Parameter {:?} is not supported.", field),
+                format!("Parameter {field:?} is not supported."),
                 None,
             )
         };
@@ -90,8 +83,13 @@ impl CatIndexQueryParams {
         if self.v.is_some() {
             return Err(unsupported_parameter_error("v"));
         }
-        if self.s.is_some() {
-            return Err(unsupported_parameter_error("s"));
+        if let Some(sort_by) = &self.s {
+            if sort_by.len() > 1 {
+                return Err(unsupported_parameter_error("s"));
+            }
+            if sort_by[0] != "index" && sort_by[0] != "index:asc" {
+                return Err(unsupported_parameter_error("s"));
+            }
         }
         Ok(())
     }
@@ -216,7 +214,7 @@ fn format_byte_size(bytes: u64) -> String {
     const GIGABYTE: u64 = MEGABYTE * 1024;
     const TERABYTE: u64 = GIGABYTE * 1024;
     if bytes < KILOBYTE {
-        format!("{}b", bytes)
+        format!("{bytes}b")
     } else if bytes < MEGABYTE {
         format!("{:.1}kb", bytes as f64 / KILOBYTE as f64)
     } else if bytes < GIGABYTE {
@@ -311,5 +309,43 @@ mod tests {
         assert_eq!(selected_fields, expected_selected_fields);
 
         // Add more test cases as needed
+    }
+
+    #[test]
+    fn test_cat_index_query_params_validate_s_parameter() {
+        let params = CatIndexQueryParams {
+            format: Some("json".to_string()),
+            s: Some(vec!["index:asc".to_string()]),
+            ..Default::default()
+        };
+        assert!(params.validate().is_ok());
+
+        let params = CatIndexQueryParams {
+            format: Some("json".to_string()),
+            s: Some(vec!["index".to_string()]),
+            ..Default::default()
+        };
+        assert!(params.validate().is_ok());
+
+        let params = CatIndexQueryParams {
+            format: Some("json".to_string()),
+            s: Some(vec!["index:desc".to_string()]),
+            ..Default::default()
+        };
+        assert!(params.validate().is_err());
+
+        let params = CatIndexQueryParams {
+            format: Some("json".to_string()),
+            s: Some(vec!["index:asc".to_string(), "docs.count".to_string()]),
+            ..Default::default()
+        };
+        assert!(params.validate().is_err());
+
+        let params = CatIndexQueryParams {
+            format: Some("json".to_string()),
+            s: None,
+            ..Default::default()
+        };
+        assert!(params.validate().is_ok());
     }
 }

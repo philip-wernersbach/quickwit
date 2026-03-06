@@ -22,6 +22,7 @@ path = "src/generate_markdown.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+backtrace = { workspace = true, optional = true }
 bytesize = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -36,8 +37,10 @@ numfmt = { workspace = true }
 once_cell = { workspace = true }
 openssl-probe = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 serde_json = { workspace = true }
 tabled = { workspace = true }
 tempfile = { workspace = true }
@@ -56,7 +59,6 @@ quickwit-actors = { workspace = true }
 quickwit-cluster = { workspace = true }
 quickwit-common = { workspace = true }
 quickwit-config = { workspace = true }
-quickwit-doc-mapper = { workspace = true }
 quickwit-index-management = { workspace = true }
 quickwit-indexing = { workspace = true }
 quickwit-ingest = { workspace = true }
@@ -80,6 +82,11 @@ quickwit-storage = { workspace = true, features = ["testsuite"] }
 
 [features]
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
+jemalloc-profiled = [
+  "dep:backtrace",
+  "quickwit-common/jemalloc-profiled",
+  "quickwit-serve/jemalloc-profiled"
+]
 ci-test = []
 pprof = ["quickwit-serve/pprof"]
 openssl-support = ["openssl-probe"]
@@ -94,10 +101,10 @@ release-feature-set = [
   "quickwit-indexing/pulsar",
   "quickwit-indexing/sqs",
   "quickwit-indexing/vrl",
+  "quickwit-serve/lambda",
   "quickwit-storage/azure",
   "quickwit-storage/gcs",
   "quickwit-metastore/postgres",
-  "quickwit-doc-mapper/multilang",
 ]
 release-feature-vendored-set = [
   "jemalloc",
@@ -108,10 +115,10 @@ release-feature-vendored-set = [
   "quickwit-indexing/sqs",
   "quickwit-indexing/vrl",
   "quickwit-indexing/vendored-kafka",
+  "quickwit-serve/lambda",
   "quickwit-storage/azure",
   "quickwit-storage/gcs",
   "quickwit-metastore/postgres",
-  "quickwit-doc-mapper/multilang",
 ]
 release-macos-feature-vendored-set = [
   "jemalloc",
@@ -121,12 +128,12 @@ release-macos-feature-vendored-set = [
   "quickwit-indexing/sqs",
   "quickwit-indexing/vrl",
   "quickwit-indexing/vendored-kafka-macos",
+  "quickwit-serve/lambda",
   "quickwit-storage/azure",
   "quickwit-storage/gcs",
   "quickwit-metastore/postgres",
-  "quickwit-doc-mapper/multilang",
 ]
-
-[package.metadata.cargo-machete]
-# used to enable the `multilang` feature
-ignored = ["quickwit-doc-mapper"]
+release-jemalloc-profiled = [
+  "release-feature-set",
+  "jemalloc-profiled",
+]

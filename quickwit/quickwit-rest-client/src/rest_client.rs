@@ -1,22 +1,18 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,17 +21,22 @@ use quickwit_config::{ConfigFormat, SourceConfig};
 use quickwit_indexing::actors::IndexingServiceCounters;
 pub use quickwit_ingest::CommitType;
 use quickwit_metastore::{IndexMetadata, Split, SplitInfo};
-use quickwit_search::SearchResponseRest;
-use quickwit_serve::{ListSplitsQueryParams, ListSplitsResponse, SearchRequestQueryString};
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use reqwest::{Client, ClientBuilder, Method, StatusCode, Url};
+use quickwit_proto::ingest::Shard;
+use quickwit_serve::{
+    ListSplitsQueryParams, ListSplitsResponse, RestIngestResponse, SearchRequestQueryString,
+};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::tls::Certificate;
+use reqwest::{ClientBuilder as ReqwestClientBuilder, Method, StatusCode, Url};
+use reqwest_middleware::{ClientBuilder as ReqwestMiddlewareClientBuilder, ClientWithMiddleware};
+use reqwest_retry::RetryTransientMiddleware;
+use reqwest_retry::policies::ExponentialBackoff;
 use serde::Serialize;
 use serde_json::json;
-use tracing::warn;
 
-use crate::error::Error;
-use crate::models::{ApiResponse, IngestSource, Timeout};
 use crate::BatchLineReader;
+use crate::error::Error;
+use crate::models::{ApiResponse, IngestSource, SearchResponseRestClient, Timeout};
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7280";
 pub const DEFAULT_CONTENT_TYPE: &str = "application/json";
@@ -49,23 +50,43 @@ pub const DEFAULT_CLIENT_COMMIT_TIMEOUT: Timeout = Timeout::from_mins(30);
 struct Transport {
     base_url: Url,
     api_url: Url,
-    client: Client,
+    client: ClientWithMiddleware,
 }
 
 impl Transport {
-    fn new(endpoint: Url, connect_timeout: Timeout) -> Self {
+    fn new(
+        endpoint: Url,
+        connect_timeout: Timeout,
+        ca_cert: Option<Certificate>,
+        num_retries: u32,
+    ) -> Self {
         let base_url = endpoint;
         let api_url = base_url
             .join("api/v1/")
-            .expect("Endpoint should not be malformed.");
-        let mut client_builder = ClientBuilder::new();
+            .expect("root url should be well-formed");
+        let mut reqwest_client_builder = ReqwestClientBuilder::new();
         if let Some(duration) = connect_timeout.as_duration_opt() {
-            client_builder = client_builder.connect_timeout(duration);
+            reqwest_client_builder = reqwest_client_builder.connect_timeout(duration);
         }
+        if let Some(ca_cert) = ca_cert {
+            reqwest_client_builder = reqwest_client_builder
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(ca_cert);
+        }
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(Duration::from_secs(1), Duration::from_secs(60))
+            .build_with_max_retries(num_retries);
+        let retry_transient_middleware = RetryTransientMiddleware::new_with_policy(retry_policy);
+        let reqwest_client = reqwest_client_builder
+            .build()
+            .expect("`client_builder.build()` should not fail");
+        let client = ReqwestMiddlewareClientBuilder::new(reqwest_client)
+            .with(retry_transient_middleware)
+            .build();
         Self {
             base_url,
             api_url,
-            client: client_builder.build().expect("Client should be built."),
+            client,
         }
     }
 
@@ -120,8 +141,14 @@ pub struct QuickwitClientBuilder {
     ingest_timeout: Timeout,
     /// Timeout for the ingest operations that require waiting for commit.
     commit_timeout: Timeout,
-    /// Experimental: if true, use the ingest v2 endpoint.
-    ingest_v2: bool,
+    /// Forces use of ingest v1.
+    use_legacy_ingest: bool,
+    /// Request detailed parse failures report from the ingest api.
+    detailed_response: bool,
+    /// Validate against a custom TLS certificate authority
+    ca_cert: Option<Certificate>,
+    /// Maximum number of retries for transient errors.
+    num_retries: u32,
 }
 
 impl QuickwitClientBuilder {
@@ -133,7 +160,10 @@ impl QuickwitClientBuilder {
             search_timeout: DEFAULT_CLIENT_SEARCH_TIMEOUT,
             ingest_timeout: DEFAULT_CLIENT_INGEST_TIMEOUT,
             commit_timeout: DEFAULT_CLIENT_COMMIT_TIMEOUT,
-            ingest_v2: false,
+            use_legacy_ingest: false,
+            detailed_response: false,
+            ca_cert: None,
+            num_retries: 0,
         }
     }
 
@@ -147,12 +177,6 @@ impl QuickwitClientBuilder {
         self
     }
 
-    pub fn enable_ingest_v2(mut self) -> Self {
-        warn!("ingest v2 experimental feature enabled!");
-        self.ingest_v2 = true;
-        self
-    }
-
     pub fn search_timeout(mut self, timeout: Timeout) -> Self {
         self.search_timeout = timeout;
         self
@@ -163,20 +187,47 @@ impl QuickwitClientBuilder {
         self
     }
 
+    // TODO(#5604)
+    pub fn use_legacy_ingest(mut self, use_legacy_ingest: bool) -> Self {
+        self.use_legacy_ingest = use_legacy_ingest;
+        self
+    }
+
+    pub fn detailed_response(mut self, is_detailed: bool) -> Self {
+        self.detailed_response = is_detailed;
+        self
+    }
+
     pub fn commit_timeout(mut self, timeout: Timeout) -> Self {
         self.commit_timeout = timeout;
         self
     }
 
+    pub fn set_tls_ca(mut self, ca_cert: Option<Certificate>) -> Self {
+        self.ca_cert = ca_cert;
+        self
+    }
+
+    pub fn num_retries(mut self, num_retries: u32) -> Self {
+        self.num_retries = num_retries;
+        self
+    }
+
     pub fn build(self) -> QuickwitClient {
-        let transport = Transport::new(self.base_url, self.connect_timeout);
+        let transport = Transport::new(
+            self.base_url,
+            self.connect_timeout,
+            self.ca_cert,
+            self.num_retries,
+        );
         QuickwitClient {
             transport,
             timeout: self.timeout,
             search_timeout: self.search_timeout,
             ingest_timeout: self.ingest_timeout,
             commit_timeout: self.commit_timeout,
-            ingest_v2: self.ingest_v2,
+            use_legacy_ingest: self.use_legacy_ingest,
+            detailed_response: self.detailed_response,
         }
     }
 }
@@ -192,21 +243,18 @@ pub struct QuickwitClient {
     ingest_timeout: Timeout,
     /// Timeout for the ingest operations that require waiting for commit.
     commit_timeout: Timeout,
-    // TODO remove me after Quickwit 0.7 release.
-    // If true, rely on ingest v2
-    ingest_v2: bool,
+    /// Forces use of ingest v1.
+    use_legacy_ingest: bool,
+    /// Request detailed parse failures report from the ingest api.
+    detailed_response: bool,
 }
 
 impl QuickwitClient {
-    pub fn enable_ingest_v2(&mut self) {
-        self.ingest_v2 = true;
-    }
-
     pub async fn search(
         &self,
         index_id: &str,
         search_query: SearchRequestQueryString,
-    ) -> Result<SearchResponseRest, Error> {
+    ) -> Result<SearchResponseRestClient, Error> {
         let path = format!("{index_id}/search");
         let bytes = serde_json::to_string(&search_query)
             .unwrap()
@@ -228,27 +276,27 @@ impl QuickwitClient {
         Ok(search_response)
     }
 
-    pub fn indexes(&self) -> IndexClient {
+    pub fn indexes(&self) -> IndexClient<'_> {
         IndexClient::new(&self.transport, self.timeout)
     }
 
-    pub fn splits<'a>(&'a self, index_id: &'a str) -> SplitClient {
+    pub fn splits<'a>(&'a self, index_id: &'a str) -> SplitClient<'a, 'a> {
         SplitClient::new(&self.transport, self.timeout, index_id)
     }
 
-    pub fn sources<'a>(&'a self, index_id: &'a str) -> SourceClient {
+    pub fn sources<'a>(&'a self, index_id: &'a str) -> SourceClient<'a> {
         SourceClient::new(&self.transport, self.timeout, index_id)
     }
 
-    pub fn cluster(&self) -> ClusterClient {
+    pub fn cluster(&self) -> ClusterClient<'_> {
         ClusterClient::new(&self.transport, self.timeout)
     }
 
-    pub fn node_stats(&self) -> NodeStatsClient {
+    pub fn node_stats(&self) -> NodeStatsClient<'_> {
         NodeStatsClient::new(&self.transport, self.timeout)
     }
 
-    pub fn node_health(&self) -> NodeHealthClient {
+    pub fn node_health(&self) -> NodeHealthClient<'_> {
         NodeHealthClient::new(&self.transport, self.timeout)
     }
 
@@ -259,12 +307,16 @@ impl QuickwitClient {
         batch_size_limit_opt: Option<usize>,
         mut on_ingest_event: Option<&mut (dyn FnMut(IngestEvent) + Sync)>,
         last_block_commit: CommitType,
-    ) -> Result<(), Error> {
-        let ingest_path = if self.ingest_v2 {
-            format!("{index_id}/ingest-v2")
-        } else {
-            format!("{index_id}/ingest")
-        };
+    ) -> Result<RestIngestResponse, Error> {
+        let ingest_path = format!("{index_id}/ingest");
+        let mut query_params = HashMap::new();
+        // TODO(#5604)
+        if self.use_legacy_ingest {
+            query_params.insert("use_legacy_ingest", "true");
+        }
+        if self.detailed_response {
+            query_params.insert("detailed_response", "true");
+        }
         let batch_size_limit = batch_size_limit_opt.unwrap_or(INGEST_CONTENT_LENGTH_LIMIT);
         let mut batch_reader = match ingest_source {
             IngestSource::File(filepath) => {
@@ -275,21 +327,30 @@ impl QuickwitClient {
                 BatchLineReader::from_string(ingest_payload, batch_size_limit)
             }
         };
+        let mut cumulated_resp = RestIngestResponse::default();
         while let Some(batch) = batch_reader.next_batch().await? {
             loop {
-                let (query_params, timeout) =
-                    if !batch_reader.has_next() && last_block_commit != CommitType::Auto {
-                        (last_block_commit.to_query_parameter(), self.commit_timeout)
-                    } else {
-                        (None, self.ingest_timeout)
-                    };
+                let timeout = if !batch_reader.has_next() && last_block_commit != CommitType::Auto {
+                    self.commit_timeout
+                } else {
+                    self.ingest_timeout
+                };
+                match last_block_commit {
+                    CommitType::Auto => {}
+                    CommitType::WaitFor => {
+                        query_params.insert("commit", "wait_for");
+                    }
+                    CommitType::Force => {
+                        query_params.insert("commit", "force");
+                    }
+                }
                 let response = self
                     .transport
                     .send(
                         Method::POST,
                         &ingest_path,
                         None,
-                        query_params,
+                        Some(&query_params),
                         Some(batch.clone()),
                         timeout,
                     )
@@ -300,7 +361,8 @@ impl QuickwitClient {
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 } else {
-                    response.check().await?;
+                    let current_parsed_resp = response.deserialize().await?;
+                    cumulated_resp = cumulated_resp.merge(current_parsed_resp);
                     break;
                 }
             }
@@ -309,7 +371,7 @@ impl QuickwitClient {
             }
         }
 
-        Ok(())
+        Ok(cumulated_resp)
     }
 }
 
@@ -357,17 +419,22 @@ impl<'a> IndexClient<'a> {
         index_id: &str,
         index_config: impl AsRef<[u8]>,
         config_format: ConfigFormat,
+        create: bool,
     ) -> Result<IndexMetadata, Error> {
         let header_map = header_from_config_format(config_format);
         let body = Bytes::copy_from_slice(index_config.as_ref());
+        let mut query_params = HashMap::new();
+        if create {
+            query_params.insert("create", "true");
+        }
         let path = format!("indexes/{index_id}");
         let response = self
             .transport
-            .send::<()>(
+            .send(
                 Method::PUT,
                 &path,
                 Some(header_map),
-                None,
+                Some(&query_params),
                 Some(body),
                 self.timeout,
             )
@@ -465,10 +532,20 @@ impl<'a, 'b> SplitClient<'a, 'b> {
 
     pub async fn mark_for_deletion(&self, split_ids: Vec<String>) -> Result<(), Error> {
         let path = format!("{}/mark-for-deletion", self.splits_root_url());
-        let body = Bytes::from(serde_json::to_vec(&json!({ "split_ids": split_ids }))?);
+        let body_json = json!({ "split_ids": split_ids });
+        let body_vec =
+            serde_json::to_vec(&body_json).expect("serializing `body_json` should never fail");
+        let body_bytes = Bytes::from(body_vec);
         let response = self
             .transport
-            .send::<()>(Method::PUT, &path, None, None, Some(body), self.timeout)
+            .send::<()>(
+                Method::PUT,
+                &path,
+                None,
+                None,
+                Some(body_bytes),
+                self.timeout,
+            )
             .await?;
         response.check().await?;
         Ok(())
@@ -509,6 +586,35 @@ impl<'a> SourceClient<'a> {
                 &self.sources_root_url(),
                 Some(header_map),
                 None,
+                Some(source_config_bytes),
+                self.timeout,
+            )
+            .await?;
+        let source_config = response.deserialize().await?;
+        Ok(source_config)
+    }
+
+    pub async fn update(
+        &self,
+        source_id: &str,
+        source_config_input: impl AsRef<[u8]>,
+        config_format: ConfigFormat,
+        create: bool,
+    ) -> Result<SourceConfig, Error> {
+        let header_map = header_from_config_format(config_format);
+        let source_config_bytes = Bytes::copy_from_slice(source_config_input.as_ref());
+        let mut query_params = HashMap::new();
+        if create {
+            query_params.insert("create", "true");
+        }
+        let path = format!("{}/{source_id}", self.sources_root_url());
+        let response = self
+            .transport
+            .send(
+                Method::PUT,
+                &path,
+                Some(header_map),
+                Some(&query_params),
                 Some(source_config_bytes),
                 self.timeout,
             )
@@ -580,6 +686,16 @@ impl<'a> SourceClient<'a> {
             .await?;
         response.check().await?;
         Ok(())
+    }
+
+    pub async fn get_shards(&self, source_id: &str) -> Result<Vec<Shard>, Error> {
+        let path = format!("{}/{source_id}/shards", self.sources_root_url());
+        let response = self
+            .transport
+            .send::<()>(Method::GET, &path, None, None, None, self.timeout)
+            .await?;
+        let source_config = response.deserialize().await?;
+        Ok(source_config)
     }
 }
 
@@ -676,17 +792,20 @@ fn header_from_config_format(config_format: ConfigFormat) -> HeaderMap {
 
 #[cfg(test)]
 mod test {
+
     use std::path::PathBuf;
     use std::str::FromStr;
 
+    use http::StatusCode;
     use quickwit_config::{ConfigFormat, SourceConfig};
     use quickwit_indexing::mock_split;
     use quickwit_ingest::CommitType;
     use quickwit_metastore::IndexMetadata;
-    use quickwit_search::SearchResponseRest;
-    use quickwit_serve::{ListSplitsQueryParams, ListSplitsResponse, SearchRequestQueryString};
+    use quickwit_serve::{
+        ListSplitsQueryParams, ListSplitsResponse, RestIngestResponse, SearchRequestQueryString,
+    };
+    use reqwest::Url;
     use reqwest::header::CONTENT_TYPE;
-    use reqwest::{StatusCode, Url};
     use serde_json::json;
     use tokio::fs::File;
     use tokio::io::AsyncReadExt;
@@ -696,17 +815,15 @@ mod test {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::error::Error;
-    use crate::models::IngestSource;
+    use crate::models::{IngestSource, SearchResponseRestClient};
     use crate::rest_client::QuickwitClientBuilder;
-
     #[tokio::test]
     async fn test_client_no_server() {
         let port = quickwit_common::net::find_available_tcp_port().unwrap();
         let server_url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
         let qw_client = QuickwitClientBuilder::new(server_url).build();
         let error = qw_client.indexes().list().await.unwrap_err();
-
-        assert!(matches!(error, Error::Client(_)));
+        assert!(matches!(error, Error::Middleware(_)));
         assert!(error.to_string().contains("tcp connect error"));
     }
 
@@ -719,7 +836,7 @@ mod test {
         let search_query_params = SearchRequestQueryString {
             ..Default::default()
         };
-        let expected_search_response = SearchResponseRest {
+        let expected_search_response = SearchResponseRestClient {
             num_hits: 0,
             hits: Vec::new(),
             snippets: None,
@@ -774,19 +891,26 @@ mod test {
             .expect(2)
             .mount(&mock_server)
             .await;
+        let mock_response = RestIngestResponse {
+            num_docs_for_processing: 2,
+            num_ingested_docs: Some(2),
+            num_rejected_docs: Some(0),
+            parse_failures: Some(Vec::new()),
+        };
         Mock::given(method("POST"))
             .and(path("/api/v1/my-index/ingest"))
             .and(query_param_is_missing("commit"))
             .and(body_bytes(buffer))
-            .respond_with(ResponseTemplate::new(StatusCode::OK))
+            .respond_with(ResponseTemplate::new(StatusCode::OK).set_body_json(&mock_response))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
         let ingest_source = IngestSource::File(PathBuf::from_str(&ndjson_filepath).unwrap());
-        qw_client
+        let actual_response = qw_client
             .ingest("my-index", ingest_source, None, None, CommitType::Auto)
             .await
             .unwrap();
+        assert_eq!(actual_response, mock_response);
     }
 
     #[tokio::test]
@@ -802,19 +926,26 @@ mod test {
             .read_to_end(&mut buffer)
             .await
             .unwrap();
+        let mock_response = RestIngestResponse {
+            num_docs_for_processing: 2,
+            num_ingested_docs: Some(2),
+            num_rejected_docs: Some(0),
+            parse_failures: Some(Vec::new()),
+        };
         Mock::given(method("POST"))
             .and(path("/api/v1/my-index/ingest"))
             .and(query_param("commit", "force"))
             .and(body_bytes(buffer))
-            .respond_with(ResponseTemplate::new(StatusCode::OK))
+            .respond_with(ResponseTemplate::new(StatusCode::OK).set_body_json(&mock_response))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
         let ingest_source = IngestSource::File(PathBuf::from_str(&ndjson_filepath).unwrap());
-        qw_client
+        let actual_response = qw_client
             .ingest("my-index", ingest_source, None, None, CommitType::Force)
             .await
             .unwrap();
+        assert_eq!(actual_response, mock_response);
     }
 
     #[tokio::test]
@@ -830,19 +961,26 @@ mod test {
             .read_to_end(&mut buffer)
             .await
             .unwrap();
+        let mock_response = RestIngestResponse {
+            num_docs_for_processing: 2,
+            num_ingested_docs: Some(2),
+            num_rejected_docs: Some(0),
+            parse_failures: Some(Vec::new()),
+        };
         Mock::given(method("POST"))
             .and(path("/api/v1/my-index/ingest"))
             .and(query_param("commit", "wait_for"))
             .and(body_bytes(buffer))
-            .respond_with(ResponseTemplate::new(StatusCode::OK))
+            .respond_with(ResponseTemplate::new(StatusCode::OK).set_body_json(&mock_response))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
         let ingest_source = IngestSource::File(PathBuf::from_str(&ndjson_filepath).unwrap());
-        qw_client
+        let actual_response = qw_client
             .ingest("my-index", ingest_source, None, None, CommitType::WaitFor)
             .await
             .unwrap();
+        assert_eq!(actual_response, mock_response);
     }
 
     #[tokio::test]
@@ -1072,6 +1210,25 @@ mod test {
             qw_client
                 .sources("my-index")
                 .create("", ConfigFormat::Toml)
+                .await
+                .unwrap(),
+            source_config
+        );
+
+        // PUT update source with yaml
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/indexes/my-index/sources/my-source-1"))
+            .and(header(CONTENT_TYPE.as_str(), "application/yaml"))
+            .respond_with(
+                ResponseTemplate::new(StatusCode::OK).set_body_json(source_config.clone()),
+            )
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        assert_eq!(
+            qw_client
+                .sources("my-index")
+                .update("my-source-1", "", ConfigFormat::Yaml, false)
                 .await
                 .unwrap(),
             source_config

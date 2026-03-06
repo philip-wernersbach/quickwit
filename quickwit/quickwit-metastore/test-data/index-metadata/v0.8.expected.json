@@ -96,9 +96,12 @@
         "type": "stable_log"
       },
       "resources": {
-        "heap_size": "50.0 MB"
+        "heap_size": 50000000
       },
       "split_num_docs_target": 10000001
+    },
+    "ingest_settings": {
+      "min_shards": 1
     },
     "retention": {
       "period": "90 days",

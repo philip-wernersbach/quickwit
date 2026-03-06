@@ -1,29 +1,24 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 
 use quickwit_proto::search::{ListFieldType, ListFieldsEntryResponse, ListFieldsResponse};
 use serde::{Deserialize, Serialize};
 
-use super::search_query_params::*;
 use super::ElasticsearchError;
+use super::search_query_params::*;
 use crate::simple_list::{from_simple_list, to_simple_list};
 
 #[serde_with::skip_serializing_none]
@@ -125,12 +120,6 @@ impl FieldCapabilityEntryResponse {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct FieldCapabilityEntry {
-    searchable: bool,
-    aggregatable: bool,
-}
-
 pub fn convert_to_es_field_capabilities_response(
     resp: ListFieldsResponse,
 ) -> FieldCapabilityResponse {
@@ -148,7 +137,7 @@ pub fn convert_to_es_field_capabilities_response(
             .entry(list_field_resp.field_name.to_string())
             .or_default();
 
-        let field_type = ListFieldType::from_i32(list_field_resp.field_type).unwrap();
+        let field_type = ListFieldType::try_from(list_field_resp.field_type).unwrap();
         let add_entry =
             FieldCapabilityEntryResponse::from_list_field_entry_response(list_field_resp);
         let types = match field_type {
@@ -184,6 +173,7 @@ pub fn convert_to_es_field_capabilities_response(
     FieldCapabilityResponse { indices, fields }
 }
 
+#[allow(clippy::result_large_err)]
 pub fn build_list_field_request_for_es_api(
     index_id_patterns: Vec<String>,
     search_params: FieldCapabilityQueryParams,

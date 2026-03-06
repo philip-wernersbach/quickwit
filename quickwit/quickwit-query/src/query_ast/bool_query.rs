@@ -1,32 +1,24 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use serde::{Deserialize, Serialize};
-use tantivy::schema::Schema as TantivySchema;
 
-use super::{BuildTantivyAst, TantivyQueryAst};
-use crate::query_ast::QueryAst;
-use crate::tokenizers::TokenizerManager;
+use super::{BuildTantivyAst, BuildTantivyAstContext, TantivyQueryAst};
 use crate::InvalidQuery;
+use crate::query_ast::QueryAst;
 
 /// # Unsupported features
-/// - minimum_should_match
 /// - named queries
 ///
 /// Edge cases of BooleanQuery are not obvious,
@@ -48,6 +40,8 @@ pub struct BoolQuery {
     pub should: Vec<QueryAst>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filter: Vec<QueryAst>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_should_match: Option<usize>,
 }
 
 impl From<BoolQuery> for QueryAst {
@@ -59,46 +53,26 @@ impl From<BoolQuery> for QueryAst {
 impl BuildTantivyAst for BoolQuery {
     fn build_tantivy_ast_impl(
         &self,
-        schema: &TantivySchema,
-        tokenizer_manager: &TokenizerManager,
-        search_fields: &[String],
-        with_validation: bool,
+        context: &BuildTantivyAstContext,
     ) -> Result<TantivyQueryAst, InvalidQuery> {
-        let mut boolean_query = super::tantivy_query_ast::TantivyBoolQuery::default();
+        let mut boolean_query = super::tantivy_query_ast::TantivyBoolQuery {
+            minimum_should_match: self.minimum_should_match,
+            ..Default::default()
+        };
         for must in &self.must {
-            let must_leaf = must.build_tantivy_ast_call(
-                schema,
-                tokenizer_manager,
-                search_fields,
-                with_validation,
-            )?;
+            let must_leaf = must.build_tantivy_ast_call(context)?;
             boolean_query.must.push(must_leaf);
         }
         for must_not in &self.must_not {
-            let must_not_leaf = must_not.build_tantivy_ast_call(
-                schema,
-                tokenizer_manager,
-                search_fields,
-                with_validation,
-            )?;
+            let must_not_leaf = must_not.build_tantivy_ast_call(context)?;
             boolean_query.must_not.push(must_not_leaf);
         }
         for should in &self.should {
-            let should_leaf = should.build_tantivy_ast_call(
-                schema,
-                tokenizer_manager,
-                search_fields,
-                with_validation,
-            )?;
+            let should_leaf = should.build_tantivy_ast_call(context)?;
             boolean_query.should.push(should_leaf);
         }
         for filter in &self.filter {
-            let filter_leaf = filter.build_tantivy_ast_call(
-                schema,
-                tokenizer_manager,
-                search_fields,
-                with_validation,
-            )?;
+            let filter_leaf = filter.build_tantivy_ast_call(context)?;
             boolean_query.filter.push(filter_leaf);
         }
         Ok(TantivyQueryAst::Bool(boolean_query))

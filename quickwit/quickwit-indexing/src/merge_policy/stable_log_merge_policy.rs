@@ -1,32 +1,27 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use quickwit_config::merge_policy_config::StableLogMergePolicyConfig;
 use quickwit_config::IndexingSettings;
+use quickwit_config::merge_policy_config::StableLogMergePolicyConfig;
 use quickwit_metastore::{SplitMaturity, SplitMetadata};
 use time::OffsetDateTime;
 use tracing::debug;
 
-use crate::merge_policy::{splits_short_debug, MergeOperation, MergePolicy};
+use crate::merge_policy::{MergeOperation, MergePolicy, splits_short_debug};
 
 /// `StableLogMergePolicy` is a rather naive implementation optimized
 /// for splits produced by a rather stable stream of splits,
@@ -40,7 +35,7 @@ use crate::merge_policy::{splits_short_debug, MergeOperation, MergePolicy};
 ///
 /// The policy first builds the merge operations
 ///
-/// 1. Build merge operations
+/// ### Build merge operations
 /// We start by sorting the splits by reverse date so that the most recent splits are
 /// coming first.
 /// We iterate through the splits and assign them to increasing levels.
@@ -52,8 +47,8 @@ use crate::merge_policy::{splits_short_debug, MergeOperation, MergePolicy};
 /// `l_0 = 3 x self.min_level_num_docs`.
 ///
 /// Assuming level N-1 has been built, level N is given by
-/// `l_N = min(num_docs(split_l_{N_1})` * 3, self.max_merge_docs)`.
-/// We stop once l_N = self.max_merge_docs is reached.
+/// `l_N = min(num_docs(split_l_{N_1})` * 3, self.split_num_docs_target)`.
+/// We stop once l_N = self.split_num_docs_target is reached.
 ///
 /// As a result, each level interval is at least 3 times larger than the previous one,
 /// forming a logscale over the number of documents.
@@ -157,8 +152,8 @@ enum MergeCandidateSize {
     /// We should not add an extra split in this candidate.
     /// This can happen for any of the two following reasons:
     /// - the number of splits involved already reached `merge_factor_max`.
-    /// - the overall number of docs that will end up in the merged segment already
-    /// exceeds `max_merge_docs`.
+    /// - the overall number of docs that will end up in the merged segment already exceeds
+    ///   `split_num_docs_target`.
     OneMoreSplitWouldBeTooBig,
 }
 
@@ -218,13 +213,13 @@ impl StableLogMergePolicy {
     /// but should behave decently (not create too many levels) if they are not.
     ///
     /// All splits are required to have a number of documents lower than
-    /// `self.max_merge_docs`
+    /// `self.split_num_docs_target`
     pub(crate) fn build_split_levels(&self, splits: &[SplitMetadata]) -> Vec<Range<usize>> {
         assert!(
             splits
                 .iter()
                 .all(|split| split.num_docs < self.split_num_docs_target),
-            "All splits are expected to be smaller than `max_merge_docs`."
+            "All splits are expected to be smaller than `split_num_docs_target`."
         );
         if splits.is_empty() {
             return Vec::new();
@@ -302,11 +297,6 @@ impl StableLogMergePolicy {
     }
 }
 
-#[cfg(test)]
-fn is_sorted(elements: &[usize]) -> bool {
-    elements.windows(2).all(|w| w[0] <= w[1])
-}
-
 // Helpers which expose some internal properties of
 // the stable log merge policy to be tested in unit tests.
 #[cfg(test)]
@@ -342,7 +332,8 @@ impl StableLogMergePolicy {
         levels: &[usize],
         sorted: bool,
     ) -> usize {
-        assert!(is_sorted(levels));
+        assert!(levels.is_sorted());
+
         if num_docs == 0 {
             return 0;
         }
@@ -356,7 +347,7 @@ impl StableLogMergePolicy {
             head + (self.config.merge_factor - 2)
         };
         if tail.is_empty() || num_docs <= first_level_min_saturation_docs as u64 {
-            return (num_docs as usize + head - 1) / head;
+            return (num_docs as usize).div_ceil(head);
         }
         num_docs -= first_level_min_saturation_docs as u64;
         self.config.merge_factor - 1 + self.max_num_splits_knowning_levels(num_docs, tail, sorted)
@@ -375,7 +366,8 @@ mod tests {
     #[test]
     fn test_split_is_mature() {
         let merge_policy = StableLogMergePolicy::default();
-        // Split under max_merge_docs and created before now() - maturation_period is not mature.
+        // Split under split_num_docs_target and created before now() - maturation_period is not
+        // mature.
         assert_eq!(
             merge_policy.split_maturity(9_000_000, 0),
             SplitMaturity::Immature {
@@ -386,7 +378,7 @@ mod tests {
             merge_policy.split_maturity(&merge_policy.split_num_docs_target + 1, 0),
             SplitMaturity::Mature
         );
-        // Split under max_merge_docs but with create_timestamp >= now + maturity duration is
+        // Split under split_num_docs_target but with create_timestamp >= now + maturity duration is
         // mature.
         assert_eq!(
             merge_policy.split_maturity(9_000_000, 0),
@@ -444,8 +436,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "All splits are expected to be smaller than `max_merge_docs`.")]
-    fn test_stable_log_merge_policy_build_split_panics_if_exceeding_max_merge_docs() {
+    #[should_panic(expected = "All splits are expected to be smaller than `split_num_docs_target`.")]
+    fn test_stable_log_merge_policy_build_split_panics_if_exceeding_split_num_docs_target() {
         let merge_policy = StableLogMergePolicy::default();
         let splits = create_splits(&merge_policy, vec![11_000_000]);
         merge_policy.build_split_levels(&splits);
@@ -550,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stable_log_merge_policy_above_max_merge_docs_is_ignored() {
+    fn test_stable_log_merge_policy_above_split_num_docs_target_is_ignored() {
         let merge_policy = StableLogMergePolicy::default();
         let mut splits = create_splits(
             &merge_policy,
@@ -662,7 +654,7 @@ mod tests {
         aux_test_simulate_merge_planner_num_docs(
             Arc::new(merge_policy.clone()),
             &vec![10_000; 100_000],
-            |splits| {
+            &|splits| {
                 let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                 assert!(splits.len() <= merge_policy.max_num_splits_ideal_case(num_docs))
             },
@@ -691,7 +683,7 @@ mod tests {
             aux_test_simulate_merge_planner_num_docs(
                 Arc::new(merge_policy.clone()),
                 &batch_num_docs,
-                |splits| {
+                &|splits| {
                     let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                     assert!(splits.len() <= merge_policy.max_num_splits_worst_case(num_docs));
                 },
@@ -708,7 +700,7 @@ mod tests {
         aux_test_simulate_merge_planner_num_docs(
             Arc::new(merge_policy.clone()),
             &batch_num_docs,
-            |splits| {
+            &|splits| {
                 let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                 assert!(splits.len() <= merge_policy.max_num_splits_worst_case(num_docs));
             },
@@ -723,7 +715,7 @@ mod tests {
         aux_test_simulate_merge_planner_num_docs(
             Arc::new(merge_policy.clone()),
             &vec![10_000; 1_000],
-            |splits| {
+            &|splits| {
                 let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                 assert!(splits.len() <= merge_policy.max_num_splits_ideal_case(num_docs));
             },
@@ -739,7 +731,7 @@ mod tests {
         aux_test_simulate_merge_planner_num_docs(
             Arc::new(merge_policy.clone()),
             &vals[..],
-            |splits| {
+            &|splits| {
                 let num_docs = splits.iter().map(|split| split.num_docs as u64).sum();
                 assert!(splits.len() <= merge_policy.max_num_splits_worst_case(num_docs));
             },

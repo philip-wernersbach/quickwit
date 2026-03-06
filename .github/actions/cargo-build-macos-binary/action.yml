@@ -17,7 +17,7 @@ runs:
       shell: bash
     - uses: actions/setup-node@v3
       with:
-        node-version: 20
+        node-version: 24
         cache: "yarn"
         cache-dependency-path: quickwit/quickwit-ui/yarn.lock
     - run: yarn global add node-gyp
@@ -30,16 +30,15 @@ runs:
     - name: Install rustup
       shell: bash
       run: curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain none -y
-    - name: Add target aarch64-apple-darwin
-      if: "${{ inputs.target == 'aarch64-apple-darwin' }}"
-      run: rustup target add aarch64-apple-darwin
+    - name: Add target ${{ inputs.target }}
+      run: rustup target add ${{ inputs.target }}
       shell: bash
       working-directory: ./quickwit
     - name: Retrieve and export commit date, hash, and tags
       run: |
-          echo "QW_COMMIT_DATE=$(TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
-          echo "QW_COMMIT_HASH=$(git rev-parse HEAD)" >> $GITHUB_ENV
-          echo "QW_COMMIT_TAGS=$(git tag --points-at HEAD | tr '\n' ',')" >> $GITHUB_ENV
+        echo "QW_COMMIT_DATE=$(TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+        echo "QW_COMMIT_HASH=$(git rev-parse HEAD)" >> $GITHUB_ENV
+        echo "QW_COMMIT_TAGS=$(git tag --points-at HEAD | tr '\n' ',')" >> $GITHUB_ENV
       shell: bash
     - name: Build binary
       run: cargo build --release --features release-macos-feature-vendored-set --target ${{ matrix.target }} --bin quickwit
@@ -55,13 +54,13 @@ runs:
           BINARY_VERSION=${{ inputs.version }} ARCHIVE_NAME=${{ env.ASSET_FULL_NAME }}
       shell: bash
     - name: Save binary archive for three days
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4.4.0
       with:
         name: ${{ env.ASSET_FULL_NAME }}.tar.gz
         path: ./${{ env.ASSET_FULL_NAME }}.tar.gz
         retention-days: 3
     - name: Deploy archive to GitHub release
-      uses: quickwit-inc/upload-to-github-release@v1
+      uses: quickwit-inc/upload-to-github-release@9b2c40fba23bf8dea05b7d2eece24cbc95d4a190
       env:
         GITHUB_TOKEN: ${{ inputs.token }}
       with:

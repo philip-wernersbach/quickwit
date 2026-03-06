@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 use std::time::Duration;
@@ -24,11 +19,11 @@ use async_trait::async_trait;
 use aws_sdk_kinesis::types::Record;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, ActorHandle, Handler, Mailbox};
 use quickwit_common::retry::RetryParams;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use tokio::sync::mpsc;
 
-use crate::source::kinesis::api::{get_records, get_shard_iterator};
 use crate::source::SourceContext;
+use crate::source::kinesis::api::{get_records, get_shard_iterator};
 
 #[derive(Debug)]
 pub(super) enum ShardConsumerMessage {
@@ -248,7 +243,7 @@ mod tests {
     use super::*;
     use crate::source::kinesis::api::tests::{merge_shards, split_shard};
     use crate::source::kinesis::helpers::tests::{
-        make_shard_id, put_records_into_shards, setup, teardown, DEFAULT_RETRY_PARAMS,
+        DEFAULT_RETRY_PARAMS, make_shard_id, put_records_into_shards, setup, teardown,
     };
 
     async fn drain_messages(

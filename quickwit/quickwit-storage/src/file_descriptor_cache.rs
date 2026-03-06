@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fs::File;
 use std::io;
@@ -28,12 +23,12 @@ use tantivy::directory::OwnedBytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
-use crate::metrics::CacheMetrics;
+use crate::metrics::SingleCacheMetrics;
 
 pub struct FileDescriptorCache {
     fd_cache: Mutex<lru::LruCache<Ulid, SplitFile>>,
     fd_semaphore: Arc<Semaphore>,
-    fd_cache_metrics: CacheMetrics,
+    fd_cache_metrics: SingleCacheMetrics,
 }
 
 #[derive(Clone)]
@@ -73,7 +68,7 @@ impl FileDescriptorCache {
     fn new(
         max_fd_limit: NonZeroU32,
         fd_cache_capacity: NonZeroU32,
-        fd_cache_metrics: CacheMetrics,
+        fd_cache_metrics: SingleCacheMetrics,
     ) -> FileDescriptorCache {
         assert!(max_fd_limit.get() > fd_cache_capacity.get());
         let fd_cache = Mutex::new(lru::LruCache::new(
@@ -93,7 +88,10 @@ impl FileDescriptorCache {
         Self::new(
             NonZeroU32::new(max_fd_limit).unwrap(),
             fd_cache_capacity,
-            crate::STORAGE_METRICS.fd_cache_metrics.clone(),
+            crate::STORAGE_METRICS
+                .fd_cache_metrics
+                .cache_metrics
+                .clone(),
         )
     }
 
@@ -119,6 +117,9 @@ impl FileDescriptorCache {
         self.fd_cache_metrics
             .in_cache_count
             .set(fd_cache_lock.len() as i64);
+        self.fd_cache_metrics
+            .evict_num_items
+            .inc_by(split_ids.len() as u64);
     }
 
     pub async fn get_or_open_split_file(
@@ -140,10 +141,7 @@ impl FileDescriptorCache {
         let file: File = tokio::task::spawn_blocking(move || std::fs::File::open(split_path))
             .await
             .map_err(|join_error| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to open file: {:?}", join_error),
-                )
+                io::Error::other(format!("failed to open file: {join_error:?}"))
             })??;
         let split_file = SplitFile(Arc::new(SplitFileInner {
             num_bytes,
@@ -190,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fd_cache_big_cache() {
-        let cache_metrics = CacheMetrics::for_component("fdtest");
+        let cache_metrics = CacheMetrics::for_component("fdtest").cache_metrics;
         let fd_cache = FileDescriptorCache::new(
             NonZeroU32::new(20).unwrap(),
             NonZeroU32::new(10).unwrap(),
@@ -232,7 +230,7 @@ mod tests {
     // opening the file several times.
     #[tokio::test]
     async fn test_fd_cache_small_cache() {
-        let cache_metrics = CacheMetrics::for_component("fdtest2");
+        let cache_metrics = CacheMetrics::for_component("fdtest2").cache_metrics;
         let fd_cache = FileDescriptorCache::new(
             NonZeroU32::new(20).unwrap(),
             NonZeroU32::new(10).unwrap(),

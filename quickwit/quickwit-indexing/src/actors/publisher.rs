@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -50,6 +45,11 @@ impl PublisherType {
         }
     }
 }
+
+/// Disconnect the merge planner loop back.
+/// This message is used to cut the merge pipeline loop, and let it terminate.
+#[derive(Debug)]
+pub(crate) struct DisconnectMergePlanner;
 
 #[derive(Clone)]
 pub struct Publisher {
@@ -94,6 +94,21 @@ impl Actor for Publisher {
             PublisherType::MainPublisher => QueueCapacity::Bounded(1),
             PublisherType::MergePublisher => QueueCapacity::Unbounded,
         }
+    }
+}
+
+#[async_trait]
+impl Handler<DisconnectMergePlanner> for Publisher {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _: DisconnectMergePlanner,
+        _ctx: &ActorContext<Self>,
+    ) -> Result<(), quickwit_actors::ActorExitStatus> {
+        info!("disconnecting merge planner mailbox");
+        self.merge_planner_mailbox_opt = None;
+        Ok(())
     }
 }
 
@@ -148,23 +163,23 @@ impl Handler<SplitsUpdate> for Publisher {
             return Ok(());
         }
         info!("publish-new-splits");
-        if let Some(source_mailbox) = self.source_mailbox_opt.as_ref() {
-            if let Some(checkpoint) = checkpoint_delta_opt {
-                // We voluntarily do not log anything here.
-                //
-                // Not being to send the truncation message is a common event and should not be
-                // considered an error. For instance, if the source is a
-                // FileSource, it will terminate upon EOF and drop its
-                // mailbox.
-                let suggest_truncate_res = ctx
-                    .send_message(
-                        source_mailbox,
-                        SuggestTruncate(checkpoint.source_delta.get_source_checkpoint()),
-                    )
-                    .await;
-                if let Err(send_truncate_err) = suggest_truncate_res {
-                    warn!(error=?send_truncate_err, "failed to send truncate message from publisher to source");
-                }
+        if let Some(source_mailbox) = self.source_mailbox_opt.as_ref()
+            && let Some(checkpoint) = checkpoint_delta_opt
+        {
+            // We voluntarily do not log anything here.
+            //
+            // Not being to send the truncation message is a common event and should not be
+            // considered an error. For instance, if the source is a
+            // FileSource, it will terminate upon EOF and drop its
+            // mailbox.
+            let suggest_truncate_res = ctx
+                .send_message(
+                    source_mailbox,
+                    SuggestTruncate(checkpoint.source_delta.get_source_checkpoint()),
+                )
+                .await;
+            if let Err(send_truncate_err) = suggest_truncate_res {
+                warn!(error=?send_truncate_err, "failed to send truncate message from publisher to source");
             }
         }
 
@@ -239,25 +254,27 @@ mod tests {
         );
         let (publisher_mailbox, publisher_handle) = universe.spawn_builder().spawn(publisher);
 
-        assert!(publisher_mailbox
-            .send_message(SplitsUpdate {
-                index_uid: ref_index_uid.clone(),
-                new_splits: vec![SplitMetadata {
-                    split_id: "split".to_string(),
-                    ..Default::default()
-                }],
-                replaced_split_ids: Vec::new(),
-                checkpoint_delta_opt: Some(IndexCheckpointDelta {
-                    source_id: "source".to_string(),
-                    source_delta: SourceCheckpointDelta::from_range(1..3),
-                }),
-                publish_lock: PublishLock::default(),
-                publish_token_opt: None,
-                merge_task: None,
-                parent_span: tracing::Span::none(),
-            })
-            .await
-            .is_ok());
+        assert!(
+            publisher_mailbox
+                .send_message(SplitsUpdate {
+                    index_uid: ref_index_uid.clone(),
+                    new_splits: vec![SplitMetadata {
+                        split_id: "split".to_string(),
+                        ..Default::default()
+                    }],
+                    replaced_split_ids: Vec::new(),
+                    checkpoint_delta_opt: Some(IndexCheckpointDelta {
+                        source_id: "source".to_string(),
+                        source_delta: SourceCheckpointDelta::from_range(1..3),
+                    }),
+                    publish_lock: PublishLock::default(),
+                    publish_token_opt: None,
+                    merge_task: None,
+                    parent_span: tracing::Span::none(),
+                })
+                .await
+                .is_ok()
+        );
 
         let publisher_observation = publisher_handle.process_pending_and_observe().await.state;
         assert_eq!(publisher_observation.num_published_splits, 1);
@@ -315,22 +332,24 @@ mod tests {
         );
         let (publisher_mailbox, publisher_handle) = universe.spawn_builder().spawn(publisher);
 
-        assert!(publisher_mailbox
-            .send_message(SplitsUpdate {
-                index_uid: ref_index_uid.clone(),
-                new_splits: Vec::new(),
-                replaced_split_ids: Vec::new(),
-                checkpoint_delta_opt: Some(IndexCheckpointDelta {
-                    source_id: "source".to_string(),
-                    source_delta: SourceCheckpointDelta::from_range(1..3),
-                }),
-                publish_lock: PublishLock::default(),
-                publish_token_opt: None,
-                merge_task: None,
-                parent_span: tracing::Span::none(),
-            })
-            .await
-            .is_ok());
+        assert!(
+            publisher_mailbox
+                .send_message(SplitsUpdate {
+                    index_uid: ref_index_uid.clone(),
+                    new_splits: Vec::new(),
+                    replaced_split_ids: Vec::new(),
+                    checkpoint_delta_opt: Some(IndexCheckpointDelta {
+                        source_id: "source".to_string(),
+                        source_delta: SourceCheckpointDelta::from_range(1..3),
+                    }),
+                    publish_lock: PublishLock::default(),
+                    publish_token_opt: None,
+                    merge_task: None,
+                    parent_span: tracing::Span::none(),
+                })
+                .await
+                .is_ok()
+        );
 
         let publisher_observation = publisher_handle.process_pending_and_observe().await.state;
         assert_eq!(publisher_observation.num_published_splits, 0);
@@ -395,10 +414,12 @@ mod tests {
             merge_task: None,
             parent_span: Span::none(),
         };
-        assert!(publisher_mailbox
-            .send_message(publisher_message)
-            .await
-            .is_ok());
+        assert!(
+            publisher_mailbox
+                .send_message(publisher_message)
+                .await
+                .is_ok()
+        );
         let publisher_observation = publisher_handle.process_pending_and_observe().await.state;
         assert_eq!(publisher_observation.num_published_splits, 0);
         assert_eq!(publisher_observation.num_replace_operations, 1);

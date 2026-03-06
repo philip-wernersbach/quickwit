@@ -1,44 +1,43 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import { SearchRequest, SortByField, SortOrder, Aggregation } from "./models";
+import { Aggregation, SearchRequest, SortByField, SortOrder } from "./models";
 
 export function hasSearchParams(historySearch: string): boolean {
   const searchParams = new URLSearchParams(historySearch);
 
-  return searchParams.has('index_id') || searchParams.has('query')
-    || searchParams.has('start_timestamp') || searchParams.has('end_timestamp');
+  return (
+    searchParams.has("index_id") ||
+    searchParams.has("query") ||
+    searchParams.has("start_timestamp") ||
+    searchParams.has("end_timestamp")
+  );
 }
 
 export function parseSearchUrl(historySearch: string): SearchRequest {
   const searchParams = new URLSearchParams(historySearch);
   const startTimestampString = searchParams.get("start_timestamp");
   let startTimestamp = null;
-  const startTimeStampParsedInt = parseInt(startTimestampString || "");
-  if (!isNaN(startTimeStampParsedInt)) {
-    startTimestamp = startTimeStampParsedInt
+  const startTimeStampParsedInt = parseInt(startTimestampString || "", 10);
+  if (!Number.isNaN(startTimeStampParsedInt)) {
+    startTimestamp = startTimeStampParsedInt;
   }
   let endTimestamp = null;
   const endTimestampString = searchParams.get("end_timestamp");
-  const endTimestampParsedInt = parseInt(endTimestampString || "");
-  if (!isNaN(endTimestampParsedInt)) {
-    endTimestamp = endTimestampParsedInt
+  const endTimestampParsedInt = parseInt(endTimestampString || "", 10);
+  if (!Number.isNaN(endTimestampParsedInt)) {
+    endTimestamp = endTimestampParsedInt;
   }
   let indexId = null;
   const indexIdParam = searchParams.get("index_id");
@@ -48,15 +47,15 @@ export function parseSearchUrl(historySearch: string): SearchRequest {
   let sortByField = null;
   const sortByFieldParam = searchParams.get("sort_by_field");
   if (sortByFieldParam !== null) {
-    if (sortByFieldParam.startsWith('+')) {
-      const order: SortOrder = 'Desc';
-      sortByField = {field_name: sortByFieldParam.substring(1), order: order};
-    } else if (sortByFieldParam.startsWith('-')) {
-      const order: SortOrder = 'Asc';
-      sortByField = {field_name: sortByFieldParam.substring(1), order: order};
+    if (sortByFieldParam.startsWith("+")) {
+      const order: SortOrder = "Desc";
+      sortByField = { field_name: sortByFieldParam.substring(1), order: order };
+    } else if (sortByFieldParam.startsWith("-")) {
+      const order: SortOrder = "Asc";
+      sortByField = { field_name: sortByFieldParam.substring(1), order: order };
     } else {
-      const order: SortOrder = 'Desc';
-      sortByField = {field_name: sortByFieldParam, order: order};
+      const order: SortOrder = "Desc";
+      sortByField = { field_name: sortByFieldParam, order: order };
     }
   }
   const aggregationParam = searchParams.get("aggregation");
@@ -73,12 +72,12 @@ export function parseSearchUrl(historySearch: string): SearchRequest {
   };
 }
 
-function parseAggregation(param: string|null): Aggregation {
+function parseAggregation(param: string | null): Aggregation {
   const empty: Aggregation = {
     metric: null,
     term: null,
     histogram: null,
-  }
+  };
   if (param !== null) {
     try {
       const aggregation: Aggregation = JSON.parse(param);
@@ -90,9 +89,11 @@ function parseAggregation(param: string|null): Aggregation {
   return empty;
 }
 
-export function toUrlSearchRequestParams(request: SearchRequest): URLSearchParams {
+export function toUrlSearchRequestParams(
+  request: SearchRequest,
+): URLSearchParams {
   const params = new URLSearchParams();
-  params.append("query", request.query || '*');
+  params.append("query", request.query || "*");
   // We have to set the index ID in url params as it's not present in the UI path params.
   // This enables the react app to be able to get index ID from url params
   // if the user enter directly the UI url.
@@ -101,10 +102,7 @@ export function toUrlSearchRequestParams(request: SearchRequest): URLSearchParam
     params.append("max_hits", request.maxHits.toString());
   }
   if (request.startTimestamp) {
-    params.append(
-      "start_timestamp",
-      request.startTimestamp.toString()
-    );
+    params.append("start_timestamp", request.startTimestamp.toString());
   }
   if (request.endTimestamp) {
     params.append("end_timestamp", request.endTimestamp.toString());
@@ -113,18 +111,21 @@ export function toUrlSearchRequestParams(request: SearchRequest): URLSearchParam
     params.append("sort_by_field", serializeSortByField(request.sortByField));
   }
   if (request.aggregation) {
-    params.append("aggregation", JSON.stringify(request.aggregationConfig, (_, val) => {
-      if (val == null) {
-        return undefined;
-      } else {
-        return val;
-      }
-    }))
+    params.append(
+      "aggregation",
+      JSON.stringify(request.aggregationConfig, (_, val) => {
+        if (val == null) {
+          return undefined;
+        } else {
+          return val;
+        }
+      }),
+    );
   }
   return params;
 }
 
 export function serializeSortByField(sortByField: SortByField): string {
-  const order = sortByField.order === 'Desc' ? '+' : '-';
+  const order = sortByField.order === "Desc" ? "+" : "-";
   return `${order}${sortByField.field_name}`;
 }

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -26,18 +21,19 @@ use itertools::Itertools;
 use quickwit_common::fs::{empty_dir, get_cache_directory_path};
 use quickwit_common::pretty::PrettySample;
 use quickwit_common::rate_limited_error;
-use quickwit_config::{validate_identifier, IndexConfig, SourceConfig};
+use quickwit_config::{IndexConfig, SourceConfig, validate_identifier};
 use quickwit_indexing::check_source_connectivity;
 use quickwit_metastore::{
     AddSourceRequestExt, CreateIndexResponseExt, IndexMetadata, IndexMetadataResponseExt,
     ListIndexesMetadataResponseExt, ListSplitsQuery, ListSplitsRequestExt,
-    MetastoreServiceStreamSplitsExt, SplitInfo, SplitMetadata, SplitState,
+    MetastoreServiceStreamSplitsExt, SplitInfo, SplitMetadata, SplitState, UpdateIndexRequestExt,
+    UpdateSourceRequestExt,
 };
 use quickwit_proto::metastore::{
-    serde_utils, AddSourceRequest, CreateIndexRequest, DeleteIndexRequest, EntityKind,
-    IndexMetadataRequest, ListIndexesMetadataRequest, ListSplitsRequest,
-    MarkSplitsForDeletionRequest, MetastoreError, MetastoreService, MetastoreServiceClient,
-    ResetSourceCheckpointRequest,
+    AddSourceRequest, CreateIndexRequest, DeleteIndexRequest, EntityKind, IndexMetadataRequest,
+    ListIndexesMetadataRequest, ListSplitsRequest, MarkSplitsForDeletionRequest, MetastoreError,
+    MetastoreService, MetastoreServiceClient, ResetSourceCheckpointRequest, UpdateIndexRequest,
+    UpdateSourceRequest, serde_utils,
 };
 use quickwit_proto::types::{IndexUid, SplitId};
 use quickwit_proto::{ServiceError, ServiceErrorCode};
@@ -46,8 +42,8 @@ use thiserror::Error;
 use tracing::{error, info};
 
 use crate::garbage_collection::{
-    delete_splits_from_storage_and_metastore, run_garbage_collect, DeleteSplitsError,
-    SplitRemovalInfo,
+    DeleteSplitsError, SplitRemovalInfo, delete_splits_from_storage_and_metastore,
+    run_garbage_collect,
 };
 
 #[derive(Error, Debug)]
@@ -160,6 +156,41 @@ impl IndexService {
         Ok(index_metadata)
     }
 
+    /// Returns the index metadata for the given index ID if it exists.
+    pub async fn index_metadata_opt(
+        &self,
+        index_metadata_request: IndexMetadataRequest,
+    ) -> Result<Option<IndexMetadata>, IndexServiceError> {
+        let index_metadata_response = self.metastore.index_metadata(index_metadata_request).await;
+        match index_metadata_response {
+            Ok(index_metadata_response) => {
+                let index_metadata = index_metadata_response.deserialize_index_metadata()?;
+                Ok(Some(index_metadata))
+            }
+            Err(MetastoreError::NotFound(_)) => Ok(None),
+            Err(error) => Err(IndexServiceError::Metastore(error)),
+        }
+    }
+
+    /// Updates an index with the given index config.
+    pub async fn update_index(
+        &self,
+        index_uid: IndexUid,
+        index_config: IndexConfig,
+    ) -> Result<IndexMetadata, IndexServiceError> {
+        let update_index_request = UpdateIndexRequest::try_from_updates(
+            index_uid,
+            &index_config.doc_mapping,
+            &index_config.indexing_settings,
+            &index_config.ingest_settings,
+            &index_config.search_settings,
+            &index_config.retention_policy_opt,
+        )?;
+        let update_index_response = self.metastore.update_index(update_index_request).await?;
+        let index_metadata = update_index_response.deserialize_index_metadata()?;
+        Ok(index_metadata)
+    }
+
     /// Deletes the index specified with `index_id`.
     /// This is equivalent to running `rm -rf <index path>` for a local index or
     /// `aws s3 rm --recursive <index path>` for a remote Amazon S3 index.
@@ -256,7 +287,7 @@ impl IndexService {
             if index_id_pattern.contains('*') {
                 return Err(IndexServiceError::Metastore(
                     MetastoreError::InvalidArgument {
-                        message: format!("index_id pattern {} contains *", index_id_pattern),
+                        message: format!("index_id pattern {index_id_pattern} contains *"),
                     },
                 ));
             }
@@ -329,14 +360,8 @@ impl IndexService {
             Ok(concatenated_split_infos)
         } else {
             Err(IndexServiceError::Metastore(MetastoreError::Internal {
-                message: format!(
-                    "errors occurred when deleting indexes: {:?}",
-                    index_id_patterns
-                ),
-                cause: format!(
-                    "errors: {:?}\ndeleted indexes: {:?}",
-                    delete_errors, delete_responses
-                ),
+                message: format!("errors occurred when deleting indexes: {index_id_patterns:?}"),
+                cause: format!("errors: {delete_errors:?}\ndeleted indexes: {delete_responses:?}"),
             }))
         }
     }
@@ -365,14 +390,14 @@ impl IndexService {
             .await?;
 
         let deleted_entries = run_garbage_collect(
-            index_uid,
-            storage,
+            [(index_uid, storage)].into_iter().collect(),
             self.metastore.clone(),
             grace_period,
             // deletion_grace_period of zero, so that a cli call directly deletes splits after
             // marking to be deleted.
             Duration::ZERO,
             dry_run,
+            None,
             None,
         )
         .await?;
@@ -481,6 +506,40 @@ impl IndexService {
         Ok(source)
     }
 
+    /// Updates a source from an index identified by its UID.
+    pub async fn update_source(
+        &mut self,
+        index_uid: IndexUid,
+        source_config: SourceConfig,
+    ) -> Result<SourceConfig, IndexServiceError> {
+        let source_id = source_config.source_id.clone();
+        check_source_connectivity(&self.storage_resolver, &source_config)
+            .await
+            .map_err(IndexServiceError::InvalidConfig)?;
+        let update_source_request =
+            UpdateSourceRequest::try_from_source_config(index_uid.clone(), &source_config)?;
+        self.metastore.update_source(update_source_request).await?;
+        info!(
+            "source `{source_id}` successfully updated for index `{}`",
+            index_uid.index_id
+        );
+        let index_metadata_request = IndexMetadataRequest::for_index_id(index_uid.index_id);
+        let source = self
+            .metastore
+            .index_metadata(index_metadata_request)
+            .await?
+            .deserialize_index_metadata()?
+            .sources
+            .get(&source_id)
+            .ok_or_else(|| {
+                IndexServiceError::Internal(
+                    "created source is not in index metadata, this should never happen".to_string(),
+                )
+            })?
+            .clone();
+        Ok(source)
+    }
+
     pub async fn get_source(
         &mut self,
         index_id: &str,
@@ -530,9 +589,11 @@ pub async fn validate_storage_uri(
 mod tests {
 
     use quickwit_common::uri::Uri;
-    use quickwit_config::{IndexConfig, CLI_SOURCE_ID, INGEST_API_SOURCE_ID, INGEST_V2_SOURCE_ID};
+    use quickwit_config::{
+        CLI_SOURCE_ID, INGEST_API_SOURCE_ID, INGEST_V2_SOURCE_ID, IndexConfig, RetentionPolicy,
+    };
     use quickwit_metastore::{
-        metastore_for_test, MetastoreServiceExt, SplitMetadata, StageSplitsRequestExt,
+        MetastoreServiceExt, SplitMetadata, StageSplitsRequestExt, metastore_for_test,
     };
     use quickwit_proto::metastore::StageSplitsRequest;
     use quickwit_storage::PutPayload;
@@ -559,17 +620,19 @@ mod tests {
         assert!(index_metadata_0.sources.contains_key(INGEST_API_SOURCE_ID));
         assert!(index_metadata_0.sources.contains_key(INGEST_V2_SOURCE_ID));
 
-        assert!(metastore
-            .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
-            .await
-            .is_ok());
+        assert!(
+            metastore
+                .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
+                .await
+                .is_ok()
+        );
 
         let error = index_service
             .create_index(index_config.clone(), false)
             .await
             .unwrap_err();
         let IndexServiceError::Metastore(inner_error) = error else {
-            panic!("expected `MetastoreError` variant, got {:?}", error)
+            panic!("expected `MetastoreError` variant, got {error:?}")
         };
         assert!(
             matches!(inner_error, MetastoreError::AlreadyExists(EntityKind::Index { index_id }) if index_id == index_metadata_0.index_id())
@@ -582,6 +645,68 @@ mod tests {
         assert_eq!(index_metadata_1.index_id(), index_id);
         assert_eq!(index_metadata_1.index_uri(), &index_uri);
         assert!(index_metadata_0.index_uid != index_metadata_1.index_uid);
+    }
+
+    #[tokio::test]
+    async fn test_index_metadata_opt() {
+        let metastore = metastore_for_test();
+        let storage_resolver = StorageResolver::for_test();
+        let mut index_service = IndexService::new(metastore.clone(), storage_resolver);
+
+        let index_id = "test-index";
+        let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
+        let index_metadata = index_service
+            .index_metadata_opt(index_metadata_request)
+            .await
+            .unwrap();
+        assert!(index_metadata.is_none());
+
+        let index_uri = "ram://indexes/test-index";
+        let index_config = IndexConfig::for_test(index_id, index_uri);
+        let index_uid = index_service
+            .create_index(index_config.clone(), false)
+            .await
+            .unwrap()
+            .index_uid;
+        let index_metadata_request = IndexMetadataRequest::for_index_uid(index_uid.clone());
+        let index_metadata = index_service
+            .index_metadata_opt(index_metadata_request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(index_metadata.index_uid, index_uid);
+    }
+
+    #[tokio::test]
+    async fn test_update_index() {
+        let metastore = metastore_for_test();
+        let storage_resolver = StorageResolver::for_test();
+        let mut index_service = IndexService::new(metastore.clone(), storage_resolver);
+
+        let index_id = "test-index";
+        let index_uri = "ram://indexes/test-index";
+        let mut index_config = IndexConfig::for_test(index_id, index_uri);
+        let index_uid = index_service
+            .create_index(index_config.clone(), false)
+            .await
+            .unwrap()
+            .index_uid;
+
+        let retention_policy = RetentionPolicy {
+            retention_period: "42 hours".to_string(),
+            evaluation_schedule: "hourly".to_string(),
+        };
+        index_config.retention_policy_opt = Some(retention_policy.clone());
+
+        let updated_index_metadata = index_service
+            .update_index(index_uid, index_config)
+            .await
+            .unwrap();
+        let updated_retention_policy = updated_index_metadata
+            .index_config
+            .retention_policy_opt
+            .unwrap();
+        assert_eq!(updated_retention_policy, retention_policy);
     }
 
     #[tokio::test]
@@ -624,7 +749,7 @@ mod tests {
             .unwrap();
         assert_eq!(splits.len(), 1);
 
-        let split_path_str = format!("{}.split", split_id);
+        let split_path_str = format!("{split_id}.split");
         let split_path = Path::new(&split_path_str);
         let payload: Box<dyn PutPayload> = Box::new(vec![0]);
         storage.put(split_path, payload).await.unwrap();

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -24,15 +19,15 @@ use bytesize::ByteSize;
 use futures::{Future, StreamExt};
 use mrecordlog::error::CreateQueueError;
 use quickwit_common::metrics::{GaugeGuard, MEMORY_METRICS};
-use quickwit_common::{rate_limited_warn, ServiceStream};
+use quickwit_common::{ServiceStream, rate_limited_warn};
 use quickwit_proto::ingest::ingester::{
-    ack_replication_message, syn_replication_message, AckReplicationMessage, IngesterStatus,
-    InitReplicaRequest, InitReplicaResponse, ReplicateFailure, ReplicateFailureReason,
-    ReplicateRequest, ReplicateResponse, ReplicateSubrequest, ReplicateSuccess,
-    SynReplicationMessage,
+    AckReplicationMessage, IngesterStatus, InitReplicaRequest, InitReplicaResponse,
+    ReplicateFailure, ReplicateFailureReason, ReplicateRequest, ReplicateResponse,
+    ReplicateSubrequest, ReplicateSuccess, SynReplicationMessage, ack_replication_message,
+    syn_replication_message,
 };
 use quickwit_proto::ingest::{CommitTypeV2, IngestV2Error, IngestV2Result, Shard, ShardState};
-use quickwit_proto::types::{NodeId, Position, QueueId};
+use quickwit_proto::types::{NodeId, QueueId};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -42,7 +37,7 @@ use super::metrics::report_wal_usage;
 use super::models::IngesterShard;
 use super::mrecordlog_utils::check_enough_capacity;
 use super::state::IngesterState;
-use crate::ingest_v2::mrecordlog_utils::{append_non_empty_doc_batch, AppendDocBatchError};
+use crate::ingest_v2::mrecordlog_utils::{AppendDocBatchError, append_non_empty_doc_batch};
 use crate::metrics::INGEST_METRICS;
 use crate::{estimate_size, with_lock_metrics};
 
@@ -470,13 +465,13 @@ impl ReplicationTask {
                 return Err(IngestV2Error::Internal(message));
             }
         };
-        let replica_shard = IngesterShard::new_replica(
-            replica_shard.leader_id.into(),
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            Instant::now(),
-        );
+        let index_uid = replica_shard.index_uid().clone();
+        let shard_id = replica_shard.shard_id().clone();
+        let source_id = replica_shard.source_id;
+        let leader_id = NodeId::from(replica_shard.leader_id);
+
+        let replica_shard =
+            IngesterShard::new_replica(index_uid, source_id, shard_id, leader_id).build();
         state_guard.shards.insert(queue_id, replica_shard);
 
         let init_replica_response = InitReplicaResponse {
@@ -703,7 +698,6 @@ impl ReplicationTask {
         if !shards_to_delete.is_empty() {
             for queue_id in &shards_to_delete {
                 state_guard.shards.remove(queue_id);
-                state_guard.rate_trackers.remove(queue_id);
                 warn!("deleted dangling shard `{queue_id}`");
             }
         }
@@ -769,7 +763,7 @@ mod tests {
 
     use quickwit_proto::ingest::ingester::{ReplicateSubrequest, ReplicateSuccess};
     use quickwit_proto::ingest::{DocBatchV2, Shard};
-    use quickwit_proto::types::{queue_id, IndexUid, ShardId};
+    use quickwit_proto::types::{IndexUid, Position, ShardId, queue_id};
 
     use super::*;
 
@@ -856,7 +850,7 @@ mod tests {
         };
         tokio::spawn(dummy_replication_task_future);
 
-        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
+        let index_uid = IndexUid::for_test("test-index", 0);
         let replica_shard = Shard {
             index_uid: Some(index_uid.clone()),
             source_id: "test-source".to_string(),
@@ -898,7 +892,8 @@ mod tests {
                         let replication_position_inclusive = subrequest
                             .from_position_exclusive()
                             .as_usize()
-                            .map_or(batch_len - 1, |pos| pos + batch_len);
+                            .map(|pos| pos + batch_len)
+                            .unwrap_or(batch_len - 1);
                         ReplicateSuccess {
                             subrequest_id: subrequest.subrequest_id,
                             index_uid: subrequest.index_uid.clone(),
@@ -927,7 +922,7 @@ mod tests {
         };
         tokio::spawn(dummy_replication_task_future);
 
-        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
+        let index_uid = IndexUid::for_test("test-index", 0);
         let index_uid2: IndexUid = IndexUid::for_test("test-index", 1);
 
         let subrequests = vec![
@@ -1060,7 +1055,7 @@ mod tests {
             memory_capacity,
         );
 
-        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
+        let index_uid = IndexUid::for_test("test-index", 0);
         let index_uid2: IndexUid = IndexUid::for_test("test-index", 1);
 
         // Init shard 01.
@@ -1323,21 +1318,21 @@ mod tests {
             memory_capacity,
         );
 
-        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
-        let queue_id_01 = queue_id(&index_uid, "test-source", &ShardId::from(1));
+        let index_uid = IndexUid::for_test("test-index", 0);
         let replica_shard = IngesterShard::new_replica(
+            index_uid.clone(),
+            "test-source".to_string(),
+            ShardId::from(1),
             leader_id,
-            ShardState::Closed,
-            Position::Beginning,
-            Position::Beginning,
-            Instant::now(),
-        );
+        )
+        .with_state(ShardState::Closed)
+        .build();
         state
             .lock_fully()
             .await
             .unwrap()
             .shards
-            .insert(queue_id_01.clone(), replica_shard);
+            .insert(replica_shard.queue_id(), replica_shard);
 
         let replicate_request = ReplicateRequest {
             leader_id: "test-leader".to_string(),
@@ -1400,15 +1395,15 @@ mod tests {
             memory_capacity,
         );
 
-        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
-        let queue_id_01 = queue_id(&index_uid, "test-source", &ShardId::from(1));
+        let index_uid = IndexUid::for_test("test-index", 0);
         let replica_shard = IngesterShard::new_replica(
+            index_uid.clone(),
+            "test-source".to_string(),
+            ShardId::from(1),
             leader_id,
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            Instant::now(),
-        );
+        )
+        .build();
+        let queue_id_01 = replica_shard.queue_id();
         state
             .lock_fully()
             .await
@@ -1488,15 +1483,15 @@ mod tests {
             memory_capacity,
         );
 
-        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
+        let index_uid = IndexUid::for_test("test-index", 0);
         let queue_id_01 = queue_id(&index_uid, "test-source", &ShardId::from(1));
         let replica_shard = IngesterShard::new_replica(
+            index_uid.clone(),
+            "test-source".to_string(),
+            ShardId::from(1),
             leader_id,
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            Instant::now(),
-        );
+        )
+        .build();
         let mut state_guard = state.lock_fully().await.unwrap();
 
         state_guard
@@ -1577,15 +1572,15 @@ mod tests {
             memory_capacity,
         );
 
-        let index_uid: IndexUid = IndexUid::for_test("test-index", 0);
-        let queue_id_01 = queue_id(&index_uid, "test-source", &ShardId::from(1));
+        let index_uid = IndexUid::for_test("test-index", 0);
         let replica_shard = IngesterShard::new_replica(
+            index_uid.clone(),
+            "test-source".to_string(),
+            ShardId::from(1),
             leader_id,
-            ShardState::Open,
-            Position::Beginning,
-            Position::Beginning,
-            Instant::now(),
-        );
+        )
+        .build();
+        let queue_id_01 = replica_shard.queue_id();
         state
             .lock_fully()
             .await

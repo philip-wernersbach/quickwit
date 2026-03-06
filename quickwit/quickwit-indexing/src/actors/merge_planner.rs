@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,20 +18,22 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
-use quickwit_metastore::SplitMetadata;
+use quickwit_metastore::{SplitMaturity, SplitMetadata};
 use quickwit_proto::indexing::MergePipelineId;
 use quickwit_proto::types::DocMappingUid;
-use serde::Serialize;
 use tantivy::Inventory;
 use time::OffsetDateTime;
 use tracing::{info, warn};
 
 use super::MergeSchedulerService;
-use crate::actors::merge_scheduler_service::schedule_merge;
+use crate::MergePolicy;
 use crate::actors::MergeSplitDownloader;
+use crate::actors::merge_scheduler_service::schedule_merge;
 use crate::merge_policy::MergeOperation;
 use crate::models::NewSplits;
-use crate::MergePolicy;
+
+#[derive(Debug)]
+pub(crate) struct RunFinalizeMergePolicyAndQuit;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MergePartition {
@@ -78,6 +75,7 @@ pub struct MergePlanner {
     known_split_ids_recompute_attempt_id: usize,
 
     merge_policy: Arc<dyn MergePolicy>,
+
     merge_split_downloader_mailbox: Mailbox<MergeSplitDownloader>,
     merge_scheduler_service: Mailbox<MergeSchedulerService>,
 
@@ -127,6 +125,22 @@ impl Actor for MergePlanner {
 }
 
 #[async_trait]
+impl Handler<RunFinalizeMergePolicyAndQuit> for MergePlanner {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _plan_merge: RunFinalizeMergePolicyAndQuit,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        // Note we ignore messages that could be coming from a different incarnation.
+        // (See comment on `Self::incarnation_start_at`.)
+        self.send_merge_ops(true, ctx).await?;
+        Err(ActorExitStatus::Success)
+    }
+}
+
+#[async_trait]
 impl Handler<PlanMerge> for MergePlanner {
     type Reply = ();
 
@@ -138,7 +152,7 @@ impl Handler<PlanMerge> for MergePlanner {
         if plan_merge.incarnation_started_at == self.incarnation_started_at {
             // Note we ignore messages that could be coming from a different incarnation.
             // (See comment on `Self::incarnation_start_at`.)
-            self.send_merge_ops(ctx).await?;
+            self.send_merge_ops(false, ctx).await?;
         }
         self.recompute_known_splits_if_necessary();
         Ok(())
@@ -155,7 +169,7 @@ impl Handler<NewSplits> for MergePlanner {
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
         self.record_splits_if_necessary(new_splits.new_splits);
-        self.send_merge_ops(ctx).await?;
+        self.send_merge_ops(false, ctx).await?;
         self.recompute_known_splits_if_necessary();
         Ok(())
     }
@@ -233,7 +247,10 @@ impl MergePlanner {
     // No need to rebuild every time, we do once out of 100 times.
     fn recompute_known_splits_if_necessary(&mut self) {
         self.known_split_ids_recompute_attempt_id += 1;
-        if self.known_split_ids_recompute_attempt_id % 100 == 0 {
+        if self
+            .known_split_ids_recompute_attempt_id
+            .is_multiple_of(100)
+        {
             self.known_split_ids = self.rebuild_known_split_ids();
             self.known_split_ids_recompute_attempt_id = 0;
         }
@@ -258,6 +275,14 @@ impl MergePlanner {
     // - do not belong to the current timeline.
     fn record_splits_if_necessary(&mut self, split_metadatas: Vec<SplitMetadata>) {
         for new_split in split_metadatas {
+            if let SplitMaturity::Mature = self
+                .merge_policy
+                .split_maturity(new_split.num_docs, new_split.num_merge_ops)
+            {
+                // This can happen if the merge policy changed (e.g, decreased
+                // split_num_docs_target).
+                continue;
+            }
             if new_split.is_mature(OffsetDateTime::now_utc()) {
                 continue;
             }
@@ -273,12 +298,18 @@ impl MergePlanner {
     }
     async fn compute_merge_ops(
         &mut self,
+        is_finalize: bool,
         ctx: &ActorContext<Self>,
     ) -> Result<Vec<MergeOperation>, ActorExitStatus> {
         let mut merge_operations = Vec::new();
         for young_splits in self.partitioned_young_splits.values_mut() {
             if !young_splits.is_empty() {
-                merge_operations.extend(self.merge_policy.operations(young_splits));
+                let operations = if is_finalize {
+                    self.merge_policy.finalize_operations(young_splits)
+                } else {
+                    self.merge_policy.operations(young_splits)
+                };
+                merge_operations.extend(operations);
             }
             ctx.record_progress();
             ctx.yield_now().await;
@@ -289,13 +320,17 @@ impl MergePlanner {
         Ok(merge_operations)
     }
 
-    async fn send_merge_ops(&mut self, ctx: &ActorContext<Self>) -> Result<(), ActorExitStatus> {
+    async fn send_merge_ops(
+        &mut self,
+        is_finalize: bool,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
         // We identify all of the merge operations we want to run and leave it
         // to the merge scheduler to decide in which order these should be scheduled.
         //
         // The merge scheduler has the merit of knowing about merge operations from other
         // index as well.
-        let merge_ops = self.compute_merge_ops(ctx).await?;
+        let merge_ops = self.compute_merge_ops(is_finalize, ctx).await?;
         for merge_operation in merge_ops {
             info!(merge_operation=?merge_operation, "schedule merge operation");
             let tracked_merge_operation = self
@@ -324,11 +359,6 @@ struct PlanMerge {
     incarnation_started_at: Instant,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct MergePlannerState {
-    pub(crate) ongoing_merge_operations: Vec<MergeOperation>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -336,10 +366,10 @@ mod tests {
 
     use itertools::Itertools;
     use quickwit_actors::{ActorExitStatus, Command, QueueCapacity, Universe};
+    use quickwit_config::IndexingSettings;
     use quickwit_config::merge_policy_config::{
         ConstWriteAmplificationMergePolicyConfig, MergePolicyConfig, StableLogMergePolicyConfig,
     };
-    use quickwit_config::IndexingSettings;
     use quickwit_metastore::{SplitMaturity, SplitMetadata};
     use quickwit_proto::indexing::MergePipelineId;
     use quickwit_proto::types::{DocMappingUid, IndexUid, NodeId};
@@ -347,7 +377,7 @@ mod tests {
 
     use crate::actors::MergePlanner;
     use crate::merge_policy::{
-        merge_policy_from_settings, MergePolicy, MergeTask, StableLogMergePolicy,
+        MergePolicy, MergeTask, StableLogMergePolicy, merge_policy_from_settings,
     };
     use crate::models::NewSplits;
 
@@ -460,24 +490,33 @@ mod tests {
 
             let first_merge_operation = merge_operations.next().unwrap();
             assert_eq!(first_merge_operation.splits.len(), 4);
-            assert!(first_merge_operation
-                .splits
-                .iter()
-                .all(|split| split.partition_id == 1 && split.doc_mapping_uid == doc_mapping_uid1));
+            assert!(
+                first_merge_operation
+                    .splits
+                    .iter()
+                    .all(|split| split.partition_id == 1
+                        && split.doc_mapping_uid == doc_mapping_uid1)
+            );
 
             let second_merge_operation = merge_operations.next().unwrap();
             assert_eq!(second_merge_operation.splits.len(), 3);
-            assert!(second_merge_operation
-                .splits
-                .iter()
-                .all(|split| split.partition_id == 1 && split.doc_mapping_uid == doc_mapping_uid2));
+            assert!(
+                second_merge_operation
+                    .splits
+                    .iter()
+                    .all(|split| split.partition_id == 1
+                        && split.doc_mapping_uid == doc_mapping_uid2)
+            );
 
             let third_merge_operation = merge_operations.next().unwrap();
             assert_eq!(third_merge_operation.splits.len(), 3);
-            assert!(third_merge_operation
-                .splits
-                .iter()
-                .all(|split| split.partition_id == 2 && split.doc_mapping_uid == doc_mapping_uid1));
+            assert!(
+                third_merge_operation
+                    .splits
+                    .iter()
+                    .all(|split| split.partition_id == 2
+                        && split.doc_mapping_uid == doc_mapping_uid1)
+            );
         }
         universe.assert_quit().await;
 

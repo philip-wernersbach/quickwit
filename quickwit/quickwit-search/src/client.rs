@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -23,21 +18,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytesize::ByteSize;
-use futures::{StreamExt, TryStreamExt};
 use http::Uri;
-use quickwit_proto::search::{
-    GetKvRequest, LeafSearchStreamResponse, PutKvRequest, ReportSplitsRequest,
-};
+use quickwit_proto::search::{GetKvRequest, PutKvRequest, ReportSplitsRequest};
+use quickwit_proto::tonic::Request;
 use quickwit_proto::tonic::codegen::InterceptedService;
 use quickwit_proto::tonic::transport::{Channel, Endpoint};
-use quickwit_proto::tonic::Request;
-use quickwit_proto::{tonic, SpanContextInterceptor};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use quickwit_proto::{SpanContextInterceptor, tonic};
 use tower::timeout::Timeout;
-use tracing::{info_span, warn, Instrument};
+use tracing::warn;
 
-use crate::error::parse_grpc_error;
 use crate::SearchService;
+use crate::error::parse_grpc_error;
 
 /// Impl is an enumeration that meant to manage Quickwit's search service client types.
 #[derive(Clone)]
@@ -111,14 +102,11 @@ impl SearchServiceClient {
         request: quickwit_proto::search::SearchRequest,
     ) -> crate::Result<quickwit_proto::search::SearchResponse> {
         match &mut self.client_impl {
-            SearchServiceClientImpl::Grpc(grpc_client) => {
-                let tonic_request = Request::new(request);
-                let tonic_response = grpc_client
-                    .root_search(tonic_request)
-                    .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?;
-                Ok(tonic_response.into_inner())
-            }
+            SearchServiceClientImpl::Grpc(grpc_client) => grpc_client
+                .root_search(request)
+                .await
+                .map(|tonic_response| tonic_response.into_inner())
+                .map_err(|tonic_error| parse_grpc_error(&tonic_error)),
             SearchServiceClientImpl::Local(service) => service.root_search(request).await,
         }
     }
@@ -129,14 +117,11 @@ impl SearchServiceClient {
         request: quickwit_proto::search::LeafSearchRequest,
     ) -> crate::Result<quickwit_proto::search::LeafSearchResponse> {
         match &mut self.client_impl {
-            SearchServiceClientImpl::Grpc(grpc_client) => {
-                let tonic_request = Request::new(request);
-                let tonic_response = grpc_client
-                    .leaf_search(tonic_request)
-                    .await
-                    .map_err(|tonic_error| parse_grpc_error(&tonic_error))?;
-                Ok(tonic_response.into_inner())
-            }
+            SearchServiceClientImpl::Grpc(grpc_client) => grpc_client
+                .leaf_search(request)
+                .await
+                .map(|tonic_response| tonic_response.into_inner())
+                .map_err(|tonic_error| parse_grpc_error(&tonic_error)),
             SearchServiceClientImpl::Local(service) => service.leaf_search(request).await,
         }
     }
@@ -156,60 +141,6 @@ impl SearchServiceClient {
                 Ok(tonic_response.into_inner())
             }
             SearchServiceClientImpl::Local(service) => service.leaf_list_fields(request).await,
-        }
-    }
-
-    /// Perform leaf stream.
-    pub async fn leaf_search_stream(
-        &mut self,
-        request: quickwit_proto::search::LeafSearchStreamRequest,
-    ) -> UnboundedReceiverStream<crate::Result<LeafSearchStreamResponse>> {
-        match &mut self.client_impl {
-            SearchServiceClientImpl::Grpc(grpc_client) => {
-                let mut grpc_client_clone = grpc_client.clone();
-                let span = info_span!(
-                    "client:leaf_search_stream",
-                    grpc_addr=?self.grpc_addr()
-                );
-                let tonic_request = Request::new(request);
-                let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
-                tokio::spawn(
-                    async move {
-                        let tonic_result = grpc_client_clone
-                            .leaf_search_stream(tonic_request)
-                            .await
-                            .map_err(|tonic_error| parse_grpc_error(&tonic_error));
-                        // If the grpc client fails, send the error in the channel and stop.
-                        if let Err(error) = tonic_result {
-                            // It is ok to ignore error sending error.
-                            let _ = result_sender.send(Err(error));
-                            return;
-                        }
-                        let mut results_stream = tonic_result
-                            .unwrap()
-                            .into_inner()
-                            .map_err(|tonic_error| parse_grpc_error(&tonic_error));
-                        while let Some(search_result) = results_stream.next().await {
-                            let send_result = result_sender.send(search_result);
-                            // If we get a sending error, stop consuming the stream.
-                            if send_result.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    .instrument(span),
-                );
-                UnboundedReceiverStream::new(result_receiver)
-            }
-            SearchServiceClientImpl::Local(service) => {
-                let stream_result = service.leaf_search_stream(request).await;
-                stream_result.unwrap_or_else(|error| {
-                    let (result_sender, result_receiver) = tokio::sync::mpsc::unbounded_channel();
-                    // Receiver cannot be closed here, ignore error.
-                    let _ = result_sender.send(Err(error));
-                    UnboundedReceiverStream::new(result_receiver)
-                })
-            }
         }
     }
 

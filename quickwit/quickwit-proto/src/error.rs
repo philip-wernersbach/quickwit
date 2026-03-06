@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -23,8 +18,8 @@ use std::fmt::Debug;
 
 use anyhow::Context;
 use quickwit_actors::AskError;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tonic::metadata::BinaryMetadataValue;
 use tracing::{error, warn};
 
@@ -102,7 +97,7 @@ where E: ServiceError
 }
 
 /// A trait for encoding/decoding service errors to/from gRPC statuses. Errors are stored in JSON
-/// in the gRPC header [`QW_ERROR_HEADER_NAME`]. This allows for propagating them transparently
+/// in the gRPC header `qw-error-bin`. This allows for propagating them transparently
 /// between clients and servers over the network without being semantically limited to a status code
 /// and a message. However, it also means that modifying the serialization format of existing errors
 /// or introducing new ones is not backward compatible.
@@ -188,6 +183,7 @@ fn decode_error<E: DeserializeOwned>(header_value: &BinaryMetadataValue) -> anyh
     Ok(service_error)
 }
 
+#[allow(clippy::result_large_err)]
 pub fn convert_to_grpc_result<T, E: GrpcServiceError>(
     result: Result<T, E>,
 ) -> tonic::Result<tonic::Response<T>> {

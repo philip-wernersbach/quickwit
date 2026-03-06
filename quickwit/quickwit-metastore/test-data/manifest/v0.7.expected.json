@@ -70,7 +70,7 @@
           "type": "stable_log"
         },
         "resources": {
-          "heap_size": "2.0 GB"
+          "heap_size": 2000000000
         },
         "split_num_docs_target": 10000000
       },
@@ -78,6 +78,9 @@
       "retention": {
         "period": "42 days",
         "schedule": "daily"
+      },
+      "ingest_settings": {
+        "min_shards": 1
       },
       "search_settings": {
         "default_search_fields": []

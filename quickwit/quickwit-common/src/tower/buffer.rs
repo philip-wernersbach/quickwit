@@ -1,30 +1,25 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::error::Error;
 use std::marker::PhantomData;
 use std::task::{Context, Poll};
 use std::{error, fmt};
 
-use futures::TryFutureExt;
-use tower::buffer::error::{Closed, ServiceError};
+use futures::TryFutureExt as _;
 use tower::buffer::Buffer as TowerBuffer;
+use tower::buffer::error::{Closed, ServiceError};
 use tower::{Layer, Service};
 
 use super::{BoxError, BoxFuture};
@@ -42,7 +37,7 @@ pub struct Buffer<S, R>
 where S: Service<R>
 {
     bound: usize,
-    inner: TowerBuffer<S, R>,
+    inner: TowerBuffer<R, <S as Service<R>>::Future>,
 }
 
 impl<S, R> Buffer<S, R>
@@ -66,6 +61,7 @@ where
 
 impl<S, R> Service<R> for Buffer<S, R>
 where
+    R: Send + 'static,
     S: Service<R>,
     S::Error: error::Error + From<BufferError> + Into<BoxError> + Clone + Send + Sync + 'static,
     S::Future: Send + 'static,
@@ -96,12 +92,11 @@ where E: error::Error + From<BufferError> + Clone + 'static {
         return BufferError::Closed.into();
     }
     // This happens when the inner service returns an error on `poll_ready`.
-    if let Some(service_error) = error.downcast_ref::<ServiceError>() {
-        if let Some(source) = service_error.source() {
-            if let Some(inner) = source.downcast_ref::<E>() {
-                return inner.clone();
-            }
-        }
+    if let Some(service_error) = error.downcast_ref::<ServiceError>()
+        && let Some(source) = service_error.source()
+        && let Some(inner) = source.downcast_ref::<E>()
+    {
+        return inner.clone();
     }
     // This will happen only if the buffer service implementation adds a new error type.
     BufferError::Unknown.into()
@@ -118,7 +113,10 @@ where S: Service<R>
 }
 
 impl<S, R> Clone for Buffer<S, R>
-where S: Service<R>
+where
+    S: Service<R>,
+    R: Send + 'static,
+    <S as Service<R>>::Future: Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -261,11 +259,9 @@ mod tests {
         let (inner, worker) = TowerBuffer::pair(MyService::default(), 1);
         let handle = tokio::spawn(worker);
 
-        let mut service = Buffer { bound: 1, inner };
-        assert_eq!(
-            service.ready().await.unwrap().call((10, 2)).await.unwrap(),
-            5
-        );
+        let mut service: Buffer<MyService, (usize, usize)> = Buffer { bound: 1, inner };
+        let res: usize = service.ready().await.unwrap().call((10, 2)).await.unwrap();
+        assert_eq!(res, 5);
 
         handle.abort();
         handle.await.unwrap_err();

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 mod serialize;
 
@@ -25,10 +20,10 @@ use quickwit_proto::types::{DocMappingUid, IndexId};
 use serde::{Deserialize, Serialize};
 pub use serialize::{IndexTemplateV0_8, VersionedIndexTemplate};
 
-use crate::index_config::validate_index_config;
+use crate::index_config::{IngestSettings, validate_index_config};
 use crate::{
-    validate_identifier, validate_index_id_pattern, DocMapping, IndexConfig, IndexingSettings,
-    RetentionPolicy, SearchSettings,
+    DocMapping, IndexConfig, IndexingSettings, RetentionPolicy, SearchSettings,
+    validate_identifier, validate_index_id_pattern,
 };
 
 pub type IndexTemplateId = String;
@@ -49,6 +44,8 @@ pub struct IndexTemplate {
     pub doc_mapping: DocMapping,
     #[serde(default)]
     pub indexing_settings: IndexingSettings,
+    #[serde(default)]
+    pub ingest_settings: IngestSettings,
     #[serde(default)]
     pub search_settings: SearchSettings,
     #[serde(rename = "retention")]
@@ -77,6 +74,7 @@ impl IndexTemplate {
             index_uri,
             doc_mapping,
             indexing_settings: self.indexing_settings.clone(),
+            ingest_settings: self.ingest_settings.clone(),
             search_settings: self.search_settings.clone(),
             retention_policy_opt: self.retention_policy_opt.clone(),
         };
@@ -133,6 +131,7 @@ impl IndexTemplate {
             description: Some("Test description.".to_string()),
             doc_mapping,
             indexing_settings: IndexingSettings::default(),
+            ingest_settings: IngestSettings::default(),
             search_settings: SearchSettings::default(),
             retention_policy_opt: None,
         }
@@ -173,6 +172,7 @@ impl crate::TestableForRegression for IndexTemplate {
             description: Some("Test description.".to_string()),
             doc_mapping,
             indexing_settings: IndexingSettings::default(),
+            ingest_settings: IngestSettings::default(),
             search_settings: SearchSettings::default(),
             retention_policy_opt: Some(RetentionPolicy {
                 retention_period: "42 days".to_string(),
@@ -296,8 +296,10 @@ mod tests {
             jitter_secs: None,
         });
         let error = index_template.validate().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("failed to parse retention period"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse retention period")
+        );
     }
 }

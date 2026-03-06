@@ -1,28 +1,23 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 
-use hyper::header::CONTENT_TYPE;
 use quickwit_config::ConfigFormat;
 use serde::{self, Deserialize, Serialize, Serializer};
 use thiserror::Error;
+use warp::hyper::header::CONTENT_TYPE;
 use warp::{Filter, Rejection};
 
 /// Body output format used for the REST API.
@@ -83,10 +78,9 @@ struct FormatQueryString {
     pub format: BodyFormat,
 }
 
-pub(crate) fn extract_format_from_qs(
-) -> impl Filter<Extract = (BodyFormat,), Error = Rejection> + Clone {
-    serde_qs::warp::query::<FormatQueryString>(serde_qs::Config::default())
-        .map(|format_qs: FormatQueryString| format_qs.format)
+pub(crate) fn extract_format_from_qs()
+-> impl Filter<Extract = (BodyFormat,), Error = Rejection> + Clone {
+    warp::query::<FormatQueryString>().map(|format_qs: FormatQueryString| format_qs.format)
 }
 
 #[derive(Debug, Error)]
@@ -98,8 +92,8 @@ pub(crate) struct UnsupportedMediaType;
 
 impl warp::reject::Reject for UnsupportedMediaType {}
 
-pub(crate) fn extract_config_format(
-) -> impl Filter<Extract = (ConfigFormat,), Error = Rejection> + Copy {
+pub(crate) fn extract_config_format()
+-> impl Filter<Extract = (ConfigFormat,), Error = Rejection> + Copy {
     warp::filters::header::optional::<mime_guess::Mime>(CONTENT_TYPE.as_str()).and_then(
         |mime_opt: Option<mime_guess::Mime>| {
             if let Some(mime) = mime_opt {

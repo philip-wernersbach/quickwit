@@ -1,37 +1,29 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::ops::Bound;
 
 use serde::{Deserialize, Serialize};
 use tantivy::fastfield::FastValue;
 use tantivy::query::FastFieldRangeQuery;
-use tantivy::schema::Schema as TantivySchema;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{DateTime, Term};
 
-use super::tantivy_query_ast::TantivyBoolQuery;
 use super::QueryAst;
+use super::tantivy_query_ast::TantivyBoolQuery;
 use crate::json_literal::InterpretUserInput;
-use crate::query_ast::tantivy_query_ast::TantivyQueryAst;
-use crate::query_ast::BuildTantivyAst;
-use crate::tokenizers::TokenizerManager;
+use crate::query_ast::{BuildTantivyAst, BuildTantivyAstContext, TantivyQueryAst};
 use crate::{InvalidQuery, JsonLiteral};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -115,13 +107,14 @@ fn get_normalized_text(normalizer: &mut Option<TextAnalyzer>, text: &str) -> Str
 impl BuildTantivyAst for RangeQuery {
     fn build_tantivy_ast_impl(
         &self,
-        schema: &TantivySchema,
-        tokenizer_manager: &TokenizerManager,
-        _search_fields: &[String],
-        _with_validation: bool,
+        context: &BuildTantivyAstContext,
     ) -> Result<TantivyQueryAst, InvalidQuery> {
         let (field, field_entry, json_path) =
-            super::utils::find_field_or_hit_dynamic(&self.field, schema)?;
+            super::utils::find_field_or_hit_dynamic(&self.field, context.schema).ok_or_else(
+                || InvalidQuery::FieldDoesNotExist {
+                    full_path: self.field.clone(),
+                },
+            )?;
         if !field_entry.is_fast() {
             return Err(InvalidQuery::SchemaError(format!(
                 "range queries are only supported for fast fields. (`{}` is not a fast field)",
@@ -130,9 +123,12 @@ impl BuildTantivyAst for RangeQuery {
         }
         Ok(match field_entry.field_type() {
             tantivy::schema::FieldType::Str(options) => {
-                let mut normalizer = options
-                    .get_fast_field_tokenizer_name()
-                    .and_then(|tokenizer_name| tokenizer_manager.get_normalizer(tokenizer_name));
+                let mut normalizer =
+                    options
+                        .get_fast_field_tokenizer_name()
+                        .and_then(|tokenizer_name| {
+                            context.tokenizer_manager.get_normalizer(tokenizer_name)
+                        });
 
                 let (lower_bound, upper_bound) =
                     convert_bounds(&self.lower_bound, &self.upper_bound, field_entry.name())?;
@@ -185,8 +181,8 @@ impl BuildTantivyAst for RangeQuery {
                     convert_bounds(&self.lower_bound, &self.upper_bound, field_entry.name())?;
                 let truncate_datetime =
                     |date: &DateTime| date.truncate(date_options.get_precision());
-                let lower_bound = map_bound(&lower_bound, truncate_datetime);
-                let upper_bound = map_bound(&upper_bound, truncate_datetime);
+                let lower_bound = lower_bound.as_ref().map(truncate_datetime);
+                let upper_bound = upper_bound.as_ref().map(truncate_datetime);
                 FastFieldRangeQuery::new(
                     lower_bound.map(|val| Term::from_field_date(field, val)),
                     upper_bound.map(|val| Term::from_field_date(field, val)),
@@ -220,10 +216,17 @@ impl BuildTantivyAst for RangeQuery {
                 } else if let Some(range) = bounds_range_f64 {
                     sub_queries.push(query_from_fast_val_range(&empty_term, range).into());
                 }
-
-                let mut normalizer = options
-                    .get_fast_field_tokenizer_name()
-                    .and_then(|tokenizer_name| tokenizer_manager.get_normalizer(tokenizer_name));
+                let bounds_range_date: Option<(Bound<DateTime>, Bound<DateTime>)> =
+                    convert_bound(&self.lower_bound).zip(convert_bound(&self.upper_bound));
+                if let Some(range) = bounds_range_date {
+                    sub_queries.push(query_from_fast_val_range(&empty_term, range).into());
+                }
+                let mut normalizer =
+                    options
+                        .get_fast_field_tokenizer_name()
+                        .and_then(|tokenizer_name| {
+                            context.tokenizer_manager.get_normalizer(tokenizer_name)
+                        });
 
                 let bounds_range_str: Option<(Bound<&str>, Bound<&str>)> =
                     convert_bound(&self.lower_bound).zip(convert_bound(&self.upper_bound));
@@ -274,25 +277,15 @@ impl BuildTantivyAst for RangeQuery {
     }
 }
 
-fn map_bound<TFrom, TTo>(bound: &Bound<TFrom>, transform: impl Fn(&TFrom) -> TTo) -> Bound<TTo> {
-    match bound {
-        Bound::Excluded(ref from_val) => Bound::Excluded(transform(from_val)),
-        Bound::Included(ref from_val) => Bound::Included(transform(from_val)),
-        Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::ops::Bound;
 
-    use tantivy::schema::{DateOptions, DateTimePrecision, Schema, FAST, STORED, TEXT};
+    use tantivy::schema::{DateOptions, DateTimePrecision, FAST, STORED, Schema, TEXT};
 
     use super::RangeQuery;
-    use crate::query_ast::BuildTantivyAst;
-    use crate::{
-        create_default_quickwit_tokenizer_manager, InvalidQuery, JsonLiteral, MatchAllOrNone,
-    };
+    use crate::query_ast::{BuildTantivyAst, BuildTantivyAstContext};
+    use crate::{InvalidQuery, JsonLiteral, MatchAllOrNone};
 
     fn make_schema(dynamic_mode: bool) -> Schema {
         let mut schema_builder = Schema::builder();
@@ -324,12 +317,7 @@ mod tests {
             upper_bound: Bound::Included(upper_value),
         };
         let tantivy_ast = range_query
-            .build_tantivy_ast_call(
-                &schema,
-                &create_default_quickwit_tokenizer_manager(),
-                &[],
-                true,
-            )
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
             .unwrap()
             .simplify();
         let leaf = tantivy_ast.as_leaf().unwrap();
@@ -372,12 +360,7 @@ mod tests {
         };
         // with validation
         let invalid_query: InvalidQuery = range_query
-            .build_tantivy_ast_call(
-                &schema,
-                &create_default_quickwit_tokenizer_manager(),
-                &[],
-                true,
-            )
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
             .unwrap_err();
         assert!(
             matches!(invalid_query, InvalidQuery::FieldDoesNotExist { full_path } if full_path == "missing_field.toto")
@@ -386,10 +369,7 @@ mod tests {
         assert_eq!(
             range_query
                 .build_tantivy_ast_call(
-                    &schema,
-                    &create_default_quickwit_tokenizer_manager(),
-                    &[],
-                    false
+                    &BuildTantivyAstContext::for_test(&schema).without_validation()
                 )
                 .unwrap()
                 .const_predicate(),
@@ -406,22 +386,45 @@ mod tests {
         };
         let schema = make_schema(true);
         let tantivy_ast = range_query
-            .build_tantivy_ast_call(
-                &schema,
-                &create_default_quickwit_tokenizer_manager(),
-                &[],
-                true,
-            )
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
             .unwrap();
         assert_eq!(
-            format!("{:?}", tantivy_ast),
+            format!("{tantivy_ast:?}"),
             "Bool(TantivyBoolQuery { must: [], must_not: [], should: [Leaf(FastFieldRangeQuery { \
              bounds: BoundsRange { lower_bound: Included(Term(field=6, type=Json, path=hello, \
              type=I64, 1980)), upper_bound: Included(Term(field=6, type=Json, path=hello, \
              type=I64, 1989)) } }), Leaf(FastFieldRangeQuery { bounds: BoundsRange { lower_bound: \
              Included(Term(field=6, type=Json, path=hello, type=Str, \"1980\")), upper_bound: \
-             Included(Term(field=6, type=Json, path=hello, type=Str, \"1989\")) } })], filter: [] \
-             })"
+             Included(Term(field=6, type=Json, path=hello, type=Str, \"1989\")) } })], filter: \
+             [], minimum_should_match: None })"
+        );
+    }
+
+    #[test]
+    fn test_range_dynamic_datetime() {
+        let range_query = RangeQuery {
+            field: "hello".to_string(),
+            lower_bound: Bound::Included(JsonLiteral::String(
+                "2020-12-09T16:09:53+00:00".to_string(),
+            )),
+            upper_bound: Bound::Included(JsonLiteral::String(
+                "2020-12-09T16:09:53+00:00".to_string(),
+            )),
+        };
+        let schema = make_schema(true);
+        let tantivy_ast = range_query
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
+            .unwrap();
+        assert_eq!(
+            format!("{tantivy_ast:?}"),
+            "Bool(TantivyBoolQuery { must: [], must_not: [], should: [Leaf(FastFieldRangeQuery { \
+             bounds: BoundsRange { lower_bound: Included(Term(field=6, type=Json, path=hello, \
+             type=Date, 2020-12-09T16:09:53Z)), upper_bound: Included(Term(field=6, type=Json, \
+             path=hello, type=Date, 2020-12-09T16:09:53Z)) } }), Leaf(FastFieldRangeQuery { \
+             bounds: BoundsRange { lower_bound: Included(Term(field=6, type=Json, path=hello, \
+             type=Str, \"2020-12-09T16:09:53+00:00\")), upper_bound: Included(Term(field=6, \
+             type=Json, path=hello, type=Str, \"2020-12-09T16:09:53+00:00\")) } })], filter: [], \
+             minimum_should_match: None })"
         );
     }
 
@@ -434,12 +437,7 @@ mod tests {
         };
         let schema = make_schema(false);
         let err = range_query
-            .build_tantivy_ast_call(
-                &schema,
-                &create_default_quickwit_tokenizer_manager(),
-                &[],
-                true,
-            )
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
             .unwrap_err();
         assert!(matches!(err, InvalidQuery::SchemaError { .. }));
     }

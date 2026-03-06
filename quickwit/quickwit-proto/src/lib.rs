@@ -1,38 +1,35 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![allow(clippy::derive_partial_eq_without_eq)]
-#![deny(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods)]
+#![allow(clippy::doc_lazy_continuation)]
 #![allow(rustdoc::invalid_html_tags)]
 
 use std::cmp::Ordering;
 
 use ::opentelemetry::global;
 use ::opentelemetry::propagation::{Extractor, Injector};
-use tonic::service::Interceptor;
 use tonic::Status;
+use tonic::service::Interceptor;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub mod cluster;
 pub mod control_plane;
-pub use {bytes, tonic};
+pub use bytes;
+pub use tonic;
 pub mod developer;
 pub mod error;
 mod getters;
@@ -52,6 +49,9 @@ pub mod jaeger {
     pub mod storage {
         pub mod v1 {
             include!("codegen/jaeger/jaeger.storage.v1.rs");
+        }
+        pub mod v2 {
+            include!("codegen/jaeger/jaeger.storage.v2.rs");
         }
     }
 }
@@ -109,24 +109,6 @@ pub mod opentelemetry {
     }
 }
 
-#[macro_use]
-extern crate serde;
-
-impl TryFrom<search::SearchStreamRequest> for search::SearchRequest {
-    type Error = anyhow::Error;
-
-    fn try_from(search_stream_req: search::SearchStreamRequest) -> Result<Self, Self::Error> {
-        Ok(Self {
-            index_id_patterns: vec![search_stream_req.index_id],
-            query_ast: search_stream_req.query_ast,
-            snippet_fields: search_stream_req.snippet_fields,
-            start_timestamp: search_stream_req.start_timestamp,
-            end_timestamp: search_stream_req.end_timestamp,
-            ..Default::default()
-        })
-    }
-}
-
 impl TryFrom<metastore::DeleteQuery> for search::SearchRequest {
     type Error = anyhow::Error;
 
@@ -144,18 +126,18 @@ impl TryFrom<metastore::DeleteQuery> for search::SearchRequest {
 /// `MutMetadataMap` used to extract [`tonic::metadata::MetadataMap`] from a request.
 pub struct MutMetadataMap<'a>(&'a mut tonic::metadata::MetadataMap);
 
-impl<'a> Injector for MutMetadataMap<'a> {
+impl Injector for MutMetadataMap<'_> {
     /// Sets a key-value pair in the [`MetadataMap`]. No-op if the key or value is invalid.
     fn set(&mut self, key: &str, value: String) {
-        if let Ok(metadata_key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) {
-            if let Ok(metadata_value) = tonic::metadata::MetadataValue::try_from(&value) {
-                self.0.insert(metadata_key, metadata_value);
-            }
+        if let Ok(metadata_key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes())
+            && let Ok(metadata_value) = tonic::metadata::MetadataValue::try_from(&value)
+        {
+            self.0.insert(metadata_key, metadata_value);
         }
     }
 }
 
-impl<'a> Extractor for MutMetadataMap<'a> {
+impl Extractor for MutMetadataMap<'_> {
     /// Gets a value for a key from the MetadataMap.  If the value can't be converted to &str,
     /// returns None.
     fn get(&self, key: &str) -> Option<&str> {
@@ -195,7 +177,7 @@ impl Interceptor for SpanContextInterceptor {
 /// tracing keys from request's headers.
 struct MetadataMap<'a>(&'a tonic::metadata::MetadataMap);
 
-impl<'a> Extractor for MetadataMap<'a> {
+impl Extractor for MetadataMap<'_> {
     /// Gets a value for a key from the MetadataMap.  If the value can't be converted to &str,
     /// returns None.
     fn get(&self, key: &str) -> Option<&str> {
@@ -218,7 +200,7 @@ impl<'a> Extractor for MetadataMap<'a> {
 pub fn set_parent_span_from_request_metadata(request_metadata: &tonic::metadata::MetadataMap) {
     let parent_cx =
         global::get_text_map_propagator(|prop| prop.extract(&MetadataMap(request_metadata)));
-    Span::current().set_parent(parent_cx);
+    let _ = Span::current().set_parent(parent_cx);
 }
 
 impl search::SortOrder {

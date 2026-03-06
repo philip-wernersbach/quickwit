@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt::Debug;
 use std::time::Duration;
@@ -109,9 +104,9 @@ impl RetryParams {
         let delay_ms = (self.base_delay.as_millis() as u64)
             .saturating_mul(2u64.saturating_pow(num_attempts as u32 - 1));
         let capped_delay_ms = delay_ms.min(self.max_delay.as_millis() as u64);
-        let half_delay_ms = (capped_delay_ms + 1) / 2;
+        let half_delay_ms = capped_delay_ms.div_ceil(2);
         let jitter_range = half_delay_ms..capped_delay_ms + 1;
-        let jittered_delay_ms = rand::thread_rng().gen_range(jitter_range);
+        let jittered_delay_ms = rand::rng().random_range(jitter_range);
         Duration::from_millis(jittered_delay_ms)
     }
 
@@ -197,7 +192,7 @@ mod tests {
 
     use futures::future::ready;
 
-    use super::{retry_with_mockable_sleep, MockableSleep, RetryParams, Retryable};
+    use super::{MockableSleep, RetryParams, Retryable, retry_with_mockable_sleep};
 
     #[derive(Debug, Eq, PartialEq)]
     pub enum Retry<E> {

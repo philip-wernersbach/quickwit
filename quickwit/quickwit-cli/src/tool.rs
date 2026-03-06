@@ -1,59 +1,56 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{stdout, IsTerminal, Stdout, Write};
+use std::io::{IsTerminal, Stdout, Write, stdout};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use std::{env, fmt, io};
 
-use anyhow::{bail, Context};
-use clap::{arg, ArgMatches, Command};
+use anyhow::{Context, bail};
+use clap::{ArgMatches, Command, arg};
 use colored::{ColoredString, Colorize};
 use humantime::format_duration;
 use quickwit_actors::{ActorExitStatus, ActorHandle, Mailbox, Universe};
-use quickwit_cluster::{ChannelTransport, Cluster, ClusterMember, FailureDetectorConfig};
+use quickwit_cluster::{
+    ChannelTransport, Cluster, ClusterMember, FailureDetectorConfig, make_client_grpc_config,
+};
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::runtimes::RuntimesConfig;
 use quickwit_common::uri::Uri;
 use quickwit_config::service::QuickwitService;
 use quickwit_config::{
-    IndexerConfig, NodeConfig, SourceConfig, SourceInputFormat, SourceParams, TransformConfig,
-    VecSourceParams, CLI_SOURCE_ID,
+    CLI_SOURCE_ID, IndexerConfig, NodeConfig, SourceConfig, SourceInputFormat, SourceParams,
+    TransformConfig, VecSourceParams,
 };
-use quickwit_index_management::{clear_cache_directory, IndexService};
+use quickwit_index_management::{IndexService, clear_cache_directory};
+use quickwit_indexing::IndexingPipeline;
 use quickwit_indexing::actors::{IndexingService, MergePipeline, MergeSchedulerService};
 use quickwit_indexing::models::{
     DetachIndexingPipeline, DetachMergePipeline, IndexingStatistics, SpawnPipeline,
 };
-use quickwit_indexing::IndexingPipeline;
 use quickwit_ingest::IngesterPool;
 use quickwit_metastore::IndexMetadataResponseExt;
 use quickwit_proto::indexing::CpuCapacity;
 use quickwit_proto::metastore::{IndexMetadataRequest, MetastoreService, MetastoreServiceClient};
 use quickwit_proto::search::{CountHits, SearchResponse};
 use quickwit_proto::types::{IndexId, PipelineUid, SourceId, SplitId};
-use quickwit_search::{single_node_search, SearchResponseRest};
+use quickwit_search::{SearchResponseRest, single_node_search};
 use quickwit_serve::{
-    search_request_from_api_request, BodyFormat, SearchRequestQueryString, SortBy,
+    BodyFormat, SearchRequestQueryString, SortBy, search_request_from_api_request,
 };
 use quickwit_storage::{BundleStorage, Storage};
 use thousands::Separable;
@@ -61,8 +58,8 @@ use tracing::{debug, info};
 
 use crate::checklist::{GREEN_COLOR, RED_COLOR};
 use crate::{
-    config_cli_arg, get_resolvers, load_node_config, run_index_checklist, start_actor_runtimes,
-    THROUGHPUT_WINDOW_SIZE,
+    THROUGHPUT_WINDOW_SIZE, config_cli_arg, get_resolvers, load_node_config, run_index_checklist,
+    start_actor_runtimes,
 };
 
 pub fn build_tool_command() -> Command {
@@ -418,7 +415,7 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
         .map(|vrl_script| TransformConfig::new(vrl_script, None));
     let source_config = SourceConfig {
         source_id: CLI_SOURCE_ID.to_string(),
-        num_pipelines: NonZeroUsize::new(1).expect("1 is always non-zero."),
+        num_pipelines: NonZeroUsize::MIN,
         enabled: true,
         source_params,
         transform_config,
@@ -495,7 +492,11 @@ pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<
     let statistics =
         start_statistics_reporting_loop(indexing_pipeline_handle, args.input_path_opt.is_none())
             .await?;
-    merge_pipeline_handle.quit().await;
+    merge_pipeline_handle
+        .mailbox()
+        .ask(quickwit_indexing::FinishPendingMergesAndShutdownPipeline)
+        .await?;
+    merge_pipeline_handle.join().await;
     // Shutdown the indexing server.
     universe
         .send_exit_with_success(&indexing_server_mailbox)
@@ -550,6 +551,7 @@ pub async fn local_search_cli(args: LocalSearchArgs) -> anyhow::Result<()> {
         format: BodyFormat::Json,
         sort_by,
         count_all: CountHits::CountAll,
+        allow_failed_splits: false,
     };
     let search_request =
         search_request_from_api_request(vec![args.index_id], search_request_query_string)?;
@@ -558,7 +560,7 @@ pub async fn local_search_cli(args: LocalSearchArgs) -> anyhow::Result<()> {
         single_node_search(search_request, metastore, storage_resolver).await?;
     let search_response_rest = SearchResponseRest::try_from(search_response)?;
     let search_response_json = serde_json::to_string_pretty(&search_response_rest)?;
-    println!("{}", search_response_json);
+    println!("{search_response_json}");
     Ok(())
 }
 
@@ -603,7 +605,7 @@ pub async fn merge_cli(args: MergeArgs) -> anyhow::Result<()> {
             index_id: args.index_id,
             source_config: SourceConfig {
                 source_id: args.source_id,
-                num_pipelines: NonZeroUsize::new(1).unwrap(),
+                num_pipelines: NonZeroUsize::MIN,
                 enabled: true,
                 source_params: SourceParams::Vec(VecSourceParams::default()),
                 transform_config: None,
@@ -840,7 +842,7 @@ struct Printer<'a> {
     pub stdout: &'a mut Stdout,
 }
 
-impl<'a> Printer<'a> {
+impl Printer<'_> {
     pub fn print_header(&mut self, header: &str) -> io::Result<()> {
         write!(&mut self.stdout, " {}", header.bright_blue())?;
         Ok(())
@@ -936,7 +938,9 @@ async fn create_empty_cluster(config: &NodeConfig) -> anyhow::Result<Cluster> {
         grpc_advertise_addr: config.grpc_advertise_addr,
         indexing_cpu_capacity: CpuCapacity::zero(),
         indexing_tasks: Vec::new(),
+        availability_zone: None,
     };
+    let client_grpc_config = make_client_grpc_config(&config.grpc_config)?;
     let cluster = Cluster::join(
         config.cluster_id.clone(),
         self_node,
@@ -945,6 +949,7 @@ async fn create_empty_cluster(config: &NodeConfig) -> anyhow::Result<Cluster> {
         config.gossip_interval,
         FailureDetectorConfig::default(),
         &ChannelTransport::default(),
+        client_grpc_config,
     )
     .await?;
 

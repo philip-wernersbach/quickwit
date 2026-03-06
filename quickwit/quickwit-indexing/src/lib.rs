@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![deny(clippy::disallowed_methods)]
 
@@ -31,12 +26,12 @@ use tracing::info;
 
 use crate::actors::MergeSchedulerService;
 pub use crate::actors::{
-    IndexingError, IndexingPipeline, IndexingPipelineParams, IndexingService, PublisherType,
-    Sequencer, SplitsUpdateMailbox,
+    FinishPendingMergesAndShutdownPipeline, IndexingError, IndexingPipeline,
+    IndexingPipelineParams, IndexingService, PublisherType, Sequencer, SplitsUpdateMailbox,
 };
 pub use crate::controlled_directory::ControlledDirectory;
 use crate::models::IndexingStatistics;
-pub use crate::split_store::{get_tantivy_directory_from_split_bundle, IndexingSplitStore};
+pub use crate::split_store::{IndexingSplitStore, get_tantivy_directory_from_split_bundle};
 
 pub mod actors;
 mod controlled_directory;
@@ -50,7 +45,7 @@ mod test_utils;
 
 use quickwit_proto::indexing::CpuCapacity;
 #[cfg(any(test, feature = "testsuite"))]
-pub use test_utils::{mock_split, mock_split_meta, MockSplitBuilder, TestSandbox};
+pub use test_utils::{MockSplitBuilder, TestSandbox, mock_split, mock_split_meta};
 
 use self::merge_policy::MergePolicy;
 pub use self::source::check_source_connectivity;

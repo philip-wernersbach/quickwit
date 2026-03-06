@@ -1,44 +1,40 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![deny(clippy::disallowed_methods)]
 
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use anyhow::Context;
-use clap::{arg, Arg, ArgMatches};
-use dialoguer::theme::ColorfulTheme;
+use clap::{Arg, ArgMatches, arg};
 use dialoguer::Confirm;
+use dialoguer::theme::ColorfulTheme;
 use quickwit_common::runtimes::RuntimesConfig;
 use quickwit_common::uri::Uri;
 use quickwit_config::service::QuickwitService;
 use quickwit_config::{
-    ConfigFormat, MetastoreConfigs, NodeConfig, SourceConfig, StorageConfigs,
-    DEFAULT_QW_CONFIG_PATH,
+    ConfigFormat, DEFAULT_QW_CONFIG_PATH, MetastoreConfigs, NodeConfig, SourceConfig,
+    StorageConfigs,
 };
 use quickwit_indexing::check_source_connectivity;
 use quickwit_metastore::{IndexMetadataResponseExt, MetastoreResolver};
 use quickwit_proto::metastore::{IndexMetadataRequest, MetastoreService, MetastoreServiceClient};
 use quickwit_rest_client::models::Timeout;
-use quickwit_rest_client::rest_client::{QuickwitClient, QuickwitClientBuilder, DEFAULT_BASE_URL};
-use quickwit_storage::{load_file, StorageResolver};
+use quickwit_rest_client::rest_client::{DEFAULT_BASE_URL, QuickwitClient, QuickwitClientBuilder};
+use quickwit_storage::{StorageResolver, load_file};
 use reqwest::Url;
 use tabled::settings::object::Rows;
 use tabled::settings::panel::Header;
@@ -99,7 +95,28 @@ fn client_args() -> Vec<Arg> {
             .required(false)
             .global(true)
             .display_order(3),
+        Arg::new("retries")
+            .long("retries")
+            .help(
+                "Maximum number of retries for transient errors. Default value is 0. The total \
+                 number of attempts will be `1 + RETRIES`.",
+            )
+            .required(false)
+            .global(true)
+            .default_value("0")
+            .display_order(4),
     ]
+}
+
+pub fn install_default_crypto_ring_provider() {
+    static CALL_ONLY_ONCE: OnceLock<Result<(), ()>> = OnceLock::new();
+    CALL_ONLY_ONCE
+        .get_or_init(|| {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .map_err(|_| ())
+        })
+        .expect("rustls crypto ring default provider installation should not fail");
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -108,7 +125,7 @@ pub struct ClientArgs {
     pub connect_timeout: Option<Timeout>,
     pub timeout: Option<Timeout>,
     pub commit_timeout: Option<Timeout>,
-    pub ingest_v2: bool,
+    pub num_retries: u32,
 }
 
 impl Default for ClientArgs {
@@ -118,13 +135,13 @@ impl Default for ClientArgs {
             connect_timeout: None,
             timeout: None,
             commit_timeout: None,
-            ingest_v2: false,
+            num_retries: 0,
         }
     }
 }
 
 impl ClientArgs {
-    pub fn client(self) -> QuickwitClient {
+    pub fn client_builder(self) -> QuickwitClientBuilder {
         let mut builder = QuickwitClientBuilder::new(self.cluster_endpoint);
         if let Some(connect_timeout) = self.connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
@@ -137,10 +154,11 @@ impl ClientArgs {
         if let Some(commit_timeout) = self.commit_timeout {
             builder = builder.commit_timeout(commit_timeout);
         }
-        if self.ingest_v2 {
-            builder = builder.enable_ingest_v2();
-        }
-        builder.build()
+        builder.num_retries(self.num_retries)
+    }
+
+    pub fn client(self) -> QuickwitClient {
+        self.client_builder().build()
     }
 
     pub fn parse_for_ingest(matches: &mut ArgMatches) -> anyhow::Result<Self> {
@@ -155,7 +173,7 @@ impl ClientArgs {
         let cluster_endpoint = matches
             .remove_one::<String>("endpoint")
             .map(|endpoint_str| Url::from_str(&endpoint_str))
-            .expect("`endpoint` should be a required arg.")?;
+            .expect("`endpoint` should be a required arg")?;
         let connect_timeout =
             if let Some(duration) = matches.remove_one::<String>("connect-timeout") {
                 Some(parse_duration_or_none(&duration)?)
@@ -167,11 +185,6 @@ impl ClientArgs {
         } else {
             None
         };
-        let ingest_v2 = if process_ingest {
-            matches.get_flag("v2")
-        } else {
-            false
-        };
         let commit_timeout = if process_ingest {
             if let Some(duration) = matches.remove_one::<String>("commit-timeout") {
                 Some(parse_duration_or_none(&duration)?)
@@ -181,12 +194,16 @@ impl ClientArgs {
         } else {
             None
         };
+        let num_retries = matches
+            .remove_one::<String>("retries")
+            .map(|retries| retries.parse::<u32>())
+            .expect("`retries` should have a default value")?;
         Ok(Self {
             cluster_endpoint,
             connect_timeout,
             timeout,
             commit_timeout,
-            ingest_v2,
+            num_retries,
         })
     }
 }
@@ -310,7 +327,7 @@ pub fn make_table<T: Tabled>(
         .with(Modify::new(Rows::new(1..)).with(Alignment::left()))
         .with(Style::ascii())
         .with(Header::new(header))
-        .with(Modify::new(Rows::single(0)).with(Alignment::center()));
+        .with(Modify::new(Rows::new(0..1)).with(Alignment::center()));
 
     table
 }

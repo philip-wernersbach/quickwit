@@ -1,27 +1,22 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::string::FromUtf8Error;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
@@ -31,8 +26,8 @@ use quickwit_common::runtimes::RuntimeType;
 use quickwit_config::{SourceInputFormat, TransformConfig};
 use quickwit_doc_mapper::{DocMapper, DocParsingError, JsonObject};
 use quickwit_opentelemetry::otlp::{
-    parse_otlp_logs_json, parse_otlp_logs_protobuf, parse_otlp_spans_json,
-    parse_otlp_spans_protobuf, JsonLogIterator, JsonSpanIterator, OtlpLogsError, OtlpTracesError,
+    JsonLogIterator, JsonSpanIterator, OtlpLogsError, OtlpTracesError, parse_otlp_logs_json,
+    parse_otlp_logs_protobuf, parse_otlp_spans_json, parse_otlp_spans_protobuf,
 };
 use quickwit_proto::types::{IndexId, SourceId};
 use serde::Serialize;
@@ -139,7 +134,7 @@ fn try_into_vrl_doc(
         SourceInputFormat::Json => serde_json::from_slice::<VrlValue>(&raw_doc)?,
         SourceInputFormat::PlainText => {
             let mut map = std::collections::BTreeMap::new();
-            let key = PLAIN_TEXT.to_string();
+            let key = vrl::value::KeyString::from(PLAIN_TEXT);
             let value = VrlValue::Bytes(raw_doc);
             map.insert(key, value);
             VrlValue::Object(map)
@@ -409,7 +404,7 @@ impl DocProcessorCounters {
 }
 
 pub struct DocProcessor {
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
     indexer_mailbox: Mailbox<Indexer>,
     timestamp_field_opt: Option<Field>,
     counters: Arc<DocProcessorCounters>,
@@ -423,12 +418,12 @@ impl DocProcessor {
     pub fn try_new(
         index_id: IndexId,
         source_id: SourceId,
-        doc_mapper: Arc<dyn DocMapper>,
+        doc_mapper: Arc<DocMapper>,
         indexer_mailbox: Mailbox<Indexer>,
         transform_config_opt: Option<TransformConfig>,
         input_format: SourceInputFormat,
     ) -> anyhow::Result<Self> {
-        let timestamp_field_opt = extract_timestamp_field(&*doc_mapper)?;
+        let timestamp_field_opt = extract_timestamp_field(&doc_mapper)?;
         if cfg!(not(feature = "vrl")) && transform_config_opt.is_some() {
             bail!("VRL is not enabled: please recompile with the `vrl` feature")
         }
@@ -512,7 +507,7 @@ impl DocProcessor {
     }
 }
 
-fn extract_timestamp_field(doc_mapper: &dyn DocMapper) -> anyhow::Result<Option<Field>> {
+fn extract_timestamp_field(doc_mapper: &DocMapper) -> anyhow::Result<Option<Field>> {
     let schema = doc_mapper.schema();
     let Some(timestamp_field_name) = doc_mapper.timestamp_field_name() else {
         return Ok(None);
@@ -632,19 +627,19 @@ mod tests {
     use prost::Message;
     use quickwit_actors::Universe;
     use quickwit_common::uri::Uri;
-    use quickwit_config::{build_doc_mapper, SearchSettings};
-    use quickwit_doc_mapper::{default_doc_mapper_for_test, DefaultDocMapper};
+    use quickwit_config::{SearchSettings, build_doc_mapper};
+    use quickwit_doc_mapper::{DocMapper, default_doc_mapper_for_test};
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
     use quickwit_opentelemetry::otlp::{OtlpGrpcLogsService, OtlpGrpcTracesService};
     use quickwit_proto::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
     use quickwit_proto::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
-    use quickwit_proto::opentelemetry::proto::common::v1::any_value::Value as OtlpAnyValueValue;
     use quickwit_proto::opentelemetry::proto::common::v1::AnyValue as OtlpAnyValue;
+    use quickwit_proto::opentelemetry::proto::common::v1::any_value::Value as OtlpAnyValueValue;
     use quickwit_proto::opentelemetry::proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use quickwit_proto::opentelemetry::proto::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use serde_json::Value as JsonValue;
-    use tantivy::schema::NamedFieldDocument;
     use tantivy::Document;
+    use tantivy::schema::NamedFieldDocument;
 
     use super::*;
     use crate::models::{PublishLock, RawDocBatch};
@@ -739,9 +734,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_doc_processor_partitioning() {
-        let doc_mapper: Arc<dyn DocMapper> = Arc::new(
-            serde_json::from_str::<DefaultDocMapper>(DOCMAPPER_WITH_PARTITION_JSON).unwrap(),
-        );
+        let doc_mapper: Arc<DocMapper> =
+            Arc::new(serde_json::from_str::<DocMapper>(DOCMAPPER_WITH_PARTITION_JSON).unwrap());
         let universe = Universe::with_accelerated_time();
         let (indexer_mailbox, indexer_inbox) = universe.create_test_mailbox();
         let doc_processor = DocProcessor::try_new(
@@ -1172,8 +1166,8 @@ mod tests_vrl {
     use quickwit_actors::Universe;
     use quickwit_doc_mapper::default_doc_mapper_for_test;
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
-    use tantivy::schema::NamedFieldDocument;
     use tantivy::Document;
+    use tantivy::schema::NamedFieldDocument;
 
     use super::*;
 

@@ -1,35 +1,31 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use elasticsearch_dsl::search::SearchResponse as ElasticsearchResponse;
 use elasticsearch_dsl::ErrorCause;
-use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_with::formats::PreferMany;
-use serde_with::{serde_as, OneOrMany};
+use serde_with::{OneOrMany, serde_as};
+use warp::hyper::StatusCode;
 
-use super::search_query_params::ExpandWildcards;
 use super::ElasticsearchError;
+use super::search_query_params::ExpandWildcards;
+use super::search_response::ElasticsearchResponse;
 use crate::simple_list::{from_simple_list, to_simple_list};
 
 // Multi search doc: https://www.elastic.co/guide/en/elasticsearch/reference/current/search-multi-search.html
 
+#[serde_as]
 #[serde_with::skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +51,10 @@ pub struct MultiSearchQueryParams {
     pub ignore_throttled: Option<bool>,
     #[serde(default)]
     pub ignore_unavailable: Option<bool>,
+    /// List of indexes to search.
+    #[serde_as(deserialize_as = "OneOrMany<_, PreferMany>")]
+    #[serde(default, rename = "index")]
+    pub indexes: Vec<String>,
     #[serde(default)]
     pub max_concurrent_searches: Option<u64>,
     #[serde(default)]
@@ -95,8 +95,8 @@ pub struct MultiSearchHeader {
     #[serde(default)]
     pub ignore_unavailable: Option<bool>,
     #[serde_as(deserialize_as = "OneOrMany<_, PreferMany>")]
-    #[serde(default)]
-    pub index: Vec<String>,
+    #[serde(default, rename = "index")]
+    pub indexes: Vec<String>,
     #[serde(default)]
     pub preference: Option<String>,
     #[serde(default)]
@@ -105,12 +105,32 @@ pub struct MultiSearchHeader {
     pub routing: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize)]
+impl MultiSearchHeader {
+    pub fn apply_query_param_defaults(&mut self, defaults: &MultiSearchQueryParams) {
+        if self.allow_no_indices.is_none() {
+            self.allow_no_indices = defaults.allow_no_indices;
+        }
+        if self.expand_wildcards.is_none() {
+            self.expand_wildcards = defaults.expand_wildcards.clone();
+        }
+        if self.ignore_unavailable.is_none() {
+            self.ignore_unavailable = defaults.ignore_unavailable;
+        }
+        if self.indexes.is_empty() {
+            self.indexes = defaults.indexes.clone();
+        }
+        if self.routing.is_none() {
+            self.routing = defaults.routing.clone();
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub struct MultiSearchResponse {
     pub responses: Vec<MultiSearchSingleResponse>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Debug)]
 pub struct MultiSearchSingleResponse {
     #[serde(with = "http_serde::status_code")]
     pub status: StatusCode,

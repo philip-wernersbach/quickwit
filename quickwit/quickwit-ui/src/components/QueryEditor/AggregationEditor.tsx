@@ -1,30 +1,25 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import { useRef, useEffect, useState } from 'react';
-import { SearchComponentProps } from '../../utils/SearchComponentProps';
-import { TermAgg, HistogramAgg } from '../../utils/models';
-import { Box } from '@mui/material';
-import MenuItem from '@mui/material/MenuItem';
-import FormControl from '@mui/material/FormControl';
-import Select, { SelectChangeEvent } from '@mui/material/Select';
-import TextField from '@mui/material/TextField';
+import { Box } from "@mui/material";
+import FormControl from "@mui/material/FormControl";
+import MenuItem from "@mui/material/MenuItem";
+import Select, { SelectChangeEvent } from "@mui/material/Select";
+import TextField from "@mui/material/TextField";
+import { useEffect, useRef, useState } from "react";
+import { HistogramAgg, TermAgg } from "../../utils/models";
+import { SearchComponentProps } from "../../utils/SearchComponentProps";
 
 export function AggregationEditor(props: SearchComponentProps) {
   return (
@@ -34,15 +29,17 @@ export function AggregationEditor(props: SearchComponentProps) {
         onSearchRequestUpdate={props.onSearchRequestUpdate}
         runSearch={props.runSearch}
         index={props.index}
-        queryRunning={props.queryRunning} />
+        queryRunning={props.queryRunning}
+      />
       <AggregationKind
         searchRequest={props.searchRequest}
         onSearchRequestUpdate={props.onSearchRequestUpdate}
         runSearch={props.runSearch}
         index={props.index}
-        queryRunning={props.queryRunning} />
+        queryRunning={props.queryRunning}
+      />
     </Box>
-  )
+  );
 }
 
 export function MetricKind(props: SearchComponentProps) {
@@ -51,9 +48,16 @@ export function MetricKind(props: SearchComponentProps) {
 
   const handleTypeChange = (event: SelectChangeEvent) => {
     const value = event.target.value;
-    const updatedMetric = value != "count" ? {...metricRef.current!, type: value} : null;
-    const updatedAggregation = {...props.searchRequest.aggregationConfig, metric: updatedMetric};
-    const updatedSearchRequest = {...props.searchRequest, aggregationConfig: updatedAggregation};
+    const updatedMetric =
+      value !== "count" ? { ...metricRef.current!, type: value } : null;
+    const updatedAggregation = {
+      ...props.searchRequest.aggregationConfig,
+      metric: updatedMetric,
+    };
+    const updatedSearchRequest = {
+      ...props.searchRequest,
+      aggregationConfig: updatedAggregation,
+    };
     props.onSearchRequestUpdate(updatedSearchRequest);
     metricRef.current = updatedMetric;
   };
@@ -63,20 +67,26 @@ export function MetricKind(props: SearchComponentProps) {
     if (metricRef.current == null) {
       return;
     }
-    const updatedMetric = {...metricRef.current!, field: value};
-    const updatedAggregation = {...props.searchRequest.aggregationConfig, metric: updatedMetric};
-    const updatedSearchRequest = {...props.searchRequest, aggregationConfig: updatedAggregation};
+    const updatedMetric = { ...metricRef.current!, field: value };
+    const updatedAggregation = {
+      ...props.searchRequest.aggregationConfig,
+      metric: updatedMetric,
+    };
+    const updatedSearchRequest = {
+      ...props.searchRequest,
+      aggregationConfig: updatedAggregation,
+    };
     props.onSearchRequestUpdate(updatedSearchRequest);
     metricRef.current = updatedMetric;
   };
 
   return (
-    <Box sx={{ m: 1, minWidth: 120, display: 'flex', flexDirection: 'row', }}>
+    <Box sx={{ m: 1, minWidth: 120, display: "flex", flexDirection: "row" }}>
       <FormControl variant="standard">
         <Select
           value={metricRef.current ? metricRef.current.type : "count"}
           onChange={handleTypeChange}
-          sx={{ "minHeight": "44px" }}
+          sx={{ minHeight: "44px" }}
         >
           <MenuItem value="count">Count</MenuItem>
           <MenuItem value="avg">Average</MenuItem>
@@ -90,28 +100,38 @@ export function MetricKind(props: SearchComponentProps) {
           variant="standard"
           label="Field"
           onChange={handleNameChange}
-          sx={{ "marginLeft": "10px", ... ( !metricRef.current && {display: "none"}) }}
+          sx={{
+            marginLeft: "10px",
+            ...(!metricRef.current && { display: "none" }),
+          }}
         />
       </FormControl>
     </Box>
-  )
+  );
 }
 
 export function AggregationKind(props: SearchComponentProps) {
-  const defaultAgg  = {
+  const defaultAgg = {
     histogram: {
       interval: "1d",
-    }
+    },
   };
-  const [aggregations, setAggregations] = useState<({term: TermAgg} | {histogram: HistogramAgg})[]>(
-          [defaultAgg]);
+  const [aggregations, setAggregations] = useState<
+    ({ term: TermAgg } | { histogram: HistogramAgg })[]
+  >([defaultAgg]);
 
   useEffect(() => {
     // do the initial filling of parameters
     const aggregationConfig = props.searchRequest.aggregationConfig;
-    if (aggregationConfig.histogram === null && aggregationConfig.term === null) {
+    if (
+      aggregationConfig.histogram === null &&
+      aggregationConfig.term === null
+    ) {
       const initialAggregation = Object.assign({}, ...aggregations);
-      const initialSearchRequest = {...props.searchRequest, aggregationConfig: initialAggregation};
+      const initialSearchRequest = {
+        ...props.searchRequest,
+        aggregationConfig: initialAggregation,
+      };
       props.onSearchRequestUpdate(initialSearchRequest);
     }
   }, []); // Empty dependency array means this runs once after mount
@@ -119,22 +139,28 @@ export function AggregationKind(props: SearchComponentProps) {
   useEffect(() => {
     // Update search request whenever aggregations change
     const metric = props.searchRequest.aggregationConfig.metric;
-    const updatedAggregation = Object.assign({}, { metric: metric }, ...aggregations);
-    const updatedSearchRequest = { ...props.searchRequest, aggregationConfig: updatedAggregation };
+    const updatedAggregation = Object.assign(
+      {},
+      { metric: metric },
+      ...aggregations,
+    );
+    const updatedSearchRequest = {
+      ...props.searchRequest,
+      aggregationConfig: updatedAggregation,
+    };
     props.onSearchRequestUpdate(updatedSearchRequest);
   }, [aggregations]);
 
-  
   const handleAggregationChange = (pos: number, event: SelectChangeEvent) => {
     const value = event.target.value;
     setAggregations((agg) => {
       const newAggregations = [...agg];
-      switch(value) {
+      switch (value) {
         case "histogram": {
           newAggregations[pos] = {
             histogram: {
               interval: "1d",
-            }
+            },
           };
           break;
         }
@@ -143,7 +169,7 @@ export function AggregationKind(props: SearchComponentProps) {
             term: {
               field: "",
               size: 10,
-            }
+            },
           };
           break;
         }
@@ -159,16 +185,19 @@ export function AggregationKind(props: SearchComponentProps) {
     const value = event.target.value;
     setAggregations((agg) => {
       const newAggregations = [...agg];
-      newAggregations[pos] = {histogram: {interval:value}};
+      newAggregations[pos] = { histogram: { interval: value } };
       return newAggregations;
     });
-  }
+  };
 
-  const handleTermFieldChange = (pos: number, event: React.ChangeEvent<HTMLInputElement|HTMLTextAreaElement>) => {
+  const handleTermFieldChange = (
+    pos: number,
+    event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
+  ) => {
     const value = event.target.value;
     setAggregations((agg) => {
       const newAggregations = [...agg];
-      const term = newAggregations[pos]
+      const term = newAggregations[pos];
       if (isTerm(term)) {
         term.term.field = value;
       }
@@ -176,11 +205,14 @@ export function AggregationKind(props: SearchComponentProps) {
     });
   };
 
-  const handleTermCountChange = (pos: number, event: React.ChangeEvent<HTMLInputElement|HTMLTextAreaElement>) => {
+  const handleTermCountChange = (
+    pos: number,
+    event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
+  ) => {
     const value = event.target.value;
     setAggregations((agg) => {
       const newAggregations = [...agg];
-      const term = newAggregations[pos]
+      const term = newAggregations[pos];
       if (isTerm(term)) {
         term.term.size = Number(value);
       }
@@ -188,17 +220,23 @@ export function AggregationKind(props: SearchComponentProps) {
     });
   };
 
-  function isHistogram(agg: {term: TermAgg} | {histogram: HistogramAgg} | undefined): agg is {histogram: HistogramAgg} {
+  function isHistogram(
+    agg: { term: TermAgg } | { histogram: HistogramAgg } | undefined,
+  ): agg is { histogram: HistogramAgg } {
     if (!agg) return false;
     return "histogram" in agg;
   }
 
-  function isTerm(agg: {term: TermAgg} | {histogram: HistogramAgg} | undefined): agg is {term: TermAgg} {
+  function isTerm(
+    agg: { term: TermAgg } | { histogram: HistogramAgg } | undefined,
+  ): agg is { term: TermAgg } {
     if (!agg) return false;
     return "term" in agg;
   }
 
-  const getAggregationKind = (agg: {term: TermAgg} | {histogram: HistogramAgg} | undefined) => {
+  const getAggregationKind = (
+    agg: { term: TermAgg } | { histogram: HistogramAgg } | undefined,
+  ) => {
     if (isHistogram(agg)) {
       return "histogram";
     }
@@ -208,43 +246,61 @@ export function AggregationKind(props: SearchComponentProps) {
     return "new";
   };
 
-  const makeOptions = (pos: number, agg: ({term: TermAgg} | {histogram: HistogramAgg})[]) => {
+  const makeOptions = (
+    pos: number,
+    agg: ({ term: TermAgg } | { histogram: HistogramAgg })[],
+  ) => {
     const options = [];
     if (pos >= agg.length) {
-      options.push((
-          <MenuItem value="new" key="new">Add aggregation</MenuItem>
-      ))
+      options.push(
+        <MenuItem value="new" key="new">
+          Add aggregation
+        </MenuItem>,
+      );
     }
     let addHistogram = true;
     let addTerm = true;
-    for(let i = 0; i < agg.length; i++) {
-      if (i == pos) continue;
+    for (let i = 0; i < agg.length; i++) {
+      if (i === pos) continue;
       if (getAggregationKind(agg[i]) === "histogram") addHistogram = false;
       if (getAggregationKind(agg[i]) === "term") addTerm = false;
     }
     if (addHistogram) {
-      options.push((<MenuItem value="histogram" key="histogram">Histogram aggregation</MenuItem>))
+      options.push(
+        <MenuItem value="histogram" key="histogram">
+          Histogram aggregation
+        </MenuItem>,
+      );
     }
     if (addTerm) {
-      options.push((<MenuItem value="term" key="term">Term aggregation</MenuItem>));
+      options.push(
+        <MenuItem value="term" key="term">
+          Term aggregation
+        </MenuItem>,
+      );
     }
     if (agg.length > 1) {
-      options.push((
-          <MenuItem value="rm" key="rm">Remove aggregation</MenuItem>
-      ))
+      options.push(
+        <MenuItem value="rm" key="rm">
+          Remove aggregation
+        </MenuItem>,
+      );
     }
     return options;
-  }
+  };
 
-  const drawAdditional = (pos: number, aggs: ({term: TermAgg} | {histogram: HistogramAgg})[]) => {
-    const agg = aggs[pos]
+  const drawAdditional = (
+    pos: number,
+    aggs: ({ term: TermAgg } | { histogram: HistogramAgg })[],
+  ) => {
+    const agg = aggs[pos];
     if (isHistogram(agg)) {
       return (
         <FormControl variant="standard">
           <Select
             value={agg.histogram.interval}
             onChange={(e) => handleHistogramChange(pos, e)}
-            sx={{ "marginLeft": "10px", "minHeight": "44px" }}
+            sx={{ marginLeft: "10px", minHeight: "44px" }}
           >
             <MenuItem value="10s">10 seconds</MenuItem>
             <MenuItem value="1m">1 minute</MenuItem>
@@ -257,13 +313,14 @@ export function AggregationKind(props: SearchComponentProps) {
       );
     }
     if (isTerm(agg)) {
-      return (<>
+      return (
+        <>
           <FormControl variant="standard">
             <TextField
               variant="standard"
               label="Field"
               onChange={(e) => handleTermFieldChange(pos, e)}
-              sx={{ "marginLeft": "10px" }}
+              sx={{ marginLeft: "10px" }}
             />
           </FormControl>
           <FormControl variant="standard">
@@ -273,40 +330,44 @@ export function AggregationKind(props: SearchComponentProps) {
               type="number"
               onChange={(e) => handleTermCountChange(pos, e)}
               value={agg.term.size}
-              sx={{ "marginLeft": "10px" }}
+              sx={{ marginLeft: "10px" }}
             />
           </FormControl>
-        </>)
+        </>
+      );
     }
-    return (null);
-  }
+    return null;
+  };
 
   return (
     <>
-      <Box sx={{ m: 1, minWidth: 120, display: 'flex', flexDirection: 'row', }}>
+      <Box sx={{ m: 1, minWidth: 120, display: "flex", flexDirection: "row" }}>
         <FormControl variant="standard">
           <Select
             value={getAggregationKind(aggregations[0])}
             onChange={(e) => handleAggregationChange(0, e)}
-            sx={{ "minHeight": "44px", width: "190px" }}
+            sx={{ minHeight: "44px", width: "190px" }}
           >
-            { makeOptions(0, aggregations) }
+            {makeOptions(0, aggregations)}
           </Select>
         </FormControl>
         {drawAdditional(0, aggregations)}
       </Box>
-      <Box sx={{ m: 1, minWidth: 120, display: 'flex', flexDirection: 'row', }}>
-        <FormControl variant="standard" sx={{ m: 1, minWidth: 120, display: 'flex', flexDirection: 'row', }}>
+      <Box sx={{ m: 1, minWidth: 120, display: "flex", flexDirection: "row" }}>
+        <FormControl
+          variant="standard"
+          sx={{ m: 1, minWidth: 120, display: "flex", flexDirection: "row" }}
+        >
           <Select
             value={getAggregationKind(aggregations[1])}
             onChange={(e) => handleAggregationChange(1, e)}
-            sx={{ "minHeight": "44px", width: "190px" }}
+            sx={{ minHeight: "44px", width: "190px" }}
           >
-            { makeOptions(1, aggregations) }
+            {makeOptions(1, aggregations)}
           </Select>
           {drawAdditional(1, aggregations)}
         </FormControl>
       </Box>
     </>
-  )
+  );
 }

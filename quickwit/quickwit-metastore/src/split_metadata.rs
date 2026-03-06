@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -27,7 +22,7 @@ use std::time::Duration;
 use bytesize::ByteSize;
 use quickwit_proto::types::{DocMappingUid, IndexUid, SourceId, SplitId};
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DurationMilliSeconds};
+use serde_with::{DurationMilliSeconds, serde_as};
 use time::OffsetDateTime;
 
 use crate::split_metadata_version::VersionedSplitMetadata;
@@ -170,7 +165,7 @@ impl fmt::Debug for SplitMetadata {
             }
             if tags_iter.next().is_some() {
                 let remaining_count = self.tags.len() - 4;
-                tags_str.push_str(&format!("and {} more", remaining_count));
+                tags_str.push_str(&format!("and {remaining_count} more"));
             } else {
                 tags_str.pop();
                 tags_str.pop();
@@ -344,7 +339,7 @@ impl FromStr for SplitState {
 /// or `Immature` with a given maturation period.
 /// The maturity is determined by the `MergePolicy`.
 #[serde_as]
-#[derive(Clone, Copy, Debug, Default, Eq, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Serialize, Deserialize, PartialEq, PartialOrd, Ord)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum SplitMaturity {
@@ -437,6 +432,23 @@ mod tests {
                                \"{\\\"🐱\\\", \\\"😻\\\", \\\"😼\\\", \\\"😿\\\", and 1 more}\", \
                                footer_offsets: 0..1024, delete_opstamp: 0, num_merge_ops: 0 }";
 
-        assert_eq!(format!("{:?}", split_metadata), expected_output);
+        assert_eq!(format!("{split_metadata:?}"), expected_output);
+    }
+
+    #[test]
+    fn test_spit_maturity_order() {
+        assert!(
+            SplitMaturity::Mature
+                < SplitMaturity::Immature {
+                    maturation_period: Duration::from_secs(0)
+                }
+        );
+        assert!(
+            SplitMaturity::Immature {
+                maturation_period: Duration::from_secs(0)
+            } < SplitMaturity::Immature {
+                maturation_period: Duration::from_secs(1)
+            }
+        );
     }
 }

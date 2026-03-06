@@ -1,34 +1,30 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use quickwit_actors::{
-    Actor, ActorContext, ActorExitStatus, ActorHandle, Handler, Health, Inbox, Mailbox,
-    SpawnContext, Supervisable, HEARTBEAT,
+    Actor, ActorContext, ActorExitStatus, ActorHandle, HEARTBEAT, Handler, Health, Inbox, Mailbox,
+    SpawnContext, Supervisable,
 };
+use quickwit_common::KillSwitch;
 use quickwit_common::io::{IoControls, Limiter};
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::temp_dir::TempDirectory;
-use quickwit_common::KillSwitch;
+use quickwit_config::RetentionPolicy;
 use quickwit_doc_mapper::DocMapper;
 use quickwit_metastore::{
     ListSplitsQuery, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitMetadata,
@@ -42,7 +38,8 @@ use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, instrument};
 
-use super::MergeSchedulerService;
+use super::publisher::DisconnectMergePlanner;
+use super::{MergeSchedulerService, RunFinalizeMergePolicyAndQuit};
 use crate::actors::indexing_pipeline::wait_duration_before_retry;
 use crate::actors::merge_split_downloader::MergeSplitDownloader;
 use crate::actors::publisher::PublisherType;
@@ -55,6 +52,24 @@ use crate::split_store::IndexingSplitStore;
 /// we rely on this semaphore to limit the number of merge pipelines that can be spawned
 /// concurrently.
 static SPAWN_PIPELINE_SEMAPHORE: Semaphore = Semaphore::const_new(10);
+
+/// Instructs the merge pipeline that it should stop itself.
+/// Merges that have already been scheduled are not aborted.
+///
+/// In addition, the finalizer merge policy will be executed to schedule a few
+/// additional merges.
+///
+/// After reception the `FinalizeAndClosePipeline`, the merge pipeline loop will
+/// be disconnected. In other words, the connection from the merge publisher to
+/// the merge planner will be cut, so that the merge pipeline will terminate naturally.
+///
+/// Supervisation will still exist. However it will not restart the pipeline
+/// in case of failure, it will just kill all of the merge pipeline actors. (for
+/// instance, if one of the actor is stuck).
+#[derive(Debug, Clone, Copy)]
+pub struct FinishPendingMergesAndShutdownPipeline;
+
+pub const SUPERVISE_LOOP_INTERVAL: Duration = Duration::from_secs(1);
 
 struct MergePipelineHandles {
     merge_planner: ActorHandle<MergePlanner>,
@@ -96,6 +111,8 @@ pub struct MergePipeline {
     kill_switch: KillSwitch,
     /// Immature splits passed to the merge planner the first time the pipeline is spawned.
     initial_immature_splits_opt: Option<Vec<SplitMetadata>>,
+    // After it is set to true, we don't respawn pipeline actors if they fail.
+    shutdown_initiated: bool,
 }
 
 #[async_trait]
@@ -141,6 +158,7 @@ impl MergePipeline {
             merge_planner_inbox,
             merge_planner_mailbox,
             initial_immature_splits_opt,
+            shutdown_initiated: false,
         }
     }
 
@@ -251,7 +269,7 @@ impl MergePipeline {
             Some(self.merge_planner_mailbox.clone()),
             None,
         );
-        let (merge_publisher_mailbox, merge_publisher_handler) = ctx
+        let (merge_publisher_mailbox, merge_publisher_handle) = ctx
             .spawn_actor()
             .set_kill_switch(self.kill_switch.clone())
             .set_backpressure_micros_counter(
@@ -266,12 +284,13 @@ impl MergePipeline {
             UploaderType::MergeUploader,
             self.params.metastore.clone(),
             self.params.merge_policy.clone(),
+            self.params.retention_policy.clone(),
             self.params.split_store.clone(),
             merge_publisher_mailbox.into(),
             self.params.max_concurrent_split_uploads,
             self.params.event_broker.clone(),
         );
-        let (merge_uploader_mailbox, merge_uploader_handler) = ctx
+        let (merge_uploader_mailbox, merge_uploader_handle) = ctx
             .spawn_actor()
             .set_kill_switch(self.kill_switch.clone())
             .spawn(merge_uploader);
@@ -279,7 +298,7 @@ impl MergePipeline {
         // Merge Packager
         let tag_fields = self.params.doc_mapper.tag_named_fields()?;
         let merge_packager = Packager::new("MergePackager", tag_fields, merge_uploader_mailbox);
-        let (merge_packager_mailbox, merge_packager_handler) = ctx
+        let (merge_packager_mailbox, merge_packager_handle) = ctx
             .spawn_actor()
             .set_kill_switch(self.kill_switch.clone())
             .spawn(merge_packager);
@@ -300,7 +319,7 @@ impl MergePipeline {
             merge_executor_io_controls,
             merge_packager_mailbox,
         );
-        let (merge_executor_mailbox, merge_executor_handler) = ctx
+        let (merge_executor_mailbox, merge_executor_handle) = ctx
             .spawn_actor()
             .set_kill_switch(self.kill_switch.clone())
             .set_backpressure_micros_counter(
@@ -316,7 +335,7 @@ impl MergePipeline {
             executor_mailbox: merge_executor_mailbox,
             io_controls: split_downloader_io_controls,
         };
-        let (merge_split_downloader_mailbox, merge_split_downloader_handler) = ctx
+        let (merge_split_downloader_mailbox, merge_split_downloader_handle) = ctx
             .spawn_actor()
             .set_kill_switch(self.kill_switch.clone())
             .set_backpressure_micros_counter(
@@ -334,7 +353,7 @@ impl MergePipeline {
             merge_split_downloader_mailbox,
             self.params.merge_scheduler_service.clone(),
         );
-        let (_, merge_planner_handler) = ctx
+        let (_, merge_planner_handle) = ctx
             .spawn_actor()
             .set_kill_switch(self.kill_switch.clone())
             .set_mailboxes(
@@ -346,12 +365,12 @@ impl MergePipeline {
         self.previous_generations_statistics = self.statistics.clone();
         self.statistics.generation += 1;
         self.handles_opt = Some(MergePipelineHandles {
-            merge_planner: merge_planner_handler,
-            merge_split_downloader: merge_split_downloader_handler,
-            merge_executor: merge_executor_handler,
-            merge_packager: merge_packager_handler,
-            merge_uploader: merge_uploader_handler,
-            merge_publisher: merge_publisher_handler,
+            merge_planner: merge_planner_handle,
+            merge_split_downloader: merge_split_downloader_handle,
+            merge_executor: merge_executor_handle,
+            merge_packager: merge_packager_handle,
+            merge_uploader: merge_uploader_handle,
+            merge_publisher: merge_publisher_handle,
             next_check_for_progress: Instant::now() + *HEARTBEAT,
         });
         Ok(())
@@ -359,14 +378,14 @@ impl MergePipeline {
 
     async fn terminate(&mut self) {
         self.kill_switch.kill();
-        if let Some(handlers) = self.handles_opt.take() {
+        if let Some(handles) = self.handles_opt.take() {
             tokio::join!(
-                handlers.merge_planner.kill(),
-                handlers.merge_split_downloader.kill(),
-                handlers.merge_executor.kill(),
-                handlers.merge_packager.kill(),
-                handlers.merge_uploader.kill(),
-                handlers.merge_publisher.kill(),
+                handles.merge_planner.kill(),
+                handles.merge_split_downloader.kill(),
+                handles.merge_executor.kill(),
+                handles.merge_packager.kill(),
+                handles.merge_uploader.kill(),
+                handles.merge_publisher.kill(),
             );
         }
     }
@@ -412,6 +431,7 @@ impl MergePipeline {
                 ctx.schedule_self_msg(*quickwit_actors::HEARTBEAT, Spawn { retry_count: 0 });
             }
             Health::Success => {
+                info!(index_uid=%self.params.pipeline_id.index_uid, "merge pipeline success, shutting down");
                 return Err(ActorExitStatus::Success);
             }
         }
@@ -462,7 +482,46 @@ impl Handler<SuperviseLoop> for MergePipeline {
     ) -> Result<(), ActorExitStatus> {
         self.perform_observe().await;
         self.perform_health_check(ctx).await?;
-        ctx.schedule_self_msg(Duration::from_secs(1), supervise_loop_token);
+        ctx.schedule_self_msg(SUPERVISE_LOOP_INTERVAL, supervise_loop_token);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<FinishPendingMergesAndShutdownPipeline> for MergePipeline {
+    type Reply = ();
+    async fn handle(
+        &mut self,
+        _: FinishPendingMergesAndShutdownPipeline,
+        _ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        info!(index_uid=%self.params.pipeline_id.index_uid, "shutdown merge pipeline initiated");
+        // From now on, we will not respawn the pipeline if it fails.
+        self.shutdown_initiated = true;
+        if let Some(handles) = &self.handles_opt {
+            // This disconnects the merge planner from the merge publisher,
+            // breaking the merge planner pipeline loop.
+            //
+            // As a result, the pipeline will naturally terminate
+            // once all of the pending / ongoing merge operations are completed.
+            let _ = handles
+                .merge_publisher
+                .mailbox()
+                .send_message(DisconnectMergePlanner)
+                .await;
+
+            // We also initiate the merge planner finalization routine.
+            // Depending on the merge policy, it may emit a few more merge
+            // operations.
+            let _ = handles
+                .merge_planner
+                .mailbox()
+                .send_message(RunFinalizeMergePolicyAndQuit)
+                .await;
+        } else {
+            // we won't respawn the pipeline in the future, so there is nothing
+            // to do here.
+        }
         Ok(())
     }
 }
@@ -476,6 +535,9 @@ impl Handler<Spawn> for MergePipeline {
         spawn: Spawn,
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
+        if self.shutdown_initiated {
+            return Ok(());
+        }
         if self.handles_opt.is_some() {
             return Ok(());
         }
@@ -503,12 +565,13 @@ impl Handler<Spawn> for MergePipeline {
 #[derive(Clone)]
 pub struct MergePipelineParams {
     pub pipeline_id: MergePipelineId,
-    pub doc_mapper: Arc<dyn DocMapper>,
+    pub doc_mapper: Arc<DocMapper>,
     pub indexing_directory: TempDirectory,
     pub metastore: MetastoreServiceClient,
     pub merge_scheduler_service: Mailbox<MergeSchedulerService>,
     pub split_store: IndexingSplitStore,
     pub merge_policy: Arc<dyn MergePolicy>,
+    pub retention_policy: Option<RetentionPolicy>,
     pub max_concurrent_split_uploads: usize, //< TODO share with the indexing pipeline.
     pub merge_io_throughput_limiter_opt: Option<Limiter>,
     pub event_broker: EventBroker,
@@ -520,8 +583,8 @@ mod tests {
     use std::sync::Arc;
 
     use quickwit_actors::{ActorExitStatus, Universe};
-    use quickwit_common::temp_dir::TempDirectory;
     use quickwit_common::ServiceStream;
+    use quickwit_common::temp_dir::TempDirectory;
     use quickwit_doc_mapper::default_doc_mapper_for_test;
     use quickwit_metastore::ListSplitsRequestExt;
     use quickwit_proto::indexing::MergePipelineId;
@@ -529,9 +592,10 @@ mod tests {
     use quickwit_proto::types::{IndexUid, NodeId};
     use quickwit_storage::RamStorage;
 
-    use crate::actors::merge_pipeline::{MergePipeline, MergePipelineParams};
-    use crate::merge_policy::default_merge_policy;
     use crate::IndexingSplitStore;
+    use crate::actors::merge_pipeline::{MergePipeline, MergePipelineParams};
+    use crate::actors::{MergePlanner, Publisher};
+    use crate::merge_policy::default_merge_policy;
 
     #[tokio::test]
     async fn test_merge_pipeline_simple() -> anyhow::Result<()> {
@@ -549,7 +613,7 @@ mod tests {
             .times(1)
             .withf(move |list_splits_request| {
                 let list_split_query = list_splits_request.deserialize_list_splits_query().unwrap();
-                assert_eq!(list_split_query.index_uids, &[index_uid.clone()]);
+                assert_eq!(list_split_query.index_uids, Some(vec![index_uid.clone()]));
                 assert_eq!(
                     list_split_query.split_states,
                     vec![quickwit_metastore::SplitState::Published]
@@ -571,17 +635,30 @@ mod tests {
             merge_scheduler_service: universe.get_or_spawn_one(),
             split_store,
             merge_policy: default_merge_policy(),
+            retention_policy: None,
             max_concurrent_split_uploads: 2,
             merge_io_throughput_limiter_opt: None,
             event_broker: Default::default(),
         };
         let pipeline = MergePipeline::new(pipeline_params, None, universe.spawn_ctx());
-        let (_pipeline_mailbox, pipeline_handler) = universe.spawn_builder().spawn(pipeline);
-        let (pipeline_exit_status, pipeline_statistics) = pipeline_handler.quit().await;
+        let _merge_planner_mailbox = pipeline.merge_planner_mailbox().clone();
+        let (pipeline_mailbox, pipeline_handle) = universe.spawn_builder().spawn(pipeline);
+        pipeline_mailbox
+            .ask(super::FinishPendingMergesAndShutdownPipeline)
+            .await
+            .unwrap();
+
+        let (pipeline_exit_status, pipeline_statistics) = pipeline_handle.join().await;
         assert_eq!(pipeline_statistics.generation, 1);
         assert_eq!(pipeline_statistics.num_spawn_attempts, 1);
         assert_eq!(pipeline_statistics.num_published_splits, 0);
-        assert!(matches!(pipeline_exit_status, ActorExitStatus::Quit));
+        assert!(matches!(pipeline_exit_status, ActorExitStatus::Success));
+
+        // Checking that the merge pipeline actors have been properly cleaned up.
+        assert!(universe.get_one::<MergePlanner>().is_none());
+        assert!(universe.get_one::<Publisher>().is_none());
+        assert!(universe.get_one::<MergePipeline>().is_none());
+
         universe.assert_quit().await;
         Ok(())
     }

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -27,16 +22,16 @@ use std::{fmt, io};
 use async_trait::async_trait;
 use azure_core::error::ErrorKind;
 use azure_core::{Pageable, StatusCode};
-use azure_storage::prelude::*;
 use azure_storage::Error as AzureError;
+use azure_storage::prelude::*;
 use azure_storage_blobs::blob::operations::GetBlobResponse;
 use azure_storage_blobs::prelude::*;
 use bytes::Bytes;
-use futures::io::{Error as FutureError, ErrorKind as FutureErrorKind};
+use futures::io::Error as FutureError;
 use futures::stream::{StreamExt, TryStreamExt};
 use md5::Digest;
 use once_cell::sync::OnceCell;
-use quickwit_common::retry::{retry, RetryParams, Retryable};
+use quickwit_common::retry::{RetryParams, Retryable, retry};
 use quickwit_common::uri::Uri;
 use quickwit_common::{chunk_range, ignore_error_kind, into_u64_range};
 use quickwit_config::{AzureStorageConfig, StorageBackend};
@@ -49,10 +44,11 @@ use tokio_util::io::StreamReader;
 use tracing::{instrument, warn};
 
 use crate::debouncer::DebouncedStorage;
+use crate::metrics::object_storage_get_slice_in_flight_guards;
 use crate::storage::SendableAsync;
 use crate::{
-    BulkDeleteError, DeleteFailure, MultiPartPolicy, PutPayload, Storage, StorageError,
-    StorageErrorKind, StorageFactory, StorageResolverError, StorageResult, STORAGE_METRICS,
+    BulkDeleteError, DeleteFailure, MultiPartPolicy, PutPayload, STORAGE_METRICS, Storage,
+    StorageError, StorageErrorKind, StorageFactory, StorageResolverError, StorageResult,
 };
 
 /// Azure object storage resolver.
@@ -99,15 +95,27 @@ impl fmt::Debug for AzureBlobStorage {
 
 impl AzureBlobStorage {
     /// Creates a new [`AzureBlobStorage`] instance.
-    pub fn new(account: String, access_key: String, uri: Uri, container_name: String) -> Self {
-        let storage_credentials = StorageCredentials::access_key(account.clone(), access_key);
-        let container_client =
-            BlobServiceClient::new(account, storage_credentials).container_client(container_name);
+    pub fn new(
+        storage_account_name: String,
+        storage_credentials: StorageCredentials,
+        uri: Uri,
+        container_name: String,
+    ) -> Self {
+        let container_client = BlobServiceClient::new(storage_account_name, storage_credentials)
+            .container_client(container_name);
         Self {
             container_client,
             uri,
             prefix: PathBuf::new(),
-            multipart_policy: MultiPartPolicy::default(),
+            multipart_policy: MultiPartPolicy {
+                // Azure max part size is 100MB
+                // https://azure.microsoft.com/en-us/blog/general-availability-larger-block-blobs-in-azure-storage/
+                target_part_num_bytes: 100_000_000,
+                multipart_threshold_num_bytes: 100_000_000,
+                max_num_parts: 50_000, // Azure allows up to 50,000 blocks
+                max_object_num_bytes: 4_770_000_000_000u64, // Azure allows up to 4.77TB objects
+                max_concurrent_uploads: 100,
+            },
             retry_params: RetryParams::aggressive(),
         }
     }
@@ -145,6 +153,7 @@ impl AzureBlobStorage {
     /// Sets the multipart policy.
     ///
     /// See `MultiPartPolicy`.
+    #[cfg(feature = "integration-testsuite")]
     pub fn set_policy(&mut self, multipart_policy: MultiPartPolicy) {
         self.multipart_policy = multipart_policy;
     }
@@ -154,26 +163,38 @@ impl AzureBlobStorage {
         azure_storage_config: &AzureStorageConfig,
         uri: &Uri,
     ) -> Result<AzureBlobStorage, StorageResolverError> {
-        let account_name = azure_storage_config.resolve_account_name().ok_or_else(|| {
-            let message = format!(
-                "could not find Azure account name in environment variable `{}` or storage config",
-                AzureStorageConfig::AZURE_STORAGE_ACCOUNT_ENV_VAR
-            );
-            StorageResolverError::InvalidConfig(message)
-        })?;
-        let access_key = azure_storage_config.resolve_access_key().ok_or_else(|| {
-            let message = format!(
-                "could not find Azure access key in environment variable `{}` or storage config",
-                AzureStorageConfig::AZURE_STORAGE_ACCESS_KEY_ENV_VAR
-            );
-            StorageResolverError::InvalidConfig(message)
-        })?;
+        let storage_account_name =
+            azure_storage_config.resolve_account_name().ok_or_else(|| {
+                let message = format!(
+                    "could not find Azure storage account name in environment variable `{}` or \
+                     storage config",
+                    AzureStorageConfig::AZURE_STORAGE_ACCOUNT_ENV_VAR
+                );
+                StorageResolverError::InvalidConfig(message)
+            })?;
+        let storage_credentials = if let Some(access_key) =
+            azure_storage_config.resolve_access_key()
+        {
+            StorageCredentials::access_key(storage_account_name.clone(), access_key)
+        } else if let Ok(credential) = azure_identity::create_credential() {
+            StorageCredentials::token_credential(credential)
+        } else {
+            return Err(StorageResolverError::InvalidConfig(
+                "could not find Azure storage account credentials using the following credential \
+                 providers: environment, managed identity, and storage account access key"
+                    .to_string(),
+            ));
+        };
         let (container_name, prefix) = parse_azure_uri(uri).ok_or_else(|| {
             let message = format!("failed to extract container name from Azure URI `{uri}`");
             StorageResolverError::InvalidUri(message)
         })?;
-        let azure_blob_storage =
-            AzureBlobStorage::new(account_name, access_key, uri.clone(), container_name);
+        let azure_blob_storage = AzureBlobStorage::new(
+            storage_account_name,
+            storage_credentials,
+            uri.clone(),
+            container_name,
+        );
         Ok(azure_blob_storage.with_prefix(prefix))
     }
 
@@ -191,18 +212,21 @@ impl AzureBlobStorage {
     ) -> StorageResult<Vec<u8>> {
         let name = self.blob_name(path);
         let capacity = range_opt.as_ref().map(Range::len).unwrap_or(0);
-
         retry(&self.retry_params, || async {
-            let mut response_stream = if let Some(range) = range_opt.as_ref() {
-                self.container_client
+            let (mut response_stream, _in_flight_guards) = if let Some(range) = range_opt.as_ref() {
+                let stream = self
+                    .container_client
                     .blob_client(&name)
                     .get()
                     .range(range.clone())
-                    .into_stream()
+                    .into_stream();
+                // only record ranged get request as being in flight
+                let in_flight_guards = object_storage_get_slice_in_flight_guards(capacity);
+                (stream, Some(in_flight_guards))
             } else {
-                self.container_client.blob_client(&name).get().into_stream()
+                let stream = self.container_client.blob_client(&name).get().into_stream();
+                (stream, None)
             };
-
             let mut buf: Vec<u8> = Vec::with_capacity(capacity);
             download_all(&mut response_stream, &mut buf).await?;
 
@@ -250,7 +274,7 @@ impl AzureBlobStorage {
             chunk_range(0..total_len as usize, part_len as usize).map(into_u64_range);
 
         let blob_client = self.container_client.blob_client(name);
-        let mut upload_blocks_stream_result = tokio_stream::iter(multipart_ranges.enumerate())
+        let upload_blocks_stream = tokio_stream::iter(multipart_ranges.enumerate())
             .map(|(num, range)| {
                 let moved_blob_client = blob_client.clone();
                 let moved_payload = payload.clone();
@@ -260,7 +284,8 @@ impl AzureBlobStorage {
                     .inc_by(range.end - range.start);
                 async move {
                     retry(&self.retry_params, || async {
-                        let block_id = format!("block:{num}");
+                        // zero pad block ids to make them sortable as strings
+                        let block_id = format!("block:{:05}", num);
                         let (data, hash_digest) =
                             extract_range_data_and_hash(moved_payload.box_clone(), range.clone())
                                 .await?;
@@ -277,16 +302,22 @@ impl AzureBlobStorage {
             })
             .buffer_unordered(self.multipart_policy.max_concurrent_uploads());
 
-        // Concurrently upload block with limit.
-        let mut block_list = BlockList::default();
-        while let Some(put_block_result) = upload_blocks_stream_result.next().await {
-            match put_block_result {
-                Ok(block_id) => block_list
-                    .blocks
-                    .push(BlobBlockType::new_uncommitted(block_id)),
-                Err(error) => return Err(error.into()),
-            }
-        }
+        // Collect and sort block ids to preserve part order for put_block_list.
+        // Azure docs: "The put block list operation enforces the order in which blocks
+        // are to be combined to create a blob".
+        // https://docs.microsoft.com/en-us/rest/api/storageservices/put-block-list
+        let mut block_ids: Vec<String> = upload_blocks_stream
+            .try_collect()
+            .await
+            .map_err(StorageError::from)?;
+        block_ids.sort_unstable();
+
+        let block_list = BlockList {
+            blocks: block_ids
+                .into_iter()
+                .map(BlobBlockType::new_uncommitted)
+                .collect(),
+        };
 
         // Commit all uploaded blocks.
         blob_client
@@ -342,7 +373,7 @@ impl Storage for AzureBlobStorage {
             let chunk_response = chunk_result.map_err(AzureErrorWrapper::from)?;
             let chunk_response_body_stream = chunk_response
                 .data
-                .map_err(|err| FutureError::new(FutureErrorKind::Other, err))
+                .map_err(FutureError::other)
                 .into_async_read()
                 .compat();
             let mut body_stream_reader = BufReader::new(chunk_response_body_stream);
@@ -441,13 +472,9 @@ impl Storage for AzureBlobStorage {
                 .range(range)
                 .into_stream();
             let mut bytes_stream = page_stream
-                .map(|page_res| {
-                    page_res
-                        .map(|page| page.data)
-                        .map_err(|err| FutureError::new(FutureErrorKind::Other, err))
-                })
+                .map(|page_res| page_res.map(|page| page.data).map_err(FutureError::other))
                 .try_flatten()
-                .map(|e| e.map_err(|err| FutureError::new(FutureErrorKind::Other, err)));
+                .map(|bytes_res| bytes_res.map_err(FutureError::other));
             // Peek into the stream so that any early error can be retried
             let first_chunk = bytes_stream.next().await;
             let reader: Box<dyn AsyncRead + Send + Unpin> = if let Some(res) = first_chunk {
@@ -545,7 +572,7 @@ async fn download_all(
         let chunk_response = chunk_result?;
         let chunk_response_body_stream = chunk_response
             .data
-            .map_err(|err| FutureError::new(FutureErrorKind::Other, err))
+            .map_err(FutureError::other)
             .into_async_read()
             .compat();
         let mut body_stream_reader = BufReader::new(chunk_response_body_stream);

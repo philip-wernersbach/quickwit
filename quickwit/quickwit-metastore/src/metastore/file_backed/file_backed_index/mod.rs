@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! [`FileBackedIndex`] module. It is public so that the crate `quickwit-backward-compat` can
 //! import [`FileBackedIndex`] and run backward-compatibility tests. You should not have to import
@@ -31,12 +26,13 @@ use std::ops::Bound;
 use itertools::Itertools;
 use quickwit_common::pretty::PrettySample;
 use quickwit_config::{
-    DocMapping, IndexingSettings, RetentionPolicy, SearchSettings, SourceConfig,
+    DocMapping, IndexingSettings, IngestSettings, RetentionPolicy, SearchSettings, SourceConfig,
 };
 use quickwit_proto::metastore::{
     AcquireShardsRequest, AcquireShardsResponse, DeleteQuery, DeleteShardsRequest,
-    DeleteShardsResponse, DeleteTask, EntityKind, ListShardsSubrequest, ListShardsSubresponse,
-    MetastoreError, MetastoreResult, OpenShardSubrequest, OpenShardSubresponse,
+    DeleteShardsResponse, DeleteTask, EntityKind, IndexStats, ListShardsSubrequest,
+    ListShardsSubresponse, MetastoreError, MetastoreResult, OpenShardSubrequest,
+    OpenShardSubresponse, PruneShardsRequest, SplitStats,
 };
 use quickwit_proto::types::{IndexUid, PublishToken, SourceId, SplitId};
 use serde::{Deserialize, Serialize};
@@ -47,8 +43,8 @@ use tracing::{info, warn};
 
 use super::MutationOccurred;
 use crate::checkpoint::IndexCheckpointDelta;
-use crate::metastore::use_shard_api;
-use crate::{split_tag_filter, IndexMetadata, ListSplitsQuery, Split, SplitMetadata, SplitState};
+use crate::metastore::{SortBy, use_shard_api};
+use crate::{IndexMetadata, ListSplitsQuery, Split, SplitMetadata, SplitState, split_tag_filter};
 
 /// A `FileBackedIndex` object carries an index metadata and its split metadata.
 // This struct is meant to be used only within the [`FileBackedMetastore`]. The public visibility is
@@ -219,24 +215,21 @@ impl FileBackedIndex {
         &self.metadata
     }
 
-    /// Replaces the retention policy in the index config, returning whether a mutation occurred.
-    pub fn set_retention_policy(&mut self, retention_policy_opt: Option<RetentionPolicy>) -> bool {
-        self.metadata.set_retention_policy(retention_policy_opt)
-    }
-
-    /// Replaces the search settings in the index config, returning whether a mutation occurred.
-    pub fn set_search_settings(&mut self, search_settings: SearchSettings) -> bool {
-        self.metadata.set_search_settings(search_settings)
-    }
-
-    /// Replaces the indexing settings in the index config, returning whether a mutation occurred.
-    pub fn set_indexing_settings(&mut self, search_settings: IndexingSettings) -> bool {
-        self.metadata.set_indexing_settings(search_settings)
-    }
-
-    /// Replaces the doc mapping in the index config, returning whether a mutation occurred.
-    pub fn set_doc_mapping(&mut self, doc_mapping: DocMapping) -> bool {
-        self.metadata.set_doc_mapping(doc_mapping)
+    pub fn update_index_config(
+        &mut self,
+        doc_mapping: DocMapping,
+        indexing_settings: IndexingSettings,
+        ingest_settings: IngestSettings,
+        search_settings: SearchSettings,
+        retention_policy_opt: Option<RetentionPolicy>,
+    ) -> MetastoreResult<bool> {
+        self.metadata.update_index_config(
+            doc_mapping,
+            indexing_settings,
+            ingest_settings,
+            search_settings,
+            retention_policy_opt,
+        )
     }
 
     /// Stages a single split.
@@ -254,14 +247,14 @@ impl FileBackedIndex {
         // Check whether the split exists.
         // If the split exists, we check what state it is in. If it's anything other than `Staged`
         // something has gone very wrong and we should abort the operation.
-        if let Some(split) = self.splits.get(split_metadata.split_id()) {
-            if split.split_state != SplitState::Staged {
-                let entity = EntityKind::Split {
-                    split_id: split.split_id().to_string(),
-                };
-                let message = "split is not staged".to_string();
-                return Err(MetastoreError::FailedPrecondition { entity, message });
-            }
+        if let Some(split) = self.splits.get(split_metadata.split_id())
+            && split.split_state != SplitState::Staged
+        {
+            let entity = EntityKind::Split {
+                split_id: split.split_id().to_string(),
+            };
+            let message = "split is not staged".to_string();
+            return Err(MetastoreError::FailedPrecondition { entity, message });
         }
         let now_timestamp = OffsetDateTime::now_utc().unix_timestamp();
         let split = Split {
@@ -424,25 +417,19 @@ impl FileBackedIndex {
 
     /// Lists splits.
     pub(crate) fn list_splits(&self, query: &ListSplitsQuery) -> MetastoreResult<Vec<Split>> {
-        let limit = query.limit.unwrap_or(usize::MAX);
-        let offset = query.offset.unwrap_or_default();
+        let limit = query
+            .limit
+            .map(|limit| limit + query.offset.unwrap_or_default())
+            .unwrap_or(usize::MAX);
+        // skip is done at a higher layer in case other indexes give spltis that would go before
+        // ours
 
-        let splits: Vec<Split> = if query.sort_by_staleness {
+        let results = if query.sort_by == SortBy::None {
+            // internally sorted_unstable_by collect everything to an intermediary vec. When not
+            // sorting at all, skip that.
             self.splits
                 .values()
                 .filter(|split| split_query_predicate(split, query))
-                .sorted_unstable_by(|left_split, right_split| {
-                    left_split
-                        .split_metadata
-                        .delete_opstamp
-                        .cmp(&right_split.split_metadata.delete_opstamp)
-                        .then_with(|| {
-                            left_split
-                                .publish_timestamp
-                                .cmp(&right_split.publish_timestamp)
-                        })
-                })
-                .skip(offset)
                 .take(limit)
                 .cloned()
                 .collect()
@@ -450,12 +437,12 @@ impl FileBackedIndex {
             self.splits
                 .values()
                 .filter(|split| split_query_predicate(split, query))
-                .skip(offset)
+                .sorted_unstable_by(|lhs, rhs| query.sort_by.compare(lhs, rhs))
                 .take(limit)
                 .cloned()
                 .collect()
         };
-        Ok(splits)
+        Ok(results)
     }
 
     /// Deletes a split.
@@ -511,6 +498,34 @@ impl FileBackedIndex {
         Ok(())
     }
 
+    /// Gets IndexStats for this index
+    pub(crate) fn get_stats(&self) -> MetastoreResult<IndexStats> {
+        let mut staged_stats = SplitStats::default();
+        let mut published_stats = SplitStats::default();
+        let mut marked_for_deletion_stats = SplitStats::default();
+
+        for split in self.splits.values() {
+            match split.split_state {
+                SplitState::Staged => {
+                    staged_stats.add_split(split.split_metadata.footer_offsets.end)
+                }
+                SplitState::Published => {
+                    published_stats.add_split(split.split_metadata.footer_offsets.end)
+                }
+                SplitState::MarkedForDeletion => {
+                    marked_for_deletion_stats.add_split(split.split_metadata.footer_offsets.end)
+                }
+            }
+        }
+
+        Ok(IndexStats {
+            index_uid: Some(self.index_uid().clone()),
+            staged: Some(staged_stats),
+            published: Some(published_stats),
+            marked_for_deletion: Some(marked_for_deletion_stats),
+        })
+    }
+
     /// Adds a source.
     pub(crate) fn add_source(&mut self, source_config: SourceConfig) -> MetastoreResult<()> {
         let index_uid = self.index_uid().clone();
@@ -521,6 +536,11 @@ impl FileBackedIndex {
         let shards = Shards::empty(index_uid, source_id.clone());
         self.per_source_shards.insert(source_id, shards);
         Ok(())
+    }
+
+    /// Updates a source. Returns whether a mutation occurred.
+    pub(crate) fn update_source(&mut self, source_config: SourceConfig) -> MetastoreResult<bool> {
+        self.metadata.update_source(source_config)
     }
 
     /// Enables or disables a source. Returns whether a mutation occurred.
@@ -653,6 +673,14 @@ impl FileBackedIndex {
             .delete_shards(request)
     }
 
+    pub(crate) fn prune_shards(
+        &mut self,
+        request: PruneShardsRequest,
+    ) -> MetastoreResult<MutationOccurred<()>> {
+        self.get_shards_for_source_mut(&request.source_id)?
+            .prune_shards(request)
+    }
+
     pub(crate) fn list_shards(
         &self,
         subrequest: ListShardsSubrequest,
@@ -736,10 +764,26 @@ fn split_query_predicate(split: &&Split, query: &ListSplitsQuery) -> bool {
         if !query.time_range.overlaps_with(range.clone()) {
             return false;
         }
+        if let Some(v) = query.max_time_range_end
+            && range.end() > &v
+        {
+            return false;
+        }
     }
 
-    if let Some(node_id) = &query.node_id {
-        if split.split_metadata.node_id != *node_id {
+    if let Some(node_id) = &query.node_id
+        && split.split_metadata.node_id != *node_id
+    {
+        return false;
+    }
+
+    if let Some((index_uid, split_id)) = &query.after_split {
+        if *index_uid > split.split_metadata.index_uid {
+            return false;
+        }
+        if *index_uid == split.split_metadata.index_uid
+            && *split_id >= split.split_metadata.split_id
+        {
             return false;
         }
     }
@@ -749,16 +793,16 @@ fn split_query_predicate(split: &&Split, query: &ListSplitsQuery) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
 
     use quickwit_doc_mapper::tag_pruning::TagFilterAst;
     use quickwit_proto::ingest::Shard;
-    use quickwit_proto::metastore::ListShardsSubrequest;
+    use quickwit_proto::metastore::{ListShardsSubrequest, SplitStats};
     use quickwit_proto::types::{IndexUid, SourceId};
 
     use super::FileBackedIndex;
     use crate::file_backed::file_backed_index::split_query_predicate;
-    use crate::{ListSplitsQuery, Split, SplitMetadata, SplitState};
+    use crate::{IndexMetadata, ListSplitsQuery, Split, SplitMetadata, SplitState};
 
     impl FileBackedIndex {
         pub(crate) fn insert_shards(&mut self, source_id: &SourceId, shards: Vec<Shard>) {
@@ -789,6 +833,7 @@ mod tests {
                     time_range: Some(32..=40),
                     tags: BTreeSet::from(["tag-1".to_string()]),
                     create_timestamp: 12,
+                    footer_offsets: 0..2048,
                     ..Default::default()
                 },
                 split_state: SplitState::Staged,
@@ -802,6 +847,7 @@ mod tests {
                     time_range: None,
                     tags: BTreeSet::from(["tag-2".to_string(), "tag-3".to_string()]),
                     create_timestamp: 5,
+                    footer_offsets: 0..1024,
                     ..Default::default()
                 },
                 split_state: SplitState::MarkedForDeletion,
@@ -815,6 +861,7 @@ mod tests {
                     time_range: Some(0..=90),
                     tags: BTreeSet::from(["tag-2".to_string(), "tag-4".to_string()]),
                     create_timestamp: 64,
+                    footer_offsets: 0..512,
                     ..Default::default()
                 },
                 split_state: SplitState::Published,
@@ -879,6 +926,12 @@ mod tests {
         assert!(split_query_predicate(&&split_1, &query));
         assert!(!split_query_predicate(&&split_2, &query));
         assert!(!split_query_predicate(&&split_3, &query));
+
+        let query = ListSplitsQuery::for_index(IndexUid::new_with_random_ulid("test-index"))
+            .with_max_time_range_end(50);
+        assert!(split_query_predicate(&&split_1, &query));
+        assert!(split_query_predicate(&&split_2, &query));
+        assert!(!split_query_predicate(&&split_3, &query));
     }
 
     #[test]
@@ -922,5 +975,31 @@ mod tests {
         assert!(!split_query_predicate(&&split_1, &query));
         assert!(!split_query_predicate(&&split_2, &query));
         assert!(!split_query_predicate(&&split_3, &query));
+    }
+
+    #[test]
+    fn test_get_stats() {
+        let index_id = "test-index";
+        let index_metadata = IndexMetadata::for_test(index_id, "file:///qwdata/indexes/test-index");
+        let index =
+            FileBackedIndex::new(index_metadata, make_splits().into(), HashMap::new(), vec![]);
+
+        let expected_staged = Some(SplitStats {
+            num_splits: 1,
+            total_size_bytes: 2048,
+        });
+        let expected_published = Some(SplitStats {
+            num_splits: 1,
+            total_size_bytes: 512,
+        });
+        let expected_marked_for_deletion = Some(SplitStats {
+            num_splits: 1,
+            total_size_bytes: 1024,
+        });
+        let stats = index.get_stats().unwrap();
+
+        assert_eq!(stats.staged, expected_staged);
+        assert_eq!(stats.published, expected_published);
+        assert_eq!(stats.marked_for_deletion, expected_marked_for_deletion);
     }
 }

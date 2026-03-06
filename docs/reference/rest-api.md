@@ -67,7 +67,7 @@ POST api/v1/<index id>/search
 | `max_hits`        | `Integer`  | Maximum number of hits to return (by default 20) | `20` |
 | `search_field`    | `[String]` | Fields to search on if no field name is specified in the query. Comma-separated list, e.g. "field1,field2"  | index_config.search_settings.default_search_fields |
 | `snippet_fields`  | `[String]` | Fields to extract snippet on. Comma-separated list, e.g. "field1,field2"  | |
-| `sort_by`         | `[String]` | Fields to sort the query results on. You can sort by one or two fast fields or by BM25 `_score` (requires fieldnorms). By default, hits are sorted by their document ID. | |
+| `sort_by`         | `[String]` | Fields to sort the query results on. You can sort by one or two fast fields or by BM25 `_score` (requires fieldnorms). By default, hits are sorted in reverse order of their [document ID](/docs/overview/concepts/querying.md#document-id) (to show recent events first). | |
 | `format`          | `Enum`     | The output format. Allowed values are "json" or "pretty_json" | `pretty_json` |
 | `aggs`            | `JSON`     | The aggregations request. See the [aggregations doc](aggregation.md) for supported aggregations. | |
 
@@ -96,7 +96,7 @@ The following are some constrains about the multi-target expression.
 
     - It must follow the regex `^[a-zA-Z\*][a-zA-Z0-9-_\.\*]{0,254}$`.
     - It cannot contain consecutive asterisks (`*`).
-    - If it contains an asterisk (`*`), the length must be greater than or equal to 3 characters.
+    - If it does not contain an asterisk (`*`), the length must be greater than or equal to 3 characters.
 
 #### Examples
 ```
@@ -113,60 +113,7 @@ GET api/v1/stackoverflow*/search
 }
 ```
 
-### Search stream in an index
-
-```
-GET api/v1/<index id>/search/stream?query=searchterm&fast_field=my_id
-```
-
-Streams field values from ALL documents matching a search query in the target index `<index id>`, in a specified output format among the following:
-
-- [CSV](https://datatracker.ietf.org/doc/html/rfc4180)
-- [ClickHouse RowBinary](https://clickhouse.tech/docs/en/interfaces/formats/#rowbinary). If `partition_by_field` is set, Quickwit returns chunks of data for each partition field value. Each chunk starts with 16 bytes being partition value and content length and then the `fast_field` values in `RowBinary` format.
-
-`fast_field` and `partition_by_field` must be fast fields of type `i64` or `u64`.
-
-This endpoint is available as long as you have at least one node running a searcher service in the cluster.
-
-
-
-:::note
-
-The endpoint will return 10 million values if 10 million documents match the query. This is expected, this endpoint is made to support queries matching millions of documents and return field values in a reasonable response time.
-
-:::
-
-#### Path variable
-
-| Variable      | Description   |
-| ------------- | ------------- |
-| `index id`  | The index id  |
-
-#### Get parameters
-
-| Variable            | Type       | Description                                                                                              | Default value                                      |
-|---------------------|------------|----------------------------------------------------------------------------------------------------------|----------------------------------------------------|
-| `query`           | `String`   | Query text. See the [query language doc](query-language.md)                                                | _required_                                         |
-| `fast_field`      | `String`   | Name of a field to retrieve from documents. This field must be a fast field of type `i64` or `u64`.        | _required_                                         |
-| `search_field`    | `[String]` | Fields to search on. Comma-separated list, e.g. "field1,field2"                                            | index_config.search_settings.default_search_fields |
-| `start_timestamp` | `i64`      | If set, restrict search to documents with a `timestamp >= start_timestamp`. The value must be in seconds.  |                                                    |
-| `end_timestamp`   | `i64`      | If set, restrict search to documents with a `timestamp < end_timestamp`. The value must be in seconds.     |                                                    |
-| `partition_by_field` | `String`      | If set, the endpoint returns chunks of data for each partition field value. This field must be a fast field of type `i64` or `u64`.           |                                                    |
-| `output_format`   | `String`   | Response output format. `csv` or `clickHouseRowBinary`  | `csv` |
-
-:::info
-The `start_timestamp` and `end_timestamp` should be specified in seconds regardless of the timestamp field precision.
-:::
-
-#### Response
-
-The response is an HTTP stream. Depending on the client's capability, it is an HTTP1.1 [chunked transfer encoded stream](https://en.wikipedia.org/wiki/Chunked_transfer_encoding) or an HTTP2 stream.
-
-It returns a list of all the field values from documents matching the query. The field must be marked as "fast" in the index config for this to work.
-The formatting is based on the specified output format.
-
-On error, an "X-Stream-Error" header will be sent via the trailers channel with information about the error, and the stream will be closed via [`sender.abort()`](https://docs.rs/hyper/0.14.16/hyper/body/struct.Sender.html#method.abort).
-Depending on the client, the trailer header with error details may not be shown. The error will also be logged in quickwit ("Error when streaming search results").
+## Ingest API
 
 ### Ingest data into an index
 
@@ -191,7 +138,9 @@ POST api/v1/<index id>/ingest?commit=wait_for -d \
 ```
 
 :::info
-The payload size is limited to 10MB as this endpoint is intended to receive documents in batch.
+
+The payload size is limited to 10MB [by default](../configuration/node-config.md#ingest-api-configuration) since this endpoint is intended to receive documents in batches.
+
 :::
 
 #### Path variable
@@ -205,6 +154,7 @@ The payload size is limited to 10MB as this endpoint is intended to receive docu
 | Variable            | Type       | Description                                        | Default value |
 |---------------------|------------|----------------------------------------------------|---------------|
 | `commit`            | `String`   | The commit behavior: `auto`, `wait_for` or `force` | `auto`        |
+| `detailed_response` | `bool`     | Enable `parse_failures` in the response. Setting to `true` might impact performances negatively. | `false`        |
 
 #### Response
 
@@ -212,7 +162,15 @@ The response is a JSON object, and the content type is `application/json; charse
 
 | Field                       | Description                                                                                                                                                              |   Type   |
 |-----------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:--------:|
-| `num_docs_for_processing` | Total number of documents ingested for processing. The documents may not have been processed. The API will not return indexing errors, check the server logs for errors. | `number` |
+| `num_docs_for_processing` | Total number of documents submitted for processing. The documents may not have been processed. | `number` |
+| `num_ingested_docs`       | Number of documents successfully persisted in the write ahead log | `number` |
+| `num_rejected_docs`       | Number of documents that couldn't be parsed (invalid json, bad schema...) | `number` |
+| `parse_failures`          | List detailing parsing failures. Only available if `detailed_response` is set to `true`. | `list(object)` |
+
+The parse failure objects contain the following fields:
+- `message`: a detailed message explaining the error
+- `reason`: one of `invalid_json`, `invalid_schema` or `unspecified`
+- `document`: the utf-8 decoded string of the document byte chunk that generated the error
 
 
 ## Index API
@@ -314,16 +272,32 @@ The response is the index metadata of the created index, and the content type is
 PUT api/v1/indexes/<index id>
 ```
 
-Updates the configurations of an index. This endpoint follows PUT semantics, which means that all the fields of the current configuration are replaced by the values specified in this request or the associated defaults. In particular, if the field is optional (e.g. `retention_policy`), omitting it will delete the associated configuration. If the new configuration file contains updates that cannot be applied, the request fails, and none of the updates are applied. The API accepts JSON with `content-type: application/json` and YAML with `content-type: application/yaml`.
+#### Path variable
+
+| Variable      | Description   |
+| ------------- | ------------- |
+| `index id`    | The index id  |
+
+#### Query parameters
+
+| Variable  | Type   | Description                                   | Default value |
+|-----------|--------|-----------------------------------------------|---------------|
+| `create`  | `bool` | Create the index if it doesn't already exists | `false`       |
+
+Update the configurations of an index. This endpoint follows PUT semantics, which means that all the fields of the current configuration are replaced by the values specified in this request or the associated defaults. In particular, if the field is optional (e.g. `retention_policy`), omitting it will delete the associated configuration. If the new configuration file contains updates that cannot be applied, the request fails, and none of the updates are applied. The API accepts JSON with `content-type: application/json` and YAML with `content-type: application/yaml`.
 
 - The retention policy update is automatically picked up by the janitor service on its next state refresh.
 - The search settings update is automatically picked up by searcher nodes when the next query is executed.
-- The indexing settings update is not automatically picked up by the indexer nodes, they need to be manually restarted.
-- The doc mapping update is not automatically picked up by the indexer nodes, they have to be manually restarted.
+- The indexing settings update is automatically picked up by the indexer nodes once the control plane emits a new indexing plan.
+- The doc mapping update is automatically picked up by the indexer nodes once the control plane emit a new indexing plan.
 
-Updating the doc mapping doesn't reindex existing data. Queries and answers are mapped on a best effort basis when querying older splits.
-It is also not possible to update the timestamp field, or to modify/remove existing non-default tokenizers (but it is possible to change
-which tokenizer is used for a field).
+:::warning
+
+If you use the ingest or ES bulk API (V2), the old doc mapping will still be used to validate new documents that end up being persisted on existing shards (see [#5738](https://github.com/quickwit-oss/quickwit/issues/5738)).
+
+:::
+
+Updating the doc mapping doesn't reindex existing data. Queries and results are mapped on a best-effort basis when querying older splits. For more details, check [the reference](updating-mapper.md) out.
 
 #### PUT payload
 
@@ -331,7 +305,7 @@ which tokenizer is used for a field).
 |---------------------|--------------------|-----------------------------------------------------------------------------------------------------------------------|---------------------------------------|
 | `version`           | `String`           | Config format version, use the same as your Quickwit version.                                                         | _required_                            |
 | `index_id`          | `String`           | Index ID, must be the same index as in the request URI.                                                               | _required_                            |
-| `index_uri`         | `String`           | Defines where the index files are stored. Cannot be updated.                                                          | `{current_index_uri}`                 |
+| `index_uri`         | `String`           | Defines where the index files are stored. Cannot be updated.                                                          | `{default_index_root_uri}/{index_id}`                 |
 | `doc_mapping`       | `DocMapping`       | Doc mapping object as specified in the [index config docs](../configuration/index-config.md#doc-mapping).             | _required_                            |
 | `indexing_settings` | `IndexingSettings` | Indexing settings object as specified in the [index config docs](../configuration/index-config.md#indexing-settings). |                                       |
 | `search_settings`   | `SearchSettings`   | Search settings object as specified in the [index config docs](../configuration/index-config.md#search-settings).     |                                       |
@@ -595,9 +569,70 @@ Create source by posting a source config JSON payload.
 | `version**       | `String` | Config format version, put your current Quickwit version.                               | _required_    |
 | `source_id`     | `String` | Source ID. See ID [validation rules](../configuration/source-config.md).                 | _required_    |
 | `source_type`   | `String` | Source type: `kafka`, `kinesis` or `pulsar`.                                             | _required_    |
-| `num_pipelines` | `usize`  | Number of running indexing pipelines per node for this source.                           | 1             |
+| `num_pipelines` | `usize`  | Number of running indexing pipelines per node for this source.                           | `1`           |
+| `transform`     | `object` | A [VRL](https://vector.dev/docs/reference/vrl/) transformation applied to incoming documents, as defined in [source config docs](../configuration/source-config.md#transform-parameters).                          | `null`         |
 | `params`        | `object` | Source parameters as defined in [source config docs](../configuration/source-config.md). | _required_    |
 
+
+**Payload Example**
+
+curl -XPOST http://localhost:7280/api/v1/indexes/my-index/sources --data @source_config.json -H "Content-Type: application/json"
+
+```json title="source_config.json
+{
+    "version": "0.8",
+    "source_id": "kafka-source",
+    "source_type": "kafka",
+    "params": {
+        "topic": "quickwit-fts-staging",
+        "client_params": {
+            "bootstrap.servers": "kafka-quickwit-server:9092"
+        }
+    }
+}
+```
+
+#### Response
+
+The response is the created source config, and the content type is `application/json; charset=UTF-8.`
+
+### Update a source
+
+```
+PUT api/v1/indexes/<index id>/sources/<source id>
+```
+
+#### Path variable
+
+| Variable      | Description   |
+| ------------- | ------------- |
+| `index id`    | The index id  |
+| `source id`   | The source id  |
+
+#### Query parameters
+
+| Variable  | Type   | Description                                   | Default value |
+|-----------|--------|-----------------------------------------------|---------------|
+| `create`  | `bool` | Create the index if it doesn't already exists | `false`       |
+
+Update a source by posting a source config JSON payload.
+
+#### PUT payload
+
+| Variable          | Type     | Description                                                                            | Default value |
+|-------------------|----------|----------------------------------------------------------------------------------------|---------------|
+| `version**       | `String` | Config format version, put your current Quickwit version.                               | _required_    |
+| `source_id`     | `String` | Source ID, must be the same source as in the request URL.                                | _required_    |
+| `source_type`   | `String` | Source type: `kafka`, `kinesis` or `pulsar`. Cannot be updated.                          | _required_    |
+| `num_pipelines` | `usize`  | Number of running indexing pipelines per node for this source.                           | `1`           |
+| `transform`     | `object` | A [VRL](https://vector.dev/docs/reference/vrl/) transformation applied to incoming documents, as defined in [source config docs](../configuration/source-config.md#transform-parameters).                          | `null`         |
+| `params`        | `object` | Source parameters as defined in [source config docs](../configuration/source-config.md). | _required_    |
+
+:::warning
+
+While updating `num_pipelines` and `transform` is generally safe and reversible, updating `params` has consequences specific to the source type and might have side effects such as loosing the source's checkpoints. Perform such updates with great care. 
+
+:::
 
 **Payload Example**
 
@@ -735,3 +770,118 @@ Get the list of delete tasks for a given `index_id`.
 #### Response
 
 The response is an array of `DeleteTask`.
+
+
+## Index template API
+
+This API manages index template resources. Templates are higher level configuration objects used to automatically create indexes according to predefined rules. See [index template configuration](../configuration/template-config.md).
+
+### Create a template
+
+```
+POST api/v1/templates
+```
+
+#### POST payload
+
+Create an index template by posting a [template configuration](../configuration/template-config.md) payload. The API accepts JSON with the header `content-type: application/json` and YAML with `content-type: application/yaml`.
+
+**Example**
+
+```yaml
+version: 0.9 # File format version.
+
+template_id: "all-logs"
+
+index_root_uri: "s3://my-bucket/logs/"
+
+description: "All my logs"
+
+index_id_patterns:
+    - logs-*
+
+priority: 100
+
+doc_mapping:
+  mode: dynamic
+  field_mappings:
+    - name: timestamp
+      type: datetime
+      input_formats:
+        - unix_timestamp
+      output_format: unix_timestamp_secs
+      fast: true
+  timestamp_field: timestamp
+```
+
+#### Response
+
+The created index template configuration as JSON.
+
+
+### Update a template
+
+```
+PUT api/v1/templates/<template id>
+```
+
+#### Path variable
+
+| Variable      | Description   |
+| ------------- | ------------- |
+| `template id` | The template id  |
+
+
+#### POST payload
+
+Update an index template by posting an [template configuration](../configuration/template-config.md) payload. The API accepts JSON with the header `content-type: application/json` and YAML with `content-type: application/yaml`.
+
+**Example**
+
+See [create endpoint](#create-a-template).
+
+#### Response
+
+The updated template configuration as JSON.
+
+### List the templates
+
+```
+GET api/v1/templates
+```
+
+#### Response
+
+An array with all the existing index template configurations as JSON.
+
+### Get a template
+
+```
+GET api/v1/templates/<template id>
+```
+
+#### Path variable
+
+| Variable      | Description   |
+| ------------- | ------------- |
+| `template id` | The template id  |
+
+#### Response
+
+The requested index template configuration as JSON.
+
+### Delete a template
+
+```
+DELETE api/v1/templates/<template id>
+```
+
+#### Path variable
+
+| Variable      | Description   |
+| ------------- | ------------- |
+| `template id` | The template id  |
+
+#### Response
+
+Empty response.

@@ -1,31 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use serde::{Deserialize, Serialize};
+use tantivy::Term;
 use tantivy::query::PhrasePrefixQuery as TantivyPhrasePrefixQuery;
 use tantivy::schema::{Field, FieldType, Schema as TantivySchema};
-use tantivy::Term;
 
 use crate::query_ast::tantivy_query_ast::TantivyQueryAst;
-use crate::query_ast::{BuildTantivyAst, FullTextParams, QueryAst};
+use crate::query_ast::{BuildTantivyAst, BuildTantivyAstContext, FullTextParams, QueryAst};
 use crate::tokenizers::TokenizerManager;
-use crate::{find_field_or_hit_dynamic, InvalidQuery};
+use crate::{InvalidQuery, find_field_or_hit_dynamic};
 
 /// The PhraseQuery node is meant to be tokenized and searched.
 ///
@@ -38,6 +33,8 @@ pub struct PhrasePrefixQuery {
     pub phrase: String,
     pub max_expansions: u32,
     pub params: FullTextParams,
+    /// Support missing fields
+    pub lenient: bool,
 }
 
 impl PhrasePrefixQuery {
@@ -46,11 +43,14 @@ impl PhrasePrefixQuery {
         schema: &TantivySchema,
         tokenizer_manager: &TokenizerManager,
     ) -> Result<(Field, Vec<(usize, Term)>), InvalidQuery> {
-        let (field, field_entry, json_path) = find_field_or_hit_dynamic(&self.field, schema)?;
+        let (field, field_entry, json_path) = find_field_or_hit_dynamic(&self.field, schema)
+            .ok_or_else(|| InvalidQuery::FieldDoesNotExist {
+                full_path: self.field.clone(),
+            })?;
         let field_type = field_entry.field_type();
 
         match field_type {
-            FieldType::Str(ref text_options) => {
+            FieldType::Str(text_options) => {
                 let text_field_indexing = text_options.get_indexing_options().ok_or_else(|| {
                     InvalidQuery::SchemaError(format!(
                         "field {} is not full-text searchable",
@@ -112,12 +112,15 @@ impl From<PhrasePrefixQuery> for QueryAst {
 impl BuildTantivyAst for PhrasePrefixQuery {
     fn build_tantivy_ast_impl(
         &self,
-        schema: &TantivySchema,
-        tokenizer_manager: &TokenizerManager,
-        _search_fields: &[String],
-        _with_validation: bool,
+        context: &BuildTantivyAstContext,
     ) -> Result<TantivyQueryAst, InvalidQuery> {
-        let (_, terms) = self.get_terms(schema, tokenizer_manager)?;
+        let (_, terms) = match self.get_terms(context.schema, context.tokenizer_manager) {
+            Ok(res) => res,
+            Err(InvalidQuery::FieldDoesNotExist { .. }) if self.lenient => {
+                return Ok(TantivyQueryAst::match_none());
+            }
+            Err(e) => return Err(e),
+        };
 
         if terms.is_empty() {
             if self.params.zero_terms_query.is_none() {

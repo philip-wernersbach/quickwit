@@ -1,33 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
 use quickwit_proto::error::convert_to_grpc_result;
 use quickwit_proto::search::{
-    search_service_server as grpc, GetKvRequest, GetKvResponse, LeafListFieldsRequest,
-    LeafSearchStreamRequest, LeafSearchStreamResponse, ListFieldsRequest, ListFieldsResponse,
-    ReportSplitsRequest, ReportSplitsResponse,
+    GetKvRequest, GetKvResponse, LeafListFieldsRequest, ListFieldsRequest, ListFieldsResponse,
+    ReportSplitsRequest, ReportSplitsResponse, search_service_server as grpc,
 };
-use quickwit_proto::{set_parent_span_from_request_metadata, tonic, GrpcServiceError};
+use quickwit_proto::{set_parent_span_from_request_metadata, tonic};
 use quickwit_search::SearchService;
 use tracing::instrument;
 
@@ -73,29 +66,6 @@ impl grpc::SearchService for GrpcSearchAdapter {
         let fetch_docs_request = request.into_inner();
         let fetch_docs_result = self.0.fetch_docs(fetch_docs_request).await;
         convert_to_grpc_result(fetch_docs_result)
-    }
-
-    type LeafSearchStreamStream = std::pin::Pin<
-        Box<
-            dyn futures::Stream<Item = Result<LeafSearchStreamResponse, tonic::Status>>
-                + Send
-                + Sync,
-        >,
-    >;
-    #[instrument(name = "search_adapter:leaf_search_stream", skip(self, request))]
-    async fn leaf_search_stream(
-        &self,
-        request: tonic::Request<LeafSearchStreamRequest>,
-    ) -> Result<tonic::Response<Self::LeafSearchStreamStream>, tonic::Status> {
-        set_parent_span_from_request_metadata(request.metadata());
-        let leaf_search_request = request.into_inner();
-        let leaf_search_result = self
-            .0
-            .leaf_search_stream(leaf_search_request)
-            .await
-            .map_err(|error| error.into_grpc_status())?
-            .map_err(|error| error.into_grpc_status());
-        Ok(tonic::Response::new(Box::pin(leaf_search_result)))
     }
 
     #[instrument(skip(self, request))]

@@ -3,11 +3,6 @@ title: Querying
 sidebar_position: 2
 ---
 
-Quickwit provides two endpoints with full-text search queries identified by the `query` parameter:
-
-- A search endpoint that returns a [JSON](../../reference/rest-api.md)
-- A search stream endpoint that returns a stream of the requested [field values](../../reference/rest-api.md)
-
 A search query received by a searcher will be executed using a map-reduce approach following these steps:
 
 1. The Searcher identifies relevant splits based on the request’s [timestamp interval](#time-sharding) and [tags](#tag-pruning).
@@ -90,18 +85,26 @@ For instance, if tenant\_1,app\_1 and tenant\_2,app\_2 are both sent to partitio
 still search inside the 1st partition as it will be tagged with tenant\_1,tenant\_2,app\_1 and app\_2. You should therefore prefer a partition key such as
 `hash_mod(tenant_id, 10),hash_mod(app_id, 5)` which will generate as many splits, but with better tags.
 
-### Search stream query limits
-
-Search stream queries can take a huge amount of RAM. Quickwit limits the number of concurrent search streams per split to 100 by default. You can adjust this limit by setting the value of the searcher configuration property called `max_num_concurrent_split_streams` in the configuration file.
-
 ### Caching
 
 Quickwit does caching in many places to deliver a highly performing query engine.
+
+In memory:
 
 - Hotcache caching: A static cache that holds information about a split file internal representation. It helps speed up the opening of a split file. Its size can be defined via the `split_footer_cache_capacity` configuration parameter.
 - Fast field caching: Fast fields tend to be accessed very frequently by users especially for stream requests. They are cached in a RAM whose size can be limited by the `fast_field_cache_capacity` configuration value.
 - Partial request caching: In some cases, like when using dashboards, some very similar requests might be issued, with only timestamp bounds changing. Some partial results can be cached to make these requests faster and issue less requests to the storage. They are cached in a RAM whose size can be limited by the `partial_request_cache_capacity` configuration value.
 
+On disk:
+
+- The split cache stores entire splits on disk. It can be enabled by setting the `split_cache` configuration fields. This cache can help reduce object store costs and load. Searchers populate this cache when splits are created or queried and evict them with a simple LRU strategy.
+
+Learn more about cache parameters in the [searcher configuration docs](../../configuration/node-config.md#searcher-configuration).
+
 ### Scoring
 
 Quickwit supports sorting docs by their BM25 scores. In order to query by score, [fieldnorms](../../configuration/index-config.md#text-type) must be enabled for the field. By default, BM25 scoring is disabled to improve query latencies but it can be opt-in by setting the `sort_by` option to `_score` in queries.
+
+### Document ID
+
+Each document in Quickwit is assigned a unique document ID, which is a combination of the split ID and the Tantivy DocId within the split. This implies that you cannot assign a custom ID and that the ID changes when splits undergo merges. This ID is used for every search query as sort order (after the explicitly specified sort values) to make the results deterministic.

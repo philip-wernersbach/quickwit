@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt::Display;
 use std::ops::Bound;
@@ -24,7 +19,7 @@ use std::time::Duration;
 
 use quickwit_common::uri::Uri;
 use quickwit_proto::metastore::{MetastoreError, MetastoreResult};
-use sea_query::{any, Expr, Func, Order, SelectStatement};
+use sea_query::{Expr, Func, Order, SelectStatement, any};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, Postgres};
 use tracing::error;
@@ -33,7 +28,7 @@ use tracing::log::LevelFilter;
 use super::model::{Splits, ToTimestampFunc};
 use super::pool::TrackedPool;
 use super::tags::generate_sql_condition;
-use crate::metastore::FilterRange;
+use crate::metastore::{FilterRange, SortBy};
 use crate::{ListSplitsQuery, SplitMaturity, SplitMetadata};
 
 /// Establishes a connection to the given database URI.
@@ -44,6 +39,7 @@ pub(super) async fn establish_connection(
     acquire_timeout: Duration,
     idle_timeout_opt: Option<Duration>,
     max_lifetime_opt: Option<Duration>,
+    read_only: bool,
 ) -> MetastoreResult<TrackedPool<Postgres>> {
     let pool_options = PgPoolOptions::new()
         .min_connections(min_connections as u32)
@@ -51,9 +47,16 @@ pub(super) async fn establish_connection(
         .acquire_timeout(acquire_timeout)
         .idle_timeout(idle_timeout_opt)
         .max_lifetime(max_lifetime_opt);
-    let connect_options: PgConnectOptions = PgConnectOptions::from_str(connection_uri.as_str())?
-        .application_name("quickwit-metastore")
-        .log_statements(LevelFilter::Info);
+
+    let mut connect_options: PgConnectOptions =
+        PgConnectOptions::from_str(connection_uri.as_str())?
+            .application_name("quickwit-metastore")
+            .log_statements(LevelFilter::Info);
+
+    if read_only {
+        // this isn't a security mechanism, only a safeguard against involontary missuse
+        connect_options = connect_options.options([("default_transaction_read_only", "on")]);
+    }
     let sqlx_pool = pool_options
         .connect_with(connect_options)
         .await
@@ -93,10 +96,16 @@ pub(super) fn append_range_filters<V: Display>(
     };
 }
 
-pub(super) fn append_query_filters(sql: &mut SelectStatement, query: &ListSplitsQuery) {
-    // Note: `ListSplitsQuery` builder enforces a non empty `index_uids` list.
-
-    sql.cond_where(Expr::col(Splits::IndexUid).is_in(&query.index_uids));
+pub(super) fn append_query_filters_and_order_by(
+    sql: &mut SelectStatement,
+    query: &ListSplitsQuery,
+) {
+    if let Some(index_uids) = &query.index_uids {
+        // Note: `ListSplitsQuery` builder enforces a non empty `index_uids` list.
+        // TODO we should explore IN VALUES, = ANY and similar constructs in case they perform
+        // better.
+        sql.cond_where(Expr::col(Splits::IndexUid).is_in(index_uids));
+    }
 
     if let Some(node_id) = &query.node_id {
         sql.cond_where(Expr::col(Splits::NodeId).eq(node_id));
@@ -112,6 +121,10 @@ pub(super) fn append_query_filters(sql: &mut SelectStatement, query: &ListSplits
     if let Some(tags) = &query.tags {
         sql.cond_where(generate_sql_condition(tags));
     };
+
+    if let Some(v) = query.max_time_range_end {
+        sql.cond_where(Expr::col(Splits::TimeRangeEnd).lte(v));
+    }
 
     match query.time_range.start {
         Bound::Included(v) => {
@@ -178,6 +191,28 @@ pub(super) fn append_query_filters(sql: &mut SelectStatement, query: &ListSplits
     append_range_filters(sql, Splits::DeleteOpstamp, &query.delete_opstamp, |&val| {
         Expr::expr(val)
     });
+
+    if let Some((index_uid, split_id)) = &query.after_split {
+        sql.cond_where(
+            Expr::tuple([
+                Expr::col(Splits::IndexUid).into(),
+                Expr::col(Splits::SplitId).into(),
+            ])
+            .gt(Expr::tuple([Expr::value(index_uid), Expr::value(split_id)])),
+        );
+    }
+
+    match query.sort_by {
+        SortBy::Staleness => {
+            sql.order_by(Splits::DeleteOpstamp, Order::Asc)
+                .order_by(Splits::PublishTimestamp, Order::Asc);
+        }
+        SortBy::IndexUid => {
+            sql.order_by(Splits::IndexUid, Order::Asc)
+                .order_by(Splits::SplitId, Order::Asc);
+        }
+        SortBy::None => (),
+    }
 
     if let Some(limit) = query.limit {
         sql.limit(limit as u64);

@@ -1,39 +1,35 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::num::NonZeroUsize;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use quickwit_actors::{Mailbox, Universe};
-use quickwit_cluster::{create_cluster_for_test, ChannelTransport};
+use quickwit_cluster::{ChannelTransport, create_cluster_for_test};
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::rand::append_random_suffix;
 use quickwit_common::uri::Uri;
 use quickwit_config::{
-    build_doc_mapper, ConfigFormat, IndexConfig, IndexerConfig, IngestApiConfig, MetastoreConfigs,
-    SourceConfig, SourceInputFormat, SourceParams, VecSourceParams, INGEST_API_SOURCE_ID,
+    ConfigFormat, INGEST_API_SOURCE_ID, IndexConfig, IndexerConfig, IngestApiConfig,
+    MetastoreConfigs, SourceConfig, SourceInputFormat, SourceParams, VecSourceParams,
+    build_doc_mapper,
 };
 use quickwit_doc_mapper::DocMapper;
-use quickwit_ingest::{init_ingest_api, IngesterPool, QUEUES_DIR_NAME};
+use quickwit_ingest::{IngesterPool, QUEUES_DIR_NAME, init_ingest_api};
 use quickwit_metastore::{
     CreateIndexRequestExt, MetastoreResolver, Split, SplitMetadata, SplitState,
 };
@@ -55,7 +51,7 @@ pub struct TestSandbox {
     index_uid: IndexUid,
     source_id: SourceId,
     indexing_service: Mailbox<IndexingService>,
-    doc_mapper: Arc<dyn DocMapper>,
+    doc_mapper: Arc<DocMapper>,
     metastore: MetastoreServiceClient,
     storage_resolver: StorageResolver,
     storage: Arc<dyn Storage>,
@@ -101,7 +97,7 @@ impl TestSandbox {
             .await?;
         let create_index_request = CreateIndexRequest::try_from_index_and_source_configs(
             &index_config,
-            &[source_config.clone()],
+            std::slice::from_ref(&source_config),
         )?;
         let index_uid: IndexUid = metastore
             .create_index(create_index_request)
@@ -150,7 +146,7 @@ impl TestSandbox {
         })
     }
 
-    /// Adds documents.
+    /// Adds documents and waits for them to be indexed (creating a separate split).
     ///
     /// The documents are expected to be `JsonValue`.
     /// They can be created using the `serde_json::json!` macro.
@@ -166,7 +162,7 @@ impl TestSandbox {
         let add_docs_id = self.add_docs_id.fetch_add(1, Ordering::SeqCst);
         let source_config = SourceConfig {
             source_id: INGEST_API_SOURCE_ID.to_string(),
-            num_pipelines: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params: SourceParams::Vec(VecSourceParams {
                 docs,
@@ -214,7 +210,7 @@ impl TestSandbox {
     }
 
     /// Returns the doc mapper of the TestSandbox.
-    pub fn doc_mapper(&self) -> Arc<dyn DocMapper> {
+    pub fn doc_mapper(&self) -> Arc<DocMapper> {
         self.doc_mapper.clone()
     }
 

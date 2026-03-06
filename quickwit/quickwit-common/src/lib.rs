@@ -1,29 +1,29 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![deny(clippy::disallowed_methods)]
 
 mod coolid;
 
+#[cfg(feature = "jemalloc-profiled")]
+pub(crate) mod alloc_tracker;
 pub mod binary_heap;
+mod cpus;
 pub mod fs;
 pub mod io;
+#[cfg(feature = "jemalloc-profiled")]
+pub mod jemalloc_profiled;
 mod kill_switch;
 pub mod metrics;
 pub mod net;
@@ -48,6 +48,8 @@ pub mod tower;
 pub mod type_map;
 pub mod uri;
 
+mod socket_addr_legacy_hash;
+
 use std::env;
 use std::fmt::{Debug, Display};
 use std::future::Future;
@@ -55,11 +57,25 @@ use std::ops::{Range, RangeInclusive};
 use std::str::FromStr;
 
 pub use coolid::new_coolid;
+pub use cpus::num_cpus;
 pub use kill_switch::KillSwitch;
 pub use path_hasher::PathHasher;
 pub use progress::{Progress, ProtectedZoneGuard};
+pub use socket_addr_legacy_hash::SocketAddrLegacyHash;
 pub use stream_utils::{BoxStream, ServiceStream};
 use tracing::{error, info};
+
+/// Returns true at compile time. This function is mostly used with serde to initialize boolean
+/// fields to true.
+pub const fn true_fn() -> bool {
+    true
+}
+
+/// Returns whether the given boolean value is true. This function is mostly used with serde to skip
+/// serializing boolean fields with `skip_serializing_if = "is_true"` when the value is true.
+pub fn is_true(value: &bool) -> bool {
+    *value
+}
 
 pub fn chunk_range(range: Range<usize>, chunk_size: usize) -> impl Iterator<Item = Range<usize>> {
     range.clone().step_by(chunk_size).map(move |block_start| {
@@ -80,43 +96,47 @@ pub fn split_file(split_id: impl Display) -> String {
     format!("{split_id}.split")
 }
 
-pub fn get_from_env<T: FromStr + Debug>(key: &str, default_value: T) -> T {
-    if let Ok(value_str) = std::env::var(key) {
-        if let Ok(value) = T::from_str(&value_str) {
-            info!(value=?value, "using environment variable `{key}` value");
-            return value;
-        } else {
-            error!(value=%value_str, "failed to parse environment variable `{key}` value");
-        }
+fn get_from_env_opt_aux<T: Debug>(
+    key: &str,
+    parse_fn: impl FnOnce(&str) -> Option<T>,
+    sensitive: bool,
+) -> Option<T> {
+    let value_str = std::env::var(key).ok()?;
+    let Some(value) = parse_fn(&value_str) else {
+        error!(value=%value_str, "failed to parse environment variable `{key}` value");
+        return None;
+    };
+    if sensitive {
+        info!("using environment variable `{key}` value");
+    } else {
+        info!(value=?value, "using environment variable `{key}` value");
     }
-    info!(value=?default_value, "using environment variable `{key}` default value");
-    default_value
+    Some(value)
+}
+
+pub fn get_from_env<T: FromStr + Debug>(key: &str, default_value: T, sensitive: bool) -> T {
+    if let Some(value) = get_from_env_opt(key, sensitive) {
+        value
+    } else {
+        info!(default_value=?default_value, "using environment variable `{key}` default value");
+        default_value
+    }
+}
+
+pub fn get_from_env_opt<T: FromStr + Debug>(key: &str, sensitive: bool) -> Option<T> {
+    get_from_env_opt_aux(key, |val_str| val_str.parse().ok(), sensitive)
+}
+
+pub fn get_bool_from_env_opt(key: &str) -> Option<bool> {
+    get_from_env_opt_aux(key, parse_bool_lenient, false)
 }
 
 pub fn get_bool_from_env(key: &str, default_value: bool) -> bool {
-    if let Ok(value_str) = std::env::var(key) {
-        if let Some(value) = parse_bool_lenient(&value_str) {
-            info!(value=%value, "using environment variable `{key}` value");
-            return value;
-        } else {
-            error!(value=%value_str, "failed to parse environment variable `{key}` value");
-        }
-    }
-    info!(value=?default_value, "using environment variable `{key}` default value");
-    default_value
-}
-
-pub fn get_from_env_opt<T: FromStr + Debug>(key: &str) -> Option<T> {
-    let Some(value_str) = std::env::var(key).ok() else {
-        info!("environment variable `{key}` is not set");
-        return None;
-    };
-    if let Ok(value) = T::from_str(&value_str) {
-        info!(value=?value, "using environment variable `{key}` value");
-        Some(value)
+    if let Some(flag_value) = get_bool_from_env_opt(key) {
+        flag_value
     } else {
-        error!(value=%value_str, "failed to parse environment variable `{key}` value");
-        None
+        info!(default_value=%default_value, "using environment variable `{key}` default value");
+        default_value
     }
 }
 
@@ -169,6 +189,32 @@ pub fn no_color() -> bool {
 }
 
 #[macro_export]
+macro_rules! assert_eventually {
+    ($cond:expr, $timeout:expr, $interval:expr) => {
+        let start = std::time::Instant::now();
+        loop {
+            if $cond {
+                break;
+            }
+            if start.elapsed() > $timeout {
+                panic!(
+                    "assertion failed: condition `{}` never became true within {} ms",
+                    stringify!($cond),
+                    $timeout.as_millis()
+                );
+            }
+            tokio::time::sleep($interval).await;
+        }
+    };
+    ($cond:expr, $timeout:expr) => {
+        assert_eventually!($cond, $timeout, std::time::Duration::from_millis(50));
+    };
+    ($cond:expr) => {
+        assert_eventually!($cond, std::time::Duration::from_secs(1));
+    };
+}
+
+#[macro_export]
 macro_rules! ignore_error_kind {
     ($kind:path, $expr:expr) => {
         match $expr {
@@ -183,11 +229,7 @@ macro_rules! ignore_error_kind {
 pub const fn div_ceil_u32(lhs: u32, rhs: u32) -> u32 {
     let d = lhs / rhs;
     let r = lhs % rhs;
-    if r > 0 {
-        d + 1
-    } else {
-        d
-    }
+    if r > 0 { d + 1 } else { d }
 }
 
 #[inline]
@@ -201,38 +243,30 @@ pub const fn div_ceil(lhs: i64, rhs: i64) -> i64 {
     }
 }
 
-/// Return the number of vCPU/hyperthreads available.
-/// This number is usually not equal to the number of cpu cores
-pub fn num_cpus() -> usize {
-    match std::thread::available_parallelism() {
-        Ok(num_cpus) => num_cpus.get(),
-        Err(io_error) => {
-            error!(error=?io_error, "failed to detect the number of threads available: arbitrarily returning 2");
-            2
-        }
-    }
-}
-
 // The following are helpers to build named tasks.
 //
-// Named tasks require the tokio feature `tracing` to be enabled.
-// If the `named_tasks` feature is disabled, this is no-op.
+// Named tasks require the tokio feature `tracing` to be enabled. If the
+// `named_tasks` feature is disabled, this is no-op.
 //
-// By default, these function will just ignore the name passed and just act
-// like a regular call to `tokio::spawn`.
+// By default, these function will just ignore the name passed and just act like
+// a regular call to `tokio::spawn`.
 //
-// If the user compiles `quickwit-cli` with the `tokio-console` feature,
-// then tasks will automatically be named. This is not just "visual sugar".
+// If the user compiles `quickwit-cli` with the `tokio-console` feature, then
+// tasks will automatically be named. This is not just "visual sugar".
 //
-// Without names, tasks will only show their spawn site on tokio-console.
-// This is a catastrophy for actors who all share the same spawn site.
+// Without names, tasks will only show their spawn site on tokio-console. This
+// is a catastrophy for actors who all share the same spawn site.
+//
+// The #[track_caller] annotation is used to show the right spawn site in the
+// Tokio TRACE spans (only available when the tokio/tracing feature is on).
 //
 // # Naming
 //
-// Actors will get named after their type, which is fine.
-// For other tasks, please use `snake_case`.
+// Actors will get named after their type, which is fine. For other tasks,
+// please use `snake_case`.
 
 #[cfg(not(all(tokio_unstable, feature = "named_tasks")))]
+#[track_caller]
 pub fn spawn_named_task<F>(future: F, _name: &'static str) -> tokio::task::JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -242,6 +276,7 @@ where
 }
 
 #[cfg(not(all(tokio_unstable, feature = "named_tasks")))]
+#[track_caller]
 pub fn spawn_named_task_on<F>(
     future: F,
     _name: &'static str,
@@ -255,6 +290,7 @@ where
 }
 
 #[cfg(all(tokio_unstable, feature = "named_tasks"))]
+#[track_caller]
 pub fn spawn_named_task<F>(future: F, name: &'static str) -> tokio::task::JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -267,6 +303,7 @@ where
 }
 
 #[cfg(all(tokio_unstable, feature = "named_tasks"))]
+#[track_caller]
 pub fn spawn_named_task_on<F>(
     future: F,
     name: &'static str,
@@ -306,12 +343,16 @@ mod tests {
 
     #[test]
     fn test_get_from_env() {
+        // SAFETY: this test may not be entirely sound if not run with nextest or --test-threads=1
+        // as this is only a test, and it would be extremely inconvenient to run it in a different
+        // way, we are keeping it that way
+
         const TEST_KEY: &str = "TEST_KEY";
-        assert_eq!(super::get_from_env(TEST_KEY, 10), 10);
-        std::env::set_var(TEST_KEY, "15");
-        assert_eq!(super::get_from_env(TEST_KEY, 10), 15);
-        std::env::set_var(TEST_KEY, "1invalidnumber");
-        assert_eq!(super::get_from_env(TEST_KEY, 10), 10);
+        assert_eq!(super::get_from_env(TEST_KEY, 10, false), 10);
+        unsafe { std::env::set_var(TEST_KEY, "15") };
+        assert_eq!(super::get_from_env(TEST_KEY, 10, false), 15);
+        unsafe { std::env::set_var(TEST_KEY, "1invalidnumber") };
+        assert_eq!(super::get_from_env(TEST_KEY, 10, false), 10);
     }
 
     #[test]

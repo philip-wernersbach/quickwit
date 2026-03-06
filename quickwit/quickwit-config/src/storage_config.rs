@@ -1,30 +1,26 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::ops::Deref;
+use std::sync::OnceLock;
 use std::{env, fmt};
 
 use anyhow::ensure;
 use itertools::Itertools;
 use quickwit_common::get_bool_from_env;
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, EnumMap};
+use serde_with::{EnumMap, serde_as};
 
 /// Lists the storage backends supported by Quickwit.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -283,16 +279,16 @@ impl AzureStorageConfig {
         }
     }
 
-    /// Attempts to find the account name in the environment variable `QW_AZURE_STORAGE_ACCOUNT` or
-    /// the config.
+    /// Attempts to find the storage account name in the environment variable
+    /// `QW_AZURE_STORAGE_ACCOUNT` or node config.
     pub fn resolve_account_name(&self) -> Option<String> {
         env::var(Self::AZURE_STORAGE_ACCOUNT_ENV_VAR)
             .ok()
             .or_else(|| self.account_name.clone())
     }
 
-    /// Attempts to find the access key in the environment variable `QW_AZURE_STORAGE_ACCESS_KEY` or
-    /// the config.
+    /// Attempts to find the storage account access key in the environment variable
+    /// `QW_AZURE_STORAGE_ACCESS_KEY` or node config.
     pub fn resolve_access_key(&self) -> Option<String> {
         env::var(Self::AZURE_STORAGE_ACCESS_KEY_ENV_VAR)
             .ok()
@@ -351,6 +347,7 @@ impl S3StorageConfig {
                 self.disable_multipart_upload = true;
             }
             Some(StorageBackendFlavor::MinIO) => {
+                self.region = Some("minio".to_string());
                 self.force_path_style_access = true;
             }
             _ => {}
@@ -370,11 +367,14 @@ impl S3StorageConfig {
     }
 
     pub fn force_path_style_access(&self) -> Option<bool> {
-        let force_path_style_access = get_bool_from_env(
-            "QW_S3_FORCE_PATH_STYLE_ACCESS",
-            self.force_path_style_access,
-        );
-        Some(force_path_style_access)
+        static FORCE_PATH_STYLE: OnceLock<Option<bool>> = OnceLock::new();
+        *FORCE_PATH_STYLE.get_or_init(|| {
+            let force_path_style_access = get_bool_from_env(
+                "QW_S3_FORCE_PATH_STYLE_ACCESS",
+                self.force_path_style_access,
+            );
+            Some(force_path_style_access)
+        })
     }
 }
 
@@ -498,6 +498,7 @@ mod tests {
         assert!(gcs_storage_config.disable_multipart_upload);
 
         let minio_storage_config = storage_configs[3].as_s3().unwrap();
+        assert_eq!(minio_storage_config.region, Some("minio".to_string()));
         assert!(minio_storage_config.force_path_style_access);
     }
 

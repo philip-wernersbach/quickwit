@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![warn(missing_docs)]
 #![allow(clippy::bool_assert_comparison)]
@@ -27,14 +22,15 @@
 //! - object storages (S3)
 //! - local filesystem
 //! - distributed filesystems.
-//! etc.
+//! - etc.
 //!
-//! - The `BundleStorage` bundles together multiple files into a single file.
+//! The `BundleStorage` bundles together multiple files into a single file.
 mod cache;
 mod debouncer;
 mod file_descriptor_cache;
 mod metrics;
 mod storage;
+mod timeout_and_retry_storage;
 pub use debouncer::AsyncDebouncer;
 pub(crate) use debouncer::DebouncedStorage;
 
@@ -67,7 +63,7 @@ pub use self::bundle_storage::{BundleStorage, BundleStorageFileOffsets};
 #[cfg(any(test, feature = "testsuite"))]
 pub use self::cache::MockStorageCache;
 pub use self::cache::{
-    wrap_storage_with_cache, ByteRangeCache, MemorySizedCache, QuickwitCache, StorageCache,
+    ByteRangeCache, MemorySizedCache, QuickwitCache, StorageCache, wrap_storage_with_cache,
 };
 pub use self::local_file_storage::{LocalFileStorage, LocalFileStorageFactory};
 #[cfg(feature = "azure")]
@@ -75,10 +71,10 @@ pub use self::object_storage::{AzureBlobStorage, AzureBlobStorageFactory};
 pub use self::object_storage::{
     MultiPartPolicy, S3CompatibleObjectStorage, S3CompatibleObjectStorageFactory,
 };
-#[cfg(all(feature = "gcs", feature = "integration-testsuite"))]
-pub use self::opendal_storage::new_emulated_google_cloud_storage;
 #[cfg(feature = "gcs")]
 pub use self::opendal_storage::GoogleCloudStorageFactory;
+#[cfg(all(feature = "gcs", feature = "integration-testsuite"))]
+pub use self::opendal_storage::test_config_helpers;
 pub use self::ram_storage::{RamStorage, RamStorageBuilder};
 pub use self::split::{SplitPayload, SplitPayloadBuilder};
 #[cfg(any(test, feature = "testsuite"))]
@@ -92,6 +88,7 @@ pub use self::test_suite::{
     storage_test_multi_part_upload, storage_test_single_part_upload, storage_test_suite,
     test_write_and_bulk_delete,
 };
+pub use self::timeout_and_retry_storage::TimeoutAndRetryStorage;
 pub use crate::error::{
     BulkDeleteError, DeleteFailure, StorageError, StorageErrorKind, StorageResolverError,
     StorageResult,
@@ -121,7 +118,7 @@ unsafe fn serde_json_preserve_order_canary(
     val: serde_json::Map<String, serde_json::Value>,
 ) -> std::collections::BTreeMap<String, serde_json::Value> {
     use std::mem::transmute as assert_serde_json__preserve_order__disabled;
-    assert_serde_json__preserve_order__disabled(val)
+    unsafe { assert_serde_json__preserve_order__disabled(val) }
 }
 
 #[cfg(any(test, feature = "testsuite", feature = "integration-testsuite"))]
@@ -386,9 +383,28 @@ pub(crate) mod test_suite {
     #[cfg(feature = "integration-testsuite")]
     pub async fn storage_test_multi_part_upload(storage: &mut dyn Storage) -> anyhow::Result<()> {
         let test_path = Path::new("hello_large.txt");
-        let test_buffer = vec![0u8; 15_000_000];
-        storage.put(test_path, Box::new(test_buffer)).await?;
+
+        let mut test_buffer = Vec::with_capacity(15_000_000);
+        for i in 0..15_000_000u32 {
+            test_buffer.push((i % 256) as u8);
+        }
+
+        storage
+            .put(test_path, Box::new(test_buffer.clone()))
+            .await?;
+
         assert_eq!(storage.file_num_bytes(test_path).await?, 15_000_000);
+
+        let downloaded_data = storage.get_all(test_path).await?;
+
+        assert_eq!(test_buffer.len(), downloaded_data.len(), "Length mismatch");
+        // dont use assert_eq since we dont want large buffers to be printed
+        // if assert fails
+        assert!(
+            test_buffer.as_slice() == downloaded_data.as_slice(),
+            "Content mismatch - data corruption detected!"
+        );
+
         Ok(())
     }
 }

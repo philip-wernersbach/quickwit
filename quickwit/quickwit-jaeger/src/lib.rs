@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::mem;
@@ -23,21 +18,18 @@ use std::ops::{Bound, RangeInclusive};
 use std::sync::Arc;
 use std::time::Instant;
 
-use async_trait::async_trait;
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use prost::Message;
 use prost_types::{Duration as WellKnownDuration, Timestamp as WellKnownTimestamp};
 use quickwit_config::JaegerConfig;
 use quickwit_opentelemetry::otlp::{
-    extract_otel_traces_index_id_patterns_from_metadata, Event as QwEvent, Link as QwLink,
-    Span as QwSpan, SpanFingerprint, SpanId, SpanKind as QwSpanKind, SpanStatus as QwSpanStatus,
-    TraceId, OTEL_TRACES_INDEX_ID,
+    Event as QwEvent, Link as QwLink, OTEL_TRACES_INDEX_ID, Span as QwSpan, SpanFingerprint,
+    SpanId, SpanKind as QwSpanKind, SpanStatus as QwSpanStatus, TraceId,
 };
 use quickwit_proto::jaeger::api_v2::{
     KeyValue as JaegerKeyValue, Log as JaegerLog, Process as JaegerProcess, Span as JaegerSpan,
     SpanRef as JaegerSpanRef, SpanRefType as JaegerSpanRefType, ValueType,
 };
-use quickwit_proto::jaeger::storage::v1::span_reader_plugin_server::SpanReaderPlugin;
 use quickwit_proto::jaeger::storage::v1::{
     FindTraceIDsRequest, FindTraceIDsResponse, FindTracesRequest, GetOperationsRequest,
     GetOperationsResponse, GetServicesRequest, GetServicesResponse, GetTraceRequest, Operation,
@@ -45,31 +37,37 @@ use quickwit_proto::jaeger::storage::v1::{
 };
 use quickwit_proto::opentelemetry::proto::trace::v1::status::StatusCode as OtlpStatusCode;
 use quickwit_proto::search::{CountHits, ListTermsRequest, SearchRequest};
-use quickwit_query::query_ast::{BoolQuery, QueryAst, RangeQuery, TermQuery};
+use quickwit_query::BooleanOperand;
+use quickwit_query::query_ast::{BoolQuery, QueryAst, RangeQuery, TermQuery, UserInputQuery};
 use quickwit_search::{FindTraceIdsCollector, SearchService};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tantivy::collector::Collector;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
+use tonic::Status;
 use tracing::field::Empty;
-use tracing::{debug, error, instrument, warn, Span as RuntimeSpan};
+use tracing::{Span as RuntimeSpan, debug, error, instrument, warn};
 
-use crate::metrics::JAEGER_SERVICE_METRICS;
+pub(crate) use crate::metrics::JAEGER_SERVICE_METRICS;
 
 mod metrics;
+mod v1;
+mod v2;
 
 // OpenTelemetry to Jaeger Transformation
 // <https://opentelemetry.io/docs/reference/specification/trace/sdk_exporters/jaeger/>
 
 type TimeIntervalSecs = RangeInclusive<i64>;
 
-type JaegerResult<T> = Result<T, Status>;
+pub(crate) type JaegerResult<T> = Result<T, Status>;
 
-type SpanStream = ReceiverStream<Result<SpansResponseChunk, Status>>;
+pub(crate) type SpanStream = ReceiverStream<Result<SpansResponseChunk, Status>>;
+
+pub(crate) type TracesDataStream =
+    ReceiverStream<Result<quickwit_proto::opentelemetry::proto::trace::v1::TracesData, Status>>;
 
 #[derive(Clone)]
 pub struct JaegerService {
@@ -92,34 +90,16 @@ impl JaegerService {
     #[instrument("get_services", skip_all)]
     pub async fn get_services_for_indexes(
         &self,
-        request: GetServicesRequest,
+        _request: GetServicesRequest,
         index_id_patterns: Vec<String>,
     ) -> JaegerResult<GetServicesResponse> {
-        debug!(request=?request, index_ids=?index_id_patterns, "`get_services` request");
-
-        let max_hits = Some(1_000);
-        let start_timestamp =
-            Some(OffsetDateTime::now_utc().unix_timestamp() - self.lookback_period_secs);
-
-        let search_request = ListTermsRequest {
+        let services = get_services_impl(
+            self.search_service.clone(),
+            self.lookback_period_secs,
             index_id_patterns,
-            field: "service_name".to_string(),
-            max_hits,
-            start_timestamp,
-            end_timestamp: None,
-            start_key: None,
-            end_key: None,
-        };
-        let search_response = self.search_service.root_list_terms(search_request).await?;
-        let services: Vec<String> = search_response
-            .terms
-            .into_iter()
-            .map(|term_bytes| extract_term(&term_bytes))
-            .sorted()
-            .collect();
-        let response = GetServicesResponse { services };
-        debug!(response=?response, "`get_services` response");
-        Ok(response)
+        )
+        .await?;
+        Ok(GetServicesResponse { services })
     }
 
     #[instrument("get_operations", skip_all, fields(service=%request.service, span_kind=%request.span_kind))]
@@ -128,38 +108,18 @@ impl JaegerService {
         request: GetOperationsRequest,
         index_id_patterns: Vec<String>,
     ) -> JaegerResult<GetOperationsResponse> {
-        debug!(request=?request, request=?request, index_ids=?index_id_patterns, "`get_operations` request");
-
-        let max_hits = Some(1_000);
-        let start_timestamp =
-            Some(OffsetDateTime::now_utc().unix_timestamp() - self.lookback_period_secs);
-
-        let span_kind_opt = request.span_kind.parse().ok();
-        let start_key = SpanFingerprint::start_key(&request.service, span_kind_opt.clone());
-        let end_key = SpanFingerprint::end_key(&request.service, span_kind_opt);
-
-        let search_request = ListTermsRequest {
+        let operations = get_operations_impl(
+            self.search_service.clone(),
+            self.lookback_period_secs,
+            request.service,
+            request.span_kind,
             index_id_patterns,
-            field: "span_fingerprint".to_string(),
-            max_hits,
-            start_timestamp,
-            end_timestamp: None,
-            start_key,
-            end_key,
-        };
-        let search_response = self.search_service.root_list_terms(search_request).await?;
-        let operations: Vec<Operation> = search_response
-            .terms
-            .into_iter()
-            .map(|term_json| extract_operation(&term_json))
-            .sorted()
-            .collect();
-        debug!(operations=?operations, "`get_operations` response");
-        let response = GetOperationsResponse {
+        )
+        .await?;
+        Ok(GetOperationsResponse {
             operations,
             operation_names: Vec::new(), // `operation_names` is deprecated.
-        };
-        Ok(response)
+        })
     }
 
     // Instrumentation happens in `find_trace_ids`.
@@ -191,6 +151,7 @@ impl JaegerService {
         operation_name: &'static str,
         request_start: Instant,
         index_id_patterns: Vec<String>,
+        root_only: bool,
     ) -> JaegerResult<SpanStream> {
         debug!(request=?request, "`find_traces` request");
 
@@ -210,6 +171,7 @@ impl JaegerService {
                 operation_name,
                 request_start,
                 index_id_patterns,
+                root_only,
             )
             .await?;
         Ok(response)
@@ -237,6 +199,7 @@ impl JaegerService {
                 operation_name,
                 request_start,
                 index_id_patterns,
+                false,
             )
             .await?;
         Ok(response)
@@ -248,50 +211,81 @@ impl JaegerService {
         trace_query: TraceQueryParameters,
         index_id_patterns: Vec<String>,
     ) -> Result<(Vec<TraceId>, TimeIntervalSecs), Status> {
-        let span_kind_opt = None;
-        let min_span_start_timestamp_secs_opt = trace_query.start_time_min.map(|ts| ts.seconds);
-        let max_span_start_timestamp_secs_opt = trace_query.start_time_max.map(|ts| ts.seconds);
-        let min_span_duration_millis_opt = trace_query
+        let min_start_secs = trace_query.start_time_min.map(|ts| ts.seconds);
+        let max_start_secs = trace_query.start_time_max.map(|ts| ts.seconds);
+        let min_duration_millis = trace_query
             .duration_min
             .and_then(|d| to_duration_millis(&d));
-        let max_span_duration_millis_opt = trace_query
+        let max_duration_millis = trace_query
             .duration_max
             .and_then(|d| to_duration_millis(&d));
-        let query = build_search_query(
+
+        find_trace_ids_common(
+            self.search_service.clone(),
             &trace_query.service_name,
-            span_kind_opt,
             &trace_query.operation_name,
             trace_query.tags,
-            min_span_start_timestamp_secs_opt,
-            max_span_start_timestamp_secs_opt,
-            min_span_duration_millis_opt,
-            max_span_duration_millis_opt,
-        );
-        let query_ast =
-            serde_json::to_string(&query).map_err(|err| Status::internal(err.to_string()))?;
-        let aggregation_query = build_aggregations_query(trace_query.num_traces as usize);
-        let max_hits = 0;
-        let search_request = SearchRequest {
+            min_start_secs,
+            max_start_secs,
+            min_duration_millis,
+            max_duration_millis,
+            trace_query.num_traces as usize,
             index_id_patterns,
-            query_ast,
-            aggregation_request: Some(aggregation_query),
-            max_hits,
-            start_timestamp: min_span_start_timestamp_secs_opt,
-            end_timestamp: max_span_start_timestamp_secs_opt,
-            count_hits: CountHits::Underestimate.into(),
-            ..Default::default()
-        };
-        let search_response = self.search_service.root_search(search_request).await?;
-
-        let Some(agg_result_json) = search_response.aggregation else {
-            debug!("the query matched no traces");
-            return Ok((Vec::new(), 0..=0));
-        };
-        let trace_ids = collect_trace_ids(&agg_result_json)?;
-        debug!("the query matched {} traces.", trace_ids.0.len());
-        Ok(trace_ids)
+        )
+        .await
     }
+}
 
+#[instrument("find_trace_ids_common", skip_all)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn find_trace_ids_common(
+    search_service: Arc<dyn SearchService>,
+    service_name: &str,
+    operation_name: &str,
+    tags: HashMap<String, String>,
+    min_start_secs: Option<i64>,
+    max_start_secs: Option<i64>,
+    min_duration_millis: Option<i64>,
+    max_duration_millis: Option<i64>,
+    num_traces: usize,
+    index_id_patterns: Vec<String>,
+) -> Result<(Vec<TraceId>, TimeIntervalSecs), Status> {
+    let query_ast = build_search_query(
+        service_name,
+        None,
+        operation_name,
+        tags,
+        min_start_secs,
+        max_start_secs,
+        min_duration_millis,
+        max_duration_millis,
+    );
+
+    let search_request = SearchRequest {
+        index_id_patterns,
+        query_ast: serde_json::to_string(&query_ast)
+            .map_err(|err| Status::internal(err.to_string()))?,
+        aggregation_request: Some(build_aggregations_query(num_traces)),
+        max_hits: 0,
+        start_timestamp: min_start_secs,
+        end_timestamp: max_start_secs,
+        count_hits: CountHits::Underestimate.into(),
+        ..Default::default()
+    };
+
+    let search_response = search_service.root_search(search_request).await?;
+
+    let Some(agg_result_postcard) = search_response.aggregation_postcard else {
+        debug!("the query matched no traces");
+        return Ok((Vec::new(), 0..=0));
+    };
+
+    let trace_ids = collect_trace_ids(&agg_result_postcard)?;
+    debug!("the query matched {} traces.", trace_ids.0.len());
+    Ok(trace_ids)
+}
+
+impl JaegerService {
     #[instrument("stream_spans", skip_all, fields(num_traces=%trace_ids.len(), num_spans=Empty, num_bytes=Empty))]
     async fn stream_spans(
         &self,
@@ -300,6 +294,7 @@ impl JaegerService {
         operation_name: &'static str,
         request_start: Instant,
         index_id_patterns: Vec<String>,
+        root_only: bool,
     ) -> Result<SpanStream, Status> {
         if trace_ids.is_empty() {
             let (_tx, rx) = mpsc::channel(1);
@@ -315,6 +310,20 @@ impl JaegerService {
                 value,
             };
             query.should.push(term_query.into());
+        }
+        if root_only {
+            // we do this so we don't error on old indexes, and instead return both root and non
+            // root spans
+            let is_root = UserInputQuery {
+                user_text: "NOT is_root:false".to_string(),
+                default_fields: None,
+                default_operator: BooleanOperand::And,
+                lenient: true,
+            };
+            let mut new_query = BoolQuery::default();
+            new_query.must.push(query.into());
+            new_query.must.push(is_root.into());
+            query = new_query;
         }
 
         let query_ast: QueryAst = query.into();
@@ -421,29 +430,7 @@ impl JaegerService {
     }
 }
 
-macro_rules! metrics {
-    ($expr:expr, [$operation:ident, $($label:expr),*]) => {
-        let start = std::time::Instant::now();
-        let labels = [stringify!($operation), $($label,)*];
-        JAEGER_SERVICE_METRICS.requests_total.with_label_values(labels).inc();
-        let (res, is_error) = match $expr {
-            ok @ Ok(_) => {
-                (ok, "false")
-            },
-            err @ Err(_) => {
-                JAEGER_SERVICE_METRICS.request_errors_total.with_label_values(labels).inc();
-                (err, "true")
-            },
-        };
-        let elapsed = start.elapsed().as_secs_f64();
-        let labels = [stringify!($operation), $($label,)* is_error];
-        JAEGER_SERVICE_METRICS.request_duration_seconds.with_label_values(labels).observe(elapsed);
-
-        return res.map(Response::new);
-    };
-}
-
-fn record_error(operation_name: &'static str, request_start: Instant) {
+pub(crate) fn record_error(operation_name: &'static str, request_start: Instant) {
     JAEGER_SERVICE_METRICS
         .request_errors_total
         .with_label_values([operation_name, OTEL_TRACES_INDEX_ID])
@@ -456,7 +443,7 @@ fn record_error(operation_name: &'static str, request_start: Instant) {
         .observe(elapsed);
 }
 
-fn record_send(operation_name: &'static str, num_spans: usize, num_bytes: usize) {
+pub(crate) fn record_send(operation_name: &'static str, num_spans: usize, num_bytes: usize) {
     JAEGER_SERVICE_METRICS
         .fetched_spans_total
         .with_label_values([operation_name, OTEL_TRACES_INDEX_ID])
@@ -467,84 +454,7 @@ fn record_send(operation_name: &'static str, num_spans: usize, num_bytes: usize)
         .inc_by(num_bytes as u64);
 }
 
-#[async_trait]
-impl SpanReaderPlugin for JaegerService {
-    type GetTraceStream = SpanStream;
-
-    type FindTracesStream = SpanStream;
-
-    async fn get_services(
-        &self,
-        request: Request<GetServicesRequest>,
-    ) -> Result<Response<GetServicesResponse>, Status> {
-        let index_id_patterns =
-            extract_otel_traces_index_id_patterns_from_metadata(request.metadata())?;
-        metrics!(
-            self.get_services_for_indexes(request.into_inner(), index_id_patterns)
-                .await,
-            [get_services, OTEL_TRACES_INDEX_ID]
-        );
-    }
-
-    async fn get_operations(
-        &self,
-        request: Request<GetOperationsRequest>,
-    ) -> Result<Response<GetOperationsResponse>, Status> {
-        let index_id_patterns =
-            extract_otel_traces_index_id_patterns_from_metadata(request.metadata())?;
-        metrics!(
-            self.get_operations_for_indexes(request.into_inner(), index_id_patterns)
-                .await,
-            [get_operations, OTEL_TRACES_INDEX_ID]
-        );
-    }
-
-    async fn find_trace_i_ds(
-        &self,
-        request: Request<FindTraceIDsRequest>,
-    ) -> Result<Response<FindTraceIDsResponse>, Status> {
-        let index_id_patterns =
-            extract_otel_traces_index_id_patterns_from_metadata(request.metadata())?;
-        metrics!(
-            self.find_trace_ids_for_indexes(request.into_inner(), index_id_patterns)
-                .await,
-            [find_trace_ids, OTEL_TRACES_INDEX_ID]
-        );
-    }
-
-    async fn find_traces(
-        &self,
-        request: Request<FindTracesRequest>,
-    ) -> Result<Response<Self::FindTracesStream>, Status> {
-        let index_id_patterns =
-            extract_otel_traces_index_id_patterns_from_metadata(request.metadata())?;
-        self.find_traces_for_indexes(
-            request.into_inner(),
-            "find_traces",
-            Instant::now(),
-            index_id_patterns,
-        )
-        .await
-        .map(Response::new)
-    }
-
-    async fn get_trace(
-        &self,
-        request: Request<GetTraceRequest>,
-    ) -> Result<Response<Self::GetTraceStream>, Status> {
-        let index_id_patterns =
-            extract_otel_traces_index_id_patterns_from_metadata(request.metadata())?;
-        self.get_trace_for_indexes(
-            request.into_inner(),
-            "get_trace",
-            Instant::now(),
-            index_id_patterns,
-        )
-        .await
-        .map(Response::new)
-    }
-}
-
+#[allow(deprecated)]
 fn extract_term(term_bytes: &[u8]) -> String {
     tantivy::Term::wrap(term_bytes)
         .value()
@@ -571,9 +481,77 @@ fn extract_operation(term_bytes: &[u8]) -> Operation {
     }
 }
 
+#[instrument("get_services", skip_all)]
+pub(crate) async fn get_services_impl(
+    search_service: Arc<dyn SearchService>,
+    lookback_period_secs: i64,
+    index_id_patterns: Vec<String>,
+) -> Result<Vec<String>, Status> {
+    debug!(index_ids=?index_id_patterns, "`get_services` request");
+
+    let max_hits = Some(1_000);
+    let start_timestamp = Some(OffsetDateTime::now_utc().unix_timestamp() - lookback_period_secs);
+
+    let search_request = ListTermsRequest {
+        index_id_patterns,
+        field: "service_name".to_string(),
+        max_hits,
+        start_timestamp,
+        end_timestamp: None,
+        start_key: None,
+        end_key: None,
+    };
+    let search_response = search_service.root_list_terms(search_request).await?;
+    let services: Vec<String> = search_response
+        .terms
+        .into_iter()
+        .map(|term_bytes| extract_term(&term_bytes))
+        .sorted()
+        .collect();
+    debug!(services=?services, "`get_services` response");
+    Ok(services)
+}
+
+#[instrument("get_operations", skip_all, fields(service=%service, span_kind=%span_kind))]
+pub(crate) async fn get_operations_impl(
+    search_service: Arc<dyn SearchService>,
+    lookback_period_secs: i64,
+    service: String,
+    span_kind: String,
+    index_id_patterns: Vec<String>,
+) -> Result<Vec<Operation>, Status> {
+    debug!(service=%service, span_kind=%span_kind, index_ids=?index_id_patterns, "`get_operations` request");
+
+    let max_hits = Some(1_000);
+    let start_timestamp = Some(OffsetDateTime::now_utc().unix_timestamp() - lookback_period_secs);
+
+    let span_kind_opt = span_kind.parse().ok();
+    let start_key = SpanFingerprint::start_key(&service, span_kind_opt.clone());
+    let end_key = SpanFingerprint::end_key(&service, span_kind_opt);
+
+    let search_request = ListTermsRequest {
+        index_id_patterns,
+        field: "span_fingerprint".to_string(),
+        max_hits,
+        start_timestamp,
+        end_timestamp: None,
+        start_key,
+        end_key,
+    };
+    let search_response = search_service.root_list_terms(search_request).await?;
+    let operations: Vec<Operation> = search_response
+        .terms
+        .into_iter()
+        .map(|term_json| extract_operation(&term_json))
+        .sorted()
+        .collect();
+    debug!(operations=?operations, "`get_operations` response");
+    Ok(operations)
+}
+
 // TODO: builder pattern
 #[allow(clippy::too_many_arguments)]
-fn build_search_query(
+pub(crate) fn build_search_query(
     service_name: &str,
     span_kind_opt: Option<QwSpanKind>,
     span_name: &str,
@@ -728,7 +706,7 @@ fn build_search_query(
     }
 }
 
-fn build_aggregations_query(num_traces: usize) -> String {
+pub(crate) fn build_aggregations_query(num_traces: usize) -> String {
     let query = serde_json::to_string(&FindTraceIdsCollector {
         num_traces,
         trace_id_field_name: "trace_id".to_string(),
@@ -739,6 +717,7 @@ fn build_aggregations_query(num_traces: usize) -> String {
     query
 }
 
+#[allow(clippy::result_large_err)]
 fn qw_span_to_jaeger_span(qw_span_json: &str) -> Result<JaegerSpan, Status> {
     let mut qw_span: QwSpan = json_deserialize(qw_span_json, "span")?;
 
@@ -750,7 +729,7 @@ fn qw_span_to_jaeger_span(qw_span_json: &str) -> Result<JaegerSpan, Status> {
     qw_span.resource_attributes.remove("service.name");
     let process = Some(JaegerProcess {
         service_name: qw_span.service_name,
-        tags: otlp_attributes_to_jaeger_tags(qw_span.resource_attributes)?,
+        tags: otlp_attributes_to_jaeger_tags(qw_span.resource_attributes),
     });
     let logs: Vec<JaegerLog> = qw_span
         .events
@@ -758,7 +737,7 @@ fn qw_span_to_jaeger_span(qw_span_json: &str) -> Result<JaegerSpan, Status> {
         .map(qw_event_to_jaeger_log)
         .collect::<Result<_, _>>()?;
 
-    let mut tags = otlp_attributes_to_jaeger_tags(qw_span.span_attributes)?;
+    let mut tags = otlp_attributes_to_jaeger_tags(qw_span.span_attributes);
     inject_dropped_count_tags(
         &mut tags,
         qw_span.span_dropped_attributes_count,
@@ -788,7 +767,7 @@ fn qw_span_to_jaeger_span(qw_span_json: &str) -> Result<JaegerSpan, Status> {
     Ok(span)
 }
 
-fn to_duration_millis(duration: &WellKnownDuration) -> Option<i64> {
+pub(crate) fn to_duration_millis(duration: &WellKnownDuration) -> Option<i64> {
     let duration_millis = duration.seconds * 1_000 + (duration.nanos as i64) / 1_000_000;
     if duration_millis == 0 {
         None
@@ -922,59 +901,95 @@ fn inject_span_status_tags(tags: &mut Vec<JaegerKeyValue>, span_status: QwSpanSt
     };
 }
 
-/// Converts OpenTelemetry attributes to Jaeger tags.
+/// Converts OpenTelemetry attributes to Jaeger tags. Objects are flattened with
+/// their keys prefixed with the parent keys delimited by a dot.
+///
 /// <https://opentelemetry.io/docs/specs/otel/trace/sdk_exporters/jaeger/#attributes>
 fn otlp_attributes_to_jaeger_tags(
-    attributes: HashMap<String, JsonValue>,
-) -> Result<Vec<JaegerKeyValue>, Status> {
-    let mut tags = Vec::with_capacity(attributes.len());
-    for (key, value) in attributes {
-        let mut tag = JaegerKeyValue {
-            key,
-            v_type: ValueType::String as i32,
-            v_str: String::new(),
-            v_bool: false,
-            v_int64: 0,
-            v_float64: 0.0,
-            v_binary: Vec::new(),
-        };
-        match value {
-            // Array values MUST be serialized to string like a JSON list.
-            JsonValue::Array(values) => {
-                tag.v_type = ValueType::String as i32;
-                tag.v_str = serde_json::to_string(&values)
-                    .expect("A vec of `serde_json::Value` values should be JSON serializable.");
-            }
-            JsonValue::Bool(value) => {
-                tag.v_type = ValueType::Bool as i32;
-                tag.v_bool = value;
-            }
-            JsonValue::Number(number) => {
-                if let Some(value) = number.as_i64() {
-                    tag.v_type = ValueType::Int64 as i32;
-                    tag.v_int64 = value;
-                } else if let Some(value) = number.as_f64() {
-                    tag.v_type = ValueType::Float64 as i32;
-                    tag.v_float64 = value
+    attributes: impl IntoIterator<Item = (String, JsonValue)>,
+) -> Vec<JaegerKeyValue> {
+    otlp_attributes_to_jaeger_tags_inner(attributes, None)
+}
+
+/// Inner helper for `otpl_attributes_to_jaeger_tags` recursive call
+///
+/// PERF: as long as `attributes` IntoIterator implementation correctly sets the
+/// lower bound then collect should allocate efficiently. Note that the flat map
+/// may cause more allocations as we cannot predict the number of elements in the
+/// iterator.
+fn otlp_attributes_to_jaeger_tags_inner(
+    attributes: impl IntoIterator<Item = (String, JsonValue)>,
+    parent_key: Option<&str>,
+) -> Vec<JaegerKeyValue> {
+    attributes
+        .into_iter()
+        .map(|(key, value)| {
+            let key = parent_key
+                .map(|parent_key| format!("{parent_key}.{key}"))
+                .unwrap_or(key);
+            match value {
+                JsonValue::Array(values) => {
+                    Either::Left(Some(JaegerKeyValue {
+                        key,
+                        v_type: ValueType::String as i32,
+                        // Array values MUST be serialized to string like a JSON list.
+                        v_str: serde_json::to_string(&values).expect(
+                            "A vec of `serde_json::Value` values should be JSON serializable.",
+                        ),
+                        ..Default::default()
+                    }))
+                }
+                JsonValue::Bool(v_bool) => Either::Left(Some(JaegerKeyValue {
+                    key,
+                    v_type: ValueType::Bool as i32,
+                    v_bool,
+                    ..Default::default()
+                })),
+                JsonValue::Number(number) => {
+                    let value = if let Some(v_int64) = number.as_i64() {
+                        Some(JaegerKeyValue {
+                            key,
+                            v_type: ValueType::Int64 as i32,
+                            v_int64,
+                            ..Default::default()
+                        })
+                    } else if let Some(v_float64) = number.as_f64() {
+                        Some(JaegerKeyValue {
+                            key,
+                            v_type: ValueType::Float64 as i32,
+                            v_float64,
+                            ..Default::default()
+                        })
+                    } else {
+                        // Print some error rather than silently ignoring the value.
+                        warn!("ignoring unrepresentable number value: {number:?}");
+                        None
+                    };
+
+                    Either::Left(value)
+                }
+                JsonValue::String(v_str) => Either::Left(Some(JaegerKeyValue {
+                    key,
+                    v_type: ValueType::String as i32,
+                    v_str,
+                    ..Default::default()
+                })),
+                JsonValue::Null => {
+                    // No use including null values in the tags, so ignore
+                    Either::Left(None)
+                }
+                JsonValue::Object(value) => {
+                    Either::Right(otlp_attributes_to_jaeger_tags_inner(value, Some(&key)))
                 }
             }
-            JsonValue::String(value) => {
-                tag.v_type = ValueType::String as i32;
-                tag.v_str = value
-            }
-            _ => {
-                return Err(Status::internal(format!(
-                    "Failed to serialize attributes: unexpected type `{value:?}`"
-                )))
-            }
-        };
-        tags.push(tag);
-    }
-    Ok(tags)
+        })
+        .flat_map(|e| e.into_iter())
+        .collect()
 }
 
 /// Converts OpenTelemetry links to Jaeger span references.
 /// <https://opentelemetry.io/docs/specs/otel/trace/sdk_exporters/jaeger/#links>
+#[allow(clippy::result_large_err)]
 fn otlp_links_to_jaeger_references(
     trace_id: &TraceId,
     parent_span_id_opt: Option<SpanId>,
@@ -1006,6 +1021,7 @@ fn otlp_links_to_jaeger_references(
     Ok(references)
 }
 
+#[allow(clippy::result_large_err)]
 fn qw_event_to_jaeger_log(event: QwEvent) -> Result<JaegerLog, Status> {
     let timestamp = to_well_known_timestamp(event.event_timestamp_nanos);
     // "OpenTelemetry Event’s name field should be added to Jaeger Log’s fields map as follows: name
@@ -1014,7 +1030,7 @@ fn qw_event_to_jaeger_log(event: QwEvent) -> Result<JaegerLog, Status> {
     let insert_event_name =
         !event.event_name.is_empty() && !event.event_attributes.contains_key("event");
 
-    let mut fields = otlp_attributes_to_jaeger_tags(event.event_attributes)?;
+    let mut fields = otlp_attributes_to_jaeger_tags(event.event_attributes);
 
     if insert_event_name {
         fields.push(JaegerKeyValue {
@@ -1035,9 +1051,12 @@ fn qw_event_to_jaeger_log(event: QwEvent) -> Result<JaegerLog, Status> {
     Ok(log)
 }
 
-fn collect_trace_ids(trace_ids_json: &str) -> Result<(Vec<TraceId>, TimeIntervalSecs), Status> {
+#[allow(clippy::result_large_err)]
+fn collect_trace_ids(
+    trace_ids_postcard: &[u8],
+) -> Result<(Vec<TraceId>, TimeIntervalSecs), Status> {
     let collector_fruit: <FindTraceIdsCollector as Collector>::Fruit =
-        json_deserialize(trace_ids_json, "trace IDs aggregation")?;
+        postcard_deserialize(trace_ids_postcard, "trace IDs aggregation")?;
     if collector_fruit.is_empty() {
         return Ok((Vec::new(), 0..=0));
     }
@@ -1053,6 +1072,7 @@ fn collect_trace_ids(trace_ids_json: &str) -> Result<(Vec<TraceId>, TimeInterval
     Ok((trace_ids, start..=end))
 }
 
+#[allow(clippy::result_large_err)]
 fn json_deserialize<'a, T>(json: &'a str, label: &'static str) -> Result<T, Status>
 where T: Deserialize<'a> {
     match serde_json::from_str(json) {
@@ -1066,11 +1086,26 @@ where T: Deserialize<'a> {
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn postcard_deserialize<'a, T>(json: &'a [u8], label: &'static str) -> Result<T, Status>
+where T: Deserialize<'a> {
+    match postcard::from_bytes(json) {
+        Ok(deserialized) => Ok(deserialized),
+        Err(error) => {
+            error!("failed to deserialize {label}: {error:?}");
+            Err(Status::internal(format!(
+                "Failed to deserialize {label}: {error:?}."
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use quickwit_opentelemetry::otlp::{OtelSignal, OTEL_TRACES_INDEX_ID_PATTERN};
+    use quickwit_opentelemetry::otlp::{OTEL_TRACES_INDEX_ID_PATTERN, OtelSignal};
     use quickwit_proto::jaeger::api_v2::ValueType;
-    use quickwit_search::{encode_term_for_test, MockSearchService, QuickwitAggregations};
+    use quickwit_proto::jaeger::storage::v1::span_reader_plugin_server::SpanReaderPlugin;
+    use quickwit_search::{MockSearchService, QuickwitAggregations, encode_term_for_test};
     use serde_json::json;
 
     use super::*;
@@ -1079,7 +1114,7 @@ mod tests {
     fn get_must(ast: QueryAst) -> Vec<QueryAst> {
         match ast {
             QueryAst::Bool(boolean_query) => boolean_query.must,
-            _ => panic!("expected `QueryAst::Bool`, got `{:?}`", ast),
+            _ => panic!("expected `QueryAst::Bool`, got `{ast:?}`"),
         }
     }
 
@@ -1087,7 +1122,7 @@ mod tests {
     fn get_must_not(ast: QueryAst) -> Vec<QueryAst> {
         match ast {
             QueryAst::Bool(boolean_query) => boolean_query.must_not,
-            _ => panic!("expected `QueryAst::Bool`, got `{:?}`", ast),
+            _ => panic!("expected `QueryAst::Bool`, got `{ast:?}`"),
         }
     }
 
@@ -1136,11 +1171,13 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![TermQuery {
-                    field: "service_name".to_string(),
-                    value: service_name.to_string(),
-                }
-                .into()]
+                vec![
+                    TermQuery {
+                        field: "service_name".to_string(),
+                        value: service_name.to_string(),
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1166,7 +1203,8 @@ mod tests {
                 quickwit_query::query_ast::UserInputQuery {
                     user_text: "query".to_string(),
                     default_fields: None,
-                    default_operator: quickwit_query::BooleanOperand::And
+                    default_operator: quickwit_query::BooleanOperand::And,
+                    lenient: false,
                 }
                 .into()
             );
@@ -1191,11 +1229,13 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![TermQuery {
-                    field: "span_kind".to_string(),
-                    value: "3".to_string(),
-                }
-                .into()]
+                vec![
+                    TermQuery {
+                        field: "span_kind".to_string(),
+                        value: "3".to_string(),
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1218,11 +1258,13 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![TermQuery {
-                    field: "span_name".to_string(),
-                    value: span_name.to_string(),
-                }
-                .into()]
+                vec![
+                    TermQuery {
+                        field: "span_name".to_string(),
+                        value: span_name.to_string(),
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1245,11 +1287,13 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![TermQuery {
-                    field: "span_status.code".to_string(),
-                    value: "error".to_string(),
-                }
-                .into(),],
+                vec![
+                    TermQuery {
+                        field: "span_status.code".to_string(),
+                        value: "error".to_string(),
+                    }
+                    .into(),
+                ],
             );
         }
         {
@@ -1272,11 +1316,13 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![TermQuery {
-                    field: "span_status.code".to_string(),
-                    value: "error".to_string(),
-                }
-                .into(),],
+                vec![
+                    TermQuery {
+                        field: "span_status.code".to_string(),
+                        value: "error".to_string(),
+                    }
+                    .into(),
+                ],
             );
         }
         {
@@ -1300,27 +1346,29 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![BoolQuery {
-                    should: vec![
-                        TermQuery {
-                            field: "resource_attributes.foo".to_string(),
-                            value: tag_value.to_string(),
-                        }
-                        .into(),
-                        TermQuery {
-                            field: "span_attributes.foo".to_string(),
-                            value: tag_value.to_string(),
-                        }
-                        .into(),
-                        TermQuery {
-                            field: "events.event_attributes.foo".to_string(),
-                            value: tag_value.to_string(),
-                        }
-                        .into(),
-                    ],
-                    ..Default::default()
-                }
-                .into()]
+                vec![
+                    BoolQuery {
+                        should: vec![
+                            TermQuery {
+                                field: "resource_attributes.foo".to_string(),
+                                value: tag_value.to_string(),
+                            }
+                            .into(),
+                            TermQuery {
+                                field: "span_attributes.foo".to_string(),
+                                value: tag_value.to_string(),
+                            }
+                            .into(),
+                            TermQuery {
+                                field: "events.event_attributes.foo".to_string(),
+                                value: tag_value.to_string(),
+                            }
+                            .into(),
+                        ],
+                        ..Default::default()
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1344,11 +1392,13 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![TermQuery {
-                    field: "events.event_name".to_string(),
-                    value: event_name.to_string(),
-                }
-                .into()]
+                vec![
+                    TermQuery {
+                        field: "events.event_name".to_string(),
+                        value: event_name.to_string(),
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1495,12 +1545,14 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![RangeQuery {
-                    field: "span_start_timestamp_nanos".to_string(),
-                    lower_bound: Bound::Included("1970-01-01T00:00:03Z".to_string().into()),
-                    upper_bound: Bound::Unbounded
-                }
-                .into()]
+                vec![
+                    RangeQuery {
+                        field: "span_start_timestamp_nanos".to_string(),
+                        lower_bound: Bound::Included("1970-01-01T00:00:03Z".to_string().into()),
+                        upper_bound: Bound::Unbounded
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1523,12 +1575,14 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![RangeQuery {
-                    field: "span_start_timestamp_nanos".to_string(),
-                    lower_bound: Bound::Unbounded,
-                    upper_bound: Bound::Included("1970-01-01T00:00:33Z".to_string().into()),
-                }
-                .into()]
+                vec![
+                    RangeQuery {
+                        field: "span_start_timestamp_nanos".to_string(),
+                        lower_bound: Bound::Unbounded,
+                        upper_bound: Bound::Included("1970-01-01T00:00:33Z".to_string().into()),
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1551,12 +1605,14 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![RangeQuery {
-                    field: "span_start_timestamp_nanos".to_string(),
-                    lower_bound: Bound::Included("1970-01-01T00:00:03Z".to_string().into()),
-                    upper_bound: Bound::Included("1970-01-01T00:00:33Z".to_string().into()),
-                }
-                .into()]
+                vec![
+                    RangeQuery {
+                        field: "span_start_timestamp_nanos".to_string(),
+                        lower_bound: Bound::Included("1970-01-01T00:00:03Z".to_string().into()),
+                        upper_bound: Bound::Included("1970-01-01T00:00:33Z".to_string().into()),
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1579,12 +1635,14 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![RangeQuery {
-                    field: "span_duration_millis".to_string(),
-                    lower_bound: Bound::Included(7u64.into()),
-                    upper_bound: Bound::Unbounded
-                }
-                .into()]
+                vec![
+                    RangeQuery {
+                        field: "span_duration_millis".to_string(),
+                        lower_bound: Bound::Included(7u64.into()),
+                        upper_bound: Bound::Unbounded
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1607,12 +1665,14 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![RangeQuery {
-                    field: "span_duration_millis".to_string(),
-                    lower_bound: Bound::Unbounded,
-                    upper_bound: Bound::Included(77u64.into()),
-                }
-                .into()]
+                vec![
+                    RangeQuery {
+                        field: "span_duration_millis".to_string(),
+                        lower_bound: Bound::Unbounded,
+                        upper_bound: Bound::Included(77u64.into()),
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1635,12 +1695,14 @@ mod tests {
                     min_span_duration_secs,
                     max_span_duration_secs
                 )),
-                vec![RangeQuery {
-                    field: "span_duration_millis".to_string(),
-                    lower_bound: Bound::Included(7u64.into()),
-                    upper_bound: Bound::Included(77u64.into()),
-                }
-                .into()]
+                vec![
+                    RangeQuery {
+                        field: "span_duration_millis".to_string(),
+                        lower_bound: Bound::Included(7u64.into()),
+                        upper_bound: Bound::Included(77u64.into()),
+                    }
+                    .into()
+                ]
             );
         }
         {
@@ -1937,18 +1999,29 @@ mod tests {
 
     #[test]
     fn test_otlp_attributes_to_jaeger_tags() {
-        let attributes = HashMap::from_iter([
+        let mut tags = otlp_attributes_to_jaeger_tags([
             ("array_int".to_string(), json!([1, 2])),
             ("array_str".to_string(), json!(["foo", "bar"])),
             ("bool".to_string(), json!(true)),
             ("float".to_string(), json!(1.0)),
             ("integer".to_string(), json!(1)),
             ("string".to_string(), json!("foo")),
+            (
+                "object".to_string(),
+                json!({
+                    "array_int": [1,2],
+                    "array_str": ["foo", "bar"],
+                    "bool": true,
+                    "float": 1.0,
+                    "integer": 1,
+                    "string": "foo",
+                }),
+            ),
         ]);
-        let mut tags = otlp_attributes_to_jaeger_tags(attributes).unwrap();
         tags.sort_by(|left, right| left.key.cmp(&right.key));
 
-        assert_eq!(tags.len(), 6);
+        // a tag for the 6 keys in the root, plus 6 more for the nested keys
+        assert_eq!(tags.len(), 12);
 
         assert_eq!(tags[0].key, "array_int");
         assert_eq!(tags[0].v_type(), ValueType::String);
@@ -1970,9 +2043,33 @@ mod tests {
         assert_eq!(tags[4].v_type(), ValueType::Int64);
         assert_eq!(tags[4].v_int64, 1);
 
-        assert_eq!(tags[5].key, "string");
+        assert_eq!(tags[5].key, "object.array_int");
         assert_eq!(tags[5].v_type(), ValueType::String);
-        assert_eq!(tags[5].v_str, "foo");
+        assert_eq!(tags[5].v_str, "[1,2]");
+
+        assert_eq!(tags[6].key, "object.array_str");
+        assert_eq!(tags[6].v_type(), ValueType::String);
+        assert_eq!(tags[6].v_str, r#"["foo","bar"]"#);
+
+        assert_eq!(tags[7].key, "object.bool");
+        assert_eq!(tags[7].v_type(), ValueType::Bool);
+        assert!(tags[7].v_bool);
+
+        assert_eq!(tags[8].key, "object.float");
+        assert_eq!(tags[8].v_type(), ValueType::Float64);
+        assert_eq!(tags[8].v_float64, 1.0);
+
+        assert_eq!(tags[9].key, "object.integer");
+        assert_eq!(tags[9].v_type(), ValueType::Int64);
+        assert_eq!(tags[9].v_int64, 1);
+
+        assert_eq!(tags[10].key, "object.string");
+        assert_eq!(tags[10].v_type(), ValueType::String);
+        assert_eq!(tags[10].v_str, "foo");
+
+        assert_eq!(tags[11].key, "string");
+        assert_eq!(tags[11].v_type(), ValueType::String);
+        assert_eq!(tags[11].v_str, "foo");
     }
 
     #[test]
@@ -2160,6 +2257,7 @@ mod tests {
                 message: Some("An error occurred.".to_string()),
             },
             parent_span_id: Some(SpanId::new([3; 8])),
+            is_root: Some(false),
             events: vec![QwEvent {
                 event_timestamp_nanos: 1000500003,
                 event_name: "event_name".to_string(),
@@ -2381,34 +2479,50 @@ mod tests {
 
     #[test]
     fn test_collect_trace_ids() {
+        use quickwit_opentelemetry::otlp::TraceId;
+        use quickwit_search::Span;
+        use tantivy::DateTime;
         {
-            let agg_result_json = r#"[]"#;
-            let (trace_ids, _span_timestamps_range) = collect_trace_ids(agg_result_json).unwrap();
+            let agg_result: Vec<Span> = Vec::new();
+            let agg_result_postcard = postcard::to_stdvec(&agg_result).unwrap();
+            let (trace_ids, _span_timestamps_range) =
+                collect_trace_ids(&agg_result_postcard).unwrap();
             assert!(trace_ids.is_empty());
         }
         {
-            let agg_result_json = r#"[
-                {
-                    "trace_id": "01010101010101010101010101010101",
-                    "span_timestamp": 1684857492783747000
-                }
-            ]"#;
-            let (trace_ids, span_timestamps_range) = collect_trace_ids(agg_result_json).unwrap();
+            let agg_result = vec![Span {
+                trace_id: TraceId::new([
+                    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+                    0x01, 0x01, 0x01,
+                ]),
+                span_timestamp: DateTime::from_timestamp_nanos(1684857492783747000),
+            }];
+            let agg_result_postcard = postcard::to_stdvec(&agg_result).unwrap();
+            let (trace_ids, span_timestamps_range) =
+                collect_trace_ids(&agg_result_postcard).unwrap();
             assert_eq!(trace_ids.len(), 1);
             assert_eq!(span_timestamps_range, 1684857492..=1684857492);
         }
         {
-            let agg_result_json = r#"[
-                {
-                    "trace_id": "0102030405060708090a0b0c0d0e0f10",
-                    "span_timestamp": 1684857492783747000
+            let agg_result = vec![
+                Span {
+                    trace_id: TraceId::new([
+                        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                        0x0d, 0x0e, 0x0f, 0x10,
+                    ]),
+                    span_timestamp: DateTime::from_timestamp_nanos(1684857492783747000),
                 },
-                {
-                    "trace_id": "02020202020202020202020202020202",
-                    "span_timestamp": 1684857826019627000
-                }
-            ]"#;
-            let (trace_ids, span_timestamps_range) = collect_trace_ids(agg_result_json).unwrap();
+                Span {
+                    trace_id: TraceId::new([
+                        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+                        0x02, 0x02, 0x02, 0x02,
+                    ]),
+                    span_timestamp: DateTime::from_timestamp_nanos(1684857826019627000),
+                },
+            ];
+            let agg_result_postcard = postcard::to_stdvec(&agg_result).unwrap();
+            let (trace_ids, span_timestamps_range) =
+                collect_trace_ids(&agg_result_postcard).unwrap();
             assert_eq!(trace_ids.len(), 2);
             assert_eq!(span_timestamps_range, 1684857492..=1684857826);
         }
@@ -2479,4 +2593,210 @@ mod tests {
         let response = jaeger.get_services(request).await.unwrap().into_inner();
         assert_eq!(response.services, &["service1", "service2", "service3"]);
     }
+
+    #[tokio::test]
+    async fn test_v2_get_services() {
+        let mut service = MockSearchService::new();
+        service
+            .expect_root_list_terms()
+            .withf(|req| {
+                req.index_id_patterns == vec![OTEL_TRACES_INDEX_ID_PATTERN]
+                    && req.field == "service_name"
+                    && req.start_timestamp.is_some()
+            })
+            .return_once(|_| {
+                Ok(quickwit_proto::search::ListTermsResponse {
+                    num_hits: 3,
+                    terms: vec![
+                        encode_term_for_test!("service1"),
+                        encode_term_for_test!("service2"),
+                        encode_term_for_test!("service3"),
+                    ],
+                    elapsed_time_micros: 0,
+                    errors: Vec::new(),
+                })
+            });
+
+        let service = Arc::new(service);
+        let jaeger = JaegerService::new(JaegerConfig::default(), service);
+
+        let request =
+            tonic::Request::new(quickwit_proto::jaeger::storage::v2::GetServicesRequest {});
+        let response =
+            quickwit_proto::jaeger::storage::v2::trace_reader_server::TraceReader::get_services(
+                &jaeger, request,
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.services, &["service1", "service2", "service3"]);
+    }
+
+    #[tokio::test]
+    async fn test_v2_get_operations() {
+        let mut service = MockSearchService::new();
+        service
+            .expect_root_list_terms()
+            .withf(|req| {
+                req.index_id_patterns == vec![OTEL_TRACES_INDEX_ID_PATTERN]
+                    && req.field == "span_fingerprint"
+                    && req.start_timestamp.is_some()
+            })
+            .return_once(|_| {
+                let fingerprint1 =
+                    SpanFingerprint::new("test-service", QwSpanKind::from(2), "GET /api");
+                let fingerprint2 =
+                    SpanFingerprint::new("test-service", QwSpanKind::from(3), "POST /data");
+
+                Ok(quickwit_proto::search::ListTermsResponse {
+                    num_hits: 2,
+                    terms: vec![
+                        encode_term_for_test!(fingerprint1.as_str()),
+                        encode_term_for_test!(fingerprint2.as_str()),
+                    ],
+                    elapsed_time_micros: 0,
+                    errors: Vec::new(),
+                })
+            });
+
+        let service = Arc::new(service);
+        let jaeger = JaegerService::new(JaegerConfig::default(), service);
+
+        let request =
+            tonic::Request::new(quickwit_proto::jaeger::storage::v2::GetOperationsRequest {
+                service: "test-service".to_string(),
+                span_kind: String::new(),
+            });
+        let response =
+            quickwit_proto::jaeger::storage::v2::trace_reader_server::TraceReader::get_operations(
+                &jaeger, request,
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.operations.len(), 2);
+        assert_eq!(response.operations[0].name, "GET /api");
+        assert_eq!(response.operations[0].span_kind, "server");
+        assert_eq!(response.operations[1].name, "POST /data");
+        assert_eq!(response.operations[1].span_kind, "client");
+    }
+
+    #[tokio::test]
+    async fn test_v2_find_trace_ids() {
+        let mut service = MockSearchService::new();
+        service
+            .expect_root_search()
+            .withf(|req| {
+                req.index_id_patterns == vec![OTEL_TRACES_INDEX_ID_PATTERN]
+                    && req.start_timestamp.is_some()
+                    && req.end_timestamp.is_some()
+            })
+            .return_once(|_| {
+                use quickwit_search::Span as TraceSpan;
+                use tantivy::DateTime;
+
+                let trace_id_1 =
+                    TraceId::new([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+                let trace_id_2 = TraceId::new([
+                    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                ]);
+
+                let spans = vec![
+                    TraceSpan {
+                        trace_id: trace_id_1,
+                        span_timestamp: DateTime::from_timestamp_secs(1500),
+                    },
+                    TraceSpan {
+                        trace_id: trace_id_2,
+                        span_timestamp: DateTime::from_timestamp_secs(1600),
+                    },
+                ];
+
+                let aggregation_postcard = postcard::to_allocvec(&spans).unwrap();
+
+                Ok(quickwit_proto::search::SearchResponse {
+                    num_hits: 2,
+                    hits: vec![],
+                    elapsed_time_micros: 100,
+                    errors: Vec::new(),
+                    aggregation_postcard: Some(aggregation_postcard),
+                    scroll_id: None,
+                    failed_splits: Vec::new(),
+                    num_successful_splits: 1,
+                })
+            });
+
+        let service = Arc::new(service);
+        let jaeger = JaegerService::new(JaegerConfig::default(), service);
+
+        let request = tonic::Request::new(quickwit_proto::jaeger::storage::v2::FindTracesRequest {
+            query: Some(quickwit_proto::jaeger::storage::v2::TraceQueryParameters {
+                service_name: "test-service".to_string(),
+                operation_name: String::new(),
+                attributes: vec![],
+                start_time_min: Some(prost_types::Timestamp {
+                    seconds: 1000,
+                    nanos: 0,
+                }),
+                start_time_max: Some(prost_types::Timestamp {
+                    seconds: 2000,
+                    nanos: 0,
+                }),
+                duration_min: None,
+                duration_max: None,
+                search_depth: 10,
+            }),
+        });
+        let response =
+            quickwit_proto::jaeger::storage::v2::trace_reader_server::TraceReader::find_trace_i_ds(
+                &jaeger, request,
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.trace_ids.len(), 2);
+        assert_eq!(response.trace_ids[0].trace_id.len(), 16);
+        assert_eq!(response.trace_ids[1].trace_id.len(), 16);
+    }
+
+    #[test]
+    fn test_convert_v2_attributes_to_v1_tags() {
+        let attributes = vec![
+            quickwit_proto::jaeger::storage::v2::KeyValue {
+                key: "http.method".to_string(),
+                value: Some(quickwit_proto::jaeger::storage::v2::AnyValue {
+                    value: Some(
+                        quickwit_proto::jaeger::storage::v2::any_value::Value::StringValue(
+                            "GET".to_string(),
+                        ),
+                    ),
+                }),
+            },
+            quickwit_proto::jaeger::storage::v2::KeyValue {
+                key: "http.status_code".to_string(),
+                value: Some(quickwit_proto::jaeger::storage::v2::AnyValue {
+                    value: Some(
+                        quickwit_proto::jaeger::storage::v2::any_value::Value::IntValue(200),
+                    ),
+                }),
+            },
+            quickwit_proto::jaeger::storage::v2::KeyValue {
+                key: "error".to_string(),
+                value: Some(quickwit_proto::jaeger::storage::v2::AnyValue {
+                    value: Some(
+                        quickwit_proto::jaeger::storage::v2::any_value::Value::BoolValue(false),
+                    ),
+                }),
+            },
+        ];
+
+        let tags = crate::v2::convert_v2_attributes_to_v1_tags(attributes);
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags.get("http.method"), Some(&"GET".to_string()));
+        assert_eq!(tags.get("http.status_code"), Some(&"200".to_string()));
+        assert_eq!(tags.get("error"), Some(&"false".to_string()));
+    }
+
+    // Note: test_spans_to_otel_traces_data was removed as v2 now works directly with
+    // native OpenTelemetry format (QwSpan) instead of converting from Jaeger v1 format
 }

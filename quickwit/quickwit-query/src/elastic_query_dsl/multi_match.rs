@@ -1,26 +1,22 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use serde::Deserialize;
 use serde_with::formats::PreferMany;
-use serde_with::{serde_as, OneOrMany};
+use serde_with::{OneOrMany, serde_as};
 
+use super::LeniencyBool;
 use crate::elastic_query_dsl::bool_query::BoolQuery;
 use crate::elastic_query_dsl::match_bool_prefix::MatchBoolPrefixQuery;
 use crate::elastic_query_dsl::match_phrase_query::{MatchPhraseQuery, MatchPhraseQueryParams};
@@ -30,7 +26,7 @@ use crate::elastic_query_dsl::phrase_prefix_query::{
 };
 use crate::elastic_query_dsl::{ConvertibleToQueryAst, ElasticQueryDslInner};
 
-/// Multi match queries are a bit odd. They end up being expanded into another type query of query.
+/// Multi match queries are a bit odd. They end up being expanded into another type of query.
 /// In Quickwit, we operate this expansion in generic way at the time of deserialization.
 #[derive(Deserialize, Debug, Eq, PartialEq, Clone)]
 #[serde(try_from = "MultiMatchQueryForDeserialization")]
@@ -48,11 +44,8 @@ struct MultiMatchQueryForDeserialization {
     #[serde_as(deserialize_as = "OneOrMany<_, PreferMany>")]
     #[serde(default)]
     fields: Vec<String>,
-    // Regardless of this option Quickwit behaves in elasticsearch definition of
-    // lenient. We include this property here just to accept user queries containing
-    // this option.
-    #[serde(default, rename = "lenient")]
-    _lenient: bool,
+    #[serde(default)]
+    lenient: LeniencyBool,
 }
 
 fn deserialize_match_query_for_one_field(
@@ -101,14 +94,14 @@ fn deserialize_match_query_for_one_field(
 fn validate_field_name(field_name: &str) -> Result<(), String> {
     if field_name.contains('^') {
         return Err(format!(
-            "Quickwit does not support field boosting in the multi match query fields (got `{}`)",
-            field_name
+            "Quickwit does not support field boosting in the multi match query fields (got \
+             `{field_name}`)"
         ));
     }
     if field_name.contains('*') {
         return Err(format!(
-            "Quickwit does not support wildcards in the multi match query fields (got `{}`)",
-            field_name
+            "Quickwit does not support wildcards in the multi match query fields (got \
+             `{field_name}`)"
         ));
     }
     Ok(())
@@ -180,7 +173,7 @@ mod tests {
         let err_msg: String = serde_json::from_str::<MultiMatchQuery>(json)
             .unwrap_err()
             .to_string();
-        assert!(err_msg.contains(expected_error_msg), "Got `{}`", err_msg);
+        assert!(err_msg.contains(expected_error_msg), "Got `{err_msg}`");
     }
 
     #[test]
@@ -198,7 +191,7 @@ mod tests {
                         query: "quick brown fox".to_string(),
                         operator: crate::BooleanOperand::Or,
                         zero_terms_query: Default::default(),
-                        _lenient: false,
+                        lenient: false,
                     },
                 }
                 .into(),
@@ -208,7 +201,7 @@ mod tests {
                         query: "quick brown fox".to_string(),
                         operator: crate::BooleanOperand::Or,
                         zero_terms_query: Default::default(),
-                        _lenient: false,
+                        lenient: false,
                     },
                 }
                 .into(),
@@ -228,7 +221,7 @@ mod tests {
                         query: "quick brown fox".to_string(),
                         operator: crate::BooleanOperand::Or,
                         zero_terms_query: Default::default(),
-                        _lenient: false,
+                        lenient: false,
                     },
                 }
                 .into(),
@@ -238,7 +231,7 @@ mod tests {
                         query: "quick brown fox".to_string(),
                         operator: crate::BooleanOperand::Or,
                         zero_terms_query: Default::default(),
-                        _lenient: false,
+                        lenient: false,
                     },
                 }
                 .into(),
@@ -258,7 +251,7 @@ mod tests {
                         query: "quick brown fox".to_string(),
                         operator: crate::BooleanOperand::Or,
                         zero_terms_query: Default::default(),
-                        _lenient: false,
+                        lenient: false,
                     },
                 }
                 .into(),
@@ -268,7 +261,7 @@ mod tests {
                         query: "quick brown fox".to_string(),
                         operator: crate::BooleanOperand::Or,
                         zero_terms_query: Default::default(),
-                        _lenient: false,
+                        lenient: false,
                     },
                 }
                 .into(),
@@ -350,7 +343,7 @@ mod tests {
                         query: "quick brown".to_string(),
                         operator: crate::BooleanOperand::Or,
                         zero_terms_query: Default::default(),
-                        _lenient: false,
+                        lenient: false,
                     },
                 }
                 .into(),
@@ -360,7 +353,7 @@ mod tests {
                         query: "quick brown".to_string(),
                         operator: crate::BooleanOperand::Or,
                         zero_terms_query: Default::default(),
-                        _lenient: false,
+                        lenient: false,
                     },
                 }
                 .into(),

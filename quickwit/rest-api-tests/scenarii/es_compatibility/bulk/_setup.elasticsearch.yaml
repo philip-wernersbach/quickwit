@@ -1,6 +1,6 @@
 # Delete possibly remaining index
 method: DELETE
-endpoint: test-index
+endpoint: test-index*
 status_code: null
 ---
 method: PUT
@@ -19,3 +19,10 @@ json: {
     }
   }
 }
+---
+# Only create indexes automatically for specific pattern
+method: PUT
+endpoint: _cluster/settings
+json:
+  transient:
+    action.auto_create_index: "test-index-pattern-*"

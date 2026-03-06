@@ -1,37 +1,44 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import AppBar from '@mui/material/AppBar';
-import Toolbar from '@mui/material/Toolbar';
-import GitHubIcon from '@mui/icons-material/GitHub';
-import { Box, IconButton, Link, styled, SvgIcon, Tooltip, Typography } from '@mui/material';
-import { Discord } from '@styled-icons/fa-brands/Discord';
-import { ReactComponent as Logo } from '../assets/img/quickwit-logo.svg';
-import { Client } from '../services/client';
-import { useEffect, useMemo, useState } from 'react';
+import GitHubIcon from "@mui/icons-material/GitHub";
+import {
+  Box,
+  IconButton,
+  Link,
+  SvgIcon,
+  styled,
+  Tooltip,
+  Typography,
+} from "@mui/material";
+import AppBar from "@mui/material/AppBar";
+import Toolbar from "@mui/material/Toolbar";
+import { Discord } from "@styled-icons/fa-brands/Discord";
+import { useEffect, useMemo, useState } from "react";
+import quickwitLogoUrl from "../assets/img/quickwit-logo-with-title.svg";
+import { Client } from "../services/client";
 
-const StyledAppBar = styled(AppBar)(({ theme })=>({
+const Logo = (props: React.ComponentProps<"img">) => (
+  <img {...props} src={quickwitLogoUrl} alt="quickwit logo" />
+);
+
+const StyledAppBar = styled(AppBar)(({ theme }) => ({
   zIndex: theme.zIndex.drawer + 1,
 }));
 
 // Update the Button's color prop options
-declare module '@mui/material/AppBar' {
+declare module "@mui/material/AppBar" {
   interface AppBarPropsColorOverrides {
     neutral: true;
   }
@@ -42,24 +49,30 @@ const TopBar = () => {
   const quickwitClient = useMemo(() => new Client(), []);
 
   useEffect(() => {
-    quickwitClient.cluster().then(cluster => {
+    quickwitClient.cluster().then((cluster) => {
       setClusterId(cluster.cluster_id);
     });
-  }, [])
+  }, [quickwitClient]);
 
   return (
     <StyledAppBar position="fixed" elevation={0} color="neutral">
       <Toolbar variant="dense">
-        <Box sx={{ flexGrow: 1, p: 0, m: 0, display: 'flex', alignItems: 'center' }}>
-          <Logo height='25px'></Logo>
+        <Box
+          sx={{
+            flexGrow: 1,
+            p: 0,
+            m: 0,
+            display: "flex",
+            alignItems: "center",
+          }}
+        >
+          <Logo height="25px"></Logo>
           <Tooltip title="Cluster ID" placement="right">
-            <Typography mx={2}>
-              {clusterId}
-            </Typography>
+            <Typography mx={2}>{clusterId}</Typography>
           </Tooltip>
         </Box>
         <Link href="https://quickwit.io/docs" target="_blank" sx={{ px: 2 }}>
-            Docs
+          Docs
         </Link>
         <Link href="https://discord.gg/rpRRTezWhW" target="_blank">
           <IconButton size="large">

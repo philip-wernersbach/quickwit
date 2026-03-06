@@ -1,24 +1,20 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use tantivy::Term;
 use tantivy::query::{
     PhrasePrefixQuery as TantivyPhrasePrefixQuery, PhraseQuery as TantivyPhraseQuery,
     TermQuery as TantivyTermQuery,
@@ -28,13 +24,12 @@ use tantivy::schema::{
     TextFieldIndexing,
 };
 use tantivy::tokenizer::{TextAnalyzer, TokenStream};
-use tantivy::Term;
 
 use crate::query_ast::tantivy_query_ast::{TantivyBoolQuery, TantivyQueryAst};
 use crate::query_ast::utils::full_text_query;
-use crate::query_ast::{BuildTantivyAst, QueryAst};
+use crate::query_ast::{BuildTantivyAst, BuildTantivyAstContext, QueryAst};
 use crate::tokenizers::TokenizerManager;
-use crate::{find_field_or_hit_dynamic, BooleanOperand, InvalidQuery, MatchAllOrNone};
+use crate::{BooleanOperand, InvalidQuery, MatchAllOrNone, find_field_or_hit_dynamic};
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
@@ -60,7 +55,7 @@ impl FullTextParams {
             .unwrap_or(text_field_indexing.tokenizer());
         tokenizer_manager
             .get_tokenizer(tokenizer_name)
-            .with_context(|| format!("no tokenizer named `{}` is registered", tokenizer_name))
+            .with_context(|| format!("no tokenizer named `{tokenizer_name}` is registered"))
     }
 
     pub(crate) fn tokenize_text_into_terms_json(
@@ -73,7 +68,7 @@ impl FullTextParams {
     ) -> anyhow::Result<Vec<(usize, Term)>> {
         let text_indexing_options = json_options
             .get_text_indexing_options()
-            .with_context(|| format!("Json field text `{}` is not indexed", json_path))?;
+            .with_context(|| format!("Json field text `{json_path}` is not indexed"))?;
         let mut text_analyzer: TextAnalyzer =
             self.text_analyzer(text_indexing_options, tokenizer_manager)?;
         let mut token_stream = text_analyzer.token_stream(text);
@@ -227,6 +222,8 @@ pub struct FullTextQuery {
     pub field: String,
     pub text: String,
     pub params: FullTextParams,
+    /// Support missing fields
+    pub lenient: bool,
 }
 
 impl From<FullTextQuery> for QueryAst {
@@ -238,17 +235,15 @@ impl From<FullTextQuery> for QueryAst {
 impl BuildTantivyAst for FullTextQuery {
     fn build_tantivy_ast_impl(
         &self,
-        schema: &TantivySchema,
-        tokenizer_manager: &TokenizerManager,
-        _search_fields: &[String],
-        _with_validation: bool,
+        context: &BuildTantivyAstContext,
     ) -> Result<TantivyQueryAst, InvalidQuery> {
         full_text_query(
             &self.field,
             &self.text,
             &self.params,
-            schema,
-            tokenizer_manager,
+            context.schema,
+            context.tokenizer_manager,
+            self.lenient,
         )
     }
 }
@@ -268,8 +263,7 @@ impl FullTextQuery {
             return None;
         };
 
-        let (field, field_entry, json_path) =
-            find_field_or_hit_dynamic(&self.field, schema).ok()?;
+        let (field, field_entry, json_path) = find_field_or_hit_dynamic(&self.field, schema)?;
         let field_type: &FieldType = field_entry.field_type();
         match field_type {
             FieldType::Str(text_options) => {
@@ -286,7 +280,7 @@ impl FullTextQuery {
                 let (_pos, term) = terms.pop()?;
                 Some(term)
             }
-            FieldType::JsonObject(ref json_options) => {
+            FieldType::JsonObject(json_options) => {
                 let mut terms = self
                     .params
                     .tokenize_text_into_terms_json(
@@ -307,11 +301,11 @@ impl FullTextQuery {
 
 #[cfg(test)]
 mod tests {
-    use tantivy::schema::{Schema, TEXT};
+    use tantivy::schema::{DateOptions, DateTimePrecision, Schema, TEXT};
 
+    use crate::BooleanOperand;
     use crate::query_ast::tantivy_query_ast::TantivyQueryAst;
-    use crate::query_ast::{BuildTantivyAst, FullTextMode, FullTextQuery};
-    use crate::{create_default_quickwit_tokenizer_manager, BooleanOperand};
+    use crate::query_ast::{BuildTantivyAst, BuildTantivyAstContext, FullTextMode, FullTextQuery};
 
     #[test]
     fn test_zero_terms() {
@@ -323,17 +317,13 @@ mod tests {
                 mode: BooleanOperand::And.into(),
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
             },
+            lenient: false,
         };
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("body", TEXT);
         let schema = schema_builder.build();
         let ast: TantivyQueryAst = full_text_query
-            .build_tantivy_ast_call(
-                &schema,
-                &create_default_quickwit_tokenizer_manager(),
-                &[],
-                true,
-            )
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
             .unwrap();
         assert_eq!(ast.const_predicate(), Some(crate::MatchAllOrNone::MatchAll));
     }
@@ -348,21 +338,17 @@ mod tests {
                 mode: FullTextMode::Phrase { slop: 1 },
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
             },
+            lenient: false,
         };
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("body", TEXT);
         let schema = schema_builder.build();
         let ast: TantivyQueryAst = full_text_query
-            .build_tantivy_ast_call(
-                &schema,
-                &create_default_quickwit_tokenizer_manager(),
-                &[],
-                true,
-            )
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
             .unwrap();
         let leaf = ast.as_leaf().unwrap();
         assert_eq!(
-            &format!("{:?}", leaf),
+            &format!("{leaf:?}"),
             "PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \
              \"hello\")), (1, Term(field=0, type=Str, \"world\"))], slop: 1 }"
         );
@@ -378,23 +364,72 @@ mod tests {
                 mode: FullTextMode::Phrase { slop: 1 },
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
             },
+            lenient: false,
         };
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("body", TEXT);
         let schema = schema_builder.build();
         let ast: TantivyQueryAst = full_text_query
-            .build_tantivy_ast_call(
-                &schema,
-                &create_default_quickwit_tokenizer_manager(),
-                &[],
-                true,
-            )
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
             .unwrap();
         let leaf = ast.as_leaf().unwrap();
         assert_eq!(
-            &format!("{:?}", leaf),
+            &format!("{leaf:?}"),
             r#"TermQuery(Term(field=0, type=Str, "Hello world"))"#
         );
+    }
+
+    #[test]
+    fn test_full_text_datetime() {
+        let full_text_query = FullTextQuery {
+            field: "ts".to_string(),
+            text: "2025-12-13T16:13:12.666777Z".to_string(),
+            params: super::FullTextParams {
+                tokenizer: Some("raw".to_string()),
+                mode: FullTextMode::Phrase { slop: 1 },
+                zero_terms_query: crate::MatchAllOrNone::MatchAll,
+            },
+            lenient: false,
+        };
+        {
+            // indexed, we truncate to the second
+            let mut schema_builder = Schema::builder();
+            schema_builder.add_date_field(
+                "ts",
+                DateOptions::default()
+                    .set_precision(DateTimePrecision::Milliseconds)
+                    .set_fast()
+                    .set_indexed(),
+            );
+            let schema = schema_builder.build();
+            let ast: TantivyQueryAst = full_text_query
+                .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
+                .unwrap();
+            let leaf = ast.as_leaf().unwrap();
+            assert_eq!(
+                &format!("{leaf:?}"),
+                r#"TermQuery(Term(field=0, type=Date, 2025-12-13T16:13:12Z))"#
+            );
+        }
+        {
+            // not indexed, we truncate to fastfield precision
+            let mut schema_builder = Schema::builder();
+            schema_builder.add_date_field(
+                "ts",
+                DateOptions::default()
+                    .set_precision(DateTimePrecision::Milliseconds)
+                    .set_fast(),
+            );
+            let schema = schema_builder.build();
+            let ast: TantivyQueryAst = full_text_query
+                .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
+                .unwrap();
+            let leaf = ast.as_leaf().unwrap();
+            assert_eq!(
+                &format!("{leaf:?}"),
+                r#"TermQuery(Term(field=0, type=Date, 2025-12-13T16:13:12.666Z))"#
+            );
+        }
     }
 
     #[test]
@@ -407,17 +442,13 @@ mod tests {
                 mode: BooleanOperand::And.into(),
                 zero_terms_query: crate::MatchAllOrNone::MatchAll,
             },
+            lenient: false,
         };
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("body", TEXT);
         let schema = schema_builder.build();
         let ast: TantivyQueryAst = full_text_query
-            .build_tantivy_ast_call(
-                &schema,
-                &create_default_quickwit_tokenizer_manager(),
-                &[],
-                true,
-            )
+            .build_tantivy_ast_call(&BuildTantivyAstContext::for_test(&schema))
             .unwrap();
         let bool_query = ast.as_bool_query().unwrap();
         assert_eq!(bool_query.must.len(), 2);

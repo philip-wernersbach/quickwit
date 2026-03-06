@@ -1,39 +1,30 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 mod chinese_compatible;
 mod code_tokenizer;
-#[cfg(feature = "multilang")]
-mod multilang;
 mod tokenizer_manager;
 
 use once_cell::sync::Lazy;
 use tantivy::tokenizer::{
-    AsciiFoldingFilter, Language, LowerCaser, RawTokenizer, RemoveLongFilter, SimpleTokenizer,
-    Stemmer, TextAnalyzer, WhitespaceTokenizer,
+    AsciiFoldingFilter, LowerCaser, RawTokenizer, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
+    WhitespaceTokenizer,
 };
 
 use self::chinese_compatible::ChineseTokenizer;
 pub use self::code_tokenizer::CodeTokenizer;
-#[cfg(feature = "multilang")]
-pub use self::multilang::MultiLangTokenizer;
-pub use self::tokenizer_manager::TokenizerManager;
+pub use self::tokenizer_manager::{RAW_TOKENIZER_NAME, TokenizerManager};
 
 pub const DEFAULT_REMOVE_TOKEN_LENGTH: usize = 255;
 
@@ -63,14 +54,6 @@ pub fn create_default_quickwit_tokenizer_manager() -> TokenizerManager {
         .filter(LowerCaser)
         .build();
     tokenizer_manager.register("default", default_tokenizer, true);
-
-    let en_stem_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
-        .filter(LowerCaser)
-        .filter(Stemmer::new(Language::English))
-        .build();
-    tokenizer_manager.register("en_stem", en_stem_tokenizer, true);
-
     tokenizer_manager.register("whitespace", WhitespaceTokenizer::default(), false);
 
     let chinese_tokenizer = TextAnalyzer::builder(ChineseTokenizer)
@@ -93,15 +76,6 @@ pub fn create_default_quickwit_tokenizer_manager() -> TokenizerManager {
             .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
             .filter(LowerCaser)
             .filter(AsciiFoldingFilter)
-            .build(),
-        true,
-    );
-    #[cfg(feature = "multilang")]
-    tokenizer_manager.register(
-        "multilang_default",
-        TextAnalyzer::builder(MultiLangTokenizer::default())
-            .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
-            .filter(LowerCaser)
             .build(),
         true,
     );

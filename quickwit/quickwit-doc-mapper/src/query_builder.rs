@@ -1,37 +1,36 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Bound;
+use std::sync::Arc;
 
+use quickwit_proto::types::SplitId;
 use quickwit_query::query_ast::{
-    FieldPresenceQuery, FullTextQuery, PhrasePrefixQuery, QueryAst, QueryAstVisitor, RangeQuery,
-    TermSetQuery, WildcardQuery,
+    BuildTantivyAstContext, FieldPresenceQuery, FullTextQuery, PhrasePrefixQuery, QueryAst,
+    QueryAstTransformer, QueryAstVisitor, RangeQuery, RegexQuery, TermSetQuery, WildcardQuery,
 };
 use quickwit_query::tokenizers::TokenizerManager;
-use quickwit_query::{find_field_or_hit_dynamic, InvalidQuery};
+use quickwit_query::{InvalidQuery, find_field_or_hit_dynamic};
+use tantivy::Term;
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema};
-use tantivy::Term;
+use tracing::error;
 
-use crate::{QueryParserError, TermRange, WarmupInfo};
+use crate::doc_mapper::FastFieldWarmupInfo;
+use crate::{Automaton, QueryParserError, TermRange, WarmupInfo};
 
 #[derive(Default)]
 struct RangeQueryFields {
@@ -48,65 +47,171 @@ impl<'a> QueryAstVisitor<'a> for RangeQueryFields {
     }
 }
 
-#[derive(Default)]
-struct ExistsQueryFields {
-    exists_query_field_names: HashSet<String>,
+/// Term Queries on fields which are fast but not indexed.
+struct TermSearchOnColumnar<'f> {
+    fields: &'f mut HashSet<FastFieldWarmupInfo>,
+    schema: Schema,
+}
+impl<'a, 'f> QueryAstVisitor<'a> for TermSearchOnColumnar<'f> {
+    type Err = Infallible;
+
+    fn visit_term_set(&mut self, term_set_query: &'a TermSetQuery) -> Result<(), Infallible> {
+        for field in term_set_query.terms_per_field.keys() {
+            if let Some((_field, field_entry, path)) =
+                find_field_or_hit_dynamic(field, &self.schema)
+                && field_entry.is_fast()
+                && !field_entry.is_indexed()
+            {
+                self.fields.insert(FastFieldWarmupInfo {
+                    name: if path.is_empty() {
+                        field_entry.name().to_string()
+                    } else {
+                        format!("{}.{}", field_entry.name(), path)
+                    },
+                    with_subfields: false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_term(
+        &mut self,
+        term_query: &'a quickwit_query::query_ast::TermQuery,
+    ) -> Result<(), Infallible> {
+        if let Some((_field, field_entry, path)) =
+            find_field_or_hit_dynamic(&term_query.field, &self.schema)
+            && field_entry.is_fast()
+            && !field_entry.is_indexed()
+        {
+            self.fields.insert(FastFieldWarmupInfo {
+                name: if path.is_empty() {
+                    field_entry.name().to_string()
+                } else {
+                    format!("{}.{}", field_entry.name(), path)
+                },
+                with_subfields: false,
+            });
+        }
+        Ok(())
+    }
+    /// We also need to visit full text queries because they can be converted to term queries
+    /// on fast fields. We only care about the field being fast and not indexed AND the tokenizer
+    /// being `raw` or None.
+    fn visit_full_text(&mut self, full_text_query: &'a FullTextQuery) -> Result<(), Infallible> {
+        if let Some((_field, field_entry, path)) =
+            find_field_or_hit_dynamic(&full_text_query.field, &self.schema)
+            && field_entry.is_fast()
+            && !field_entry.is_indexed()
+            && (full_text_query.params.tokenizer.is_none()
+                || full_text_query.params.tokenizer.as_deref() == Some("raw"))
+        {
+            self.fields.insert(FastFieldWarmupInfo {
+                name: if path.is_empty() {
+                    field_entry.name().to_string()
+                } else {
+                    format!("{}.{}", field_entry.name(), path)
+                },
+                with_subfields: false,
+            });
+        }
+        Ok(())
+    }
 }
 
-impl<'a> QueryAstVisitor<'a> for ExistsQueryFields {
+struct ExistsQueryFastFields<'f> {
+    fields: &'f mut HashSet<FastFieldWarmupInfo>,
+    schema: Schema,
+}
+
+impl<'a, 'f> QueryAstVisitor<'a> for ExistsQueryFastFields<'f> {
     type Err = Infallible;
 
     fn visit_exists(&mut self, exists_query: &'a FieldPresenceQuery) -> Result<(), Infallible> {
-        // If the field is a fast field, we will rely on the `ColumnIndex`.
-        // If the field is not a fast, we will rely on the field presence field.
-        //
-        // After all field names are collected they are checked against schema and
-        // non-fast fields are removed from warmup operation.
-        self.exists_query_field_names
-            .insert(exists_query.field.to_string());
+        let fields = exists_query.find_field_and_subfields(&self.schema);
+        for (_, field_entry, path) in fields {
+            if field_entry.is_fast() {
+                if field_entry.field_type().is_json() {
+                    let full_path = format!("{}.{}", field_entry.name(), path);
+                    self.fields.insert(FastFieldWarmupInfo {
+                        name: full_path,
+                        with_subfields: true,
+                    });
+                } else if path.is_empty() {
+                    self.fields.insert(FastFieldWarmupInfo {
+                        name: field_entry.name().to_string(),
+                        with_subfields: false,
+                    });
+                } else {
+                    error!(
+                        field_entry = field_entry.name(),
+                        path, "only JSON type supports subfields"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
 
 /// Build a `Query` with field resolution & forbidding range clauses.
 pub(crate) fn build_query(
-    query_ast: &QueryAst,
-    schema: Schema,
-    tokenizer_manager: &TokenizerManager,
-    search_fields: &[String],
-    with_validation: bool,
+    query_ast: QueryAst,
+    context: &BuildTantivyAstContext,
+    cache_context: Option<(Arc<dyn quickwit_query::query_ast::PredicateCache>, SplitId)>,
 ) -> Result<(Box<dyn Query>, WarmupInfo), QueryParserError> {
+    let mut fast_fields: HashSet<FastFieldWarmupInfo> = HashSet::new();
+
+    let query_ast = if let Some((cache, split_id)) = cache_context {
+        let Ok(query_ast) = quickwit_query::query_ast::PredicateCacheInjector { cache, split_id }
+            .transform(query_ast);
+        // this transformer isn't supposed to ever remove a node
+        query_ast.unwrap_or(QueryAst::MatchAll)
+    } else {
+        query_ast
+    };
+
     let mut range_query_fields = RangeQueryFields::default();
     // This cannot fail. The error type is Infallible.
-    let _: Result<(), Infallible> = range_query_fields.visit(query_ast);
-
-    let mut exists_query_fields = ExistsQueryFields::default();
-    // This cannot fail. The error type is Infallible.
-    let _: Result<(), Infallible> = exists_query_fields.visit(query_ast);
-
-    let mut fast_field_names = HashSet::new();
-    fast_field_names.extend(range_query_fields.range_query_field_names);
-    fast_field_names.extend(
-        exists_query_fields
-            .exists_query_field_names
+    let Ok(_) = range_query_fields.visit(&query_ast);
+    let range_query_fast_fields =
+        range_query_fields
+            .range_query_field_names
             .into_iter()
-            .filter(|field| is_fast_field(&schema, field)),
-    );
+            .map(|name| FastFieldWarmupInfo {
+                name,
+                with_subfields: false,
+            });
+    fast_fields.extend(range_query_fast_fields);
 
-    let query = query_ast.build_tantivy_query(
-        &schema,
-        tokenizer_manager,
-        search_fields,
-        with_validation,
-    )?;
+    let Ok(_) = TermSearchOnColumnar {
+        fields: &mut fast_fields,
+        schema: context.schema.clone(),
+    }
+    .visit(&query_ast);
 
-    let term_set_query_fields = extract_term_set_query_fields(query_ast, &schema)?;
-    let term_ranges_grouped_by_field =
-        extract_prefix_term_ranges(query_ast, &schema, tokenizer_manager)?;
+    let Ok(_) = ExistsQueryFastFields {
+        fields: &mut fast_fields,
+        schema: context.schema.clone(),
+    }
+    .visit(&query_ast);
+
+    let query = query_ast.build_tantivy_query(context)?;
+
+    let term_set_query_fields = extract_term_set_query_fields(&query_ast, context.schema)?;
+    let (term_ranges_grouped_by_field, automatons_grouped_by_field) =
+        extract_prefix_term_ranges_and_automaton(
+            &query_ast,
+            context.schema,
+            context.tokenizer_manager,
+        )?;
 
     let mut terms_grouped_by_field: HashMap<Field, HashMap<_, bool>> = Default::default();
     query.query_terms(&mut |term, need_position| {
         let field = term.field();
+        if !context.schema.get_field_entry(field).is_indexed() {
+            return;
+        }
         *terms_grouped_by_field
             .entry(field)
             .or_default()
@@ -118,18 +223,12 @@ pub(crate) fn build_query(
         term_dict_fields: term_set_query_fields,
         terms_grouped_by_field,
         term_ranges_grouped_by_field,
-        fast_field_names,
+        fast_fields,
+        automatons_grouped_by_field,
         ..WarmupInfo::default()
     };
 
     Ok((query, warmup_info))
-}
-
-fn is_fast_field(schema: &Schema, field_name: &str) -> bool {
-    if let Ok((_field, field_entry, _path)) = find_field_or_hit_dynamic(field_name, schema) {
-        return field_entry.is_fast();
-    }
-    false
 }
 
 struct ExtractTermSetFields<'a> {
@@ -146,12 +245,13 @@ impl<'a> ExtractTermSetFields<'a> {
     }
 }
 
-impl<'a, 'b> QueryAstVisitor<'a> for ExtractTermSetFields<'b> {
+impl<'a> QueryAstVisitor<'a> for ExtractTermSetFields<'_> {
     type Err = anyhow::Error;
 
     fn visit_term_set(&mut self, term_set_query: &'a TermSetQuery) -> anyhow::Result<()> {
         for field in term_set_query.terms_per_field.keys() {
-            if let Ok((field, _field_entry, _path)) = find_field_or_hit_dynamic(field, self.schema)
+            if let Some((field, _field_entry, _path)) =
+                find_field_or_hit_dynamic(field, self.schema)
             {
                 self.term_dict_fields_to_warm_up.insert(field);
             } else {
@@ -171,20 +271,32 @@ fn extract_term_set_query_fields(
     Ok(visitor.term_dict_fields_to_warm_up)
 }
 
+/// Converts a `prefix` term into the equivalent term range.
+///
+/// The resulting range is `[prefix, next_prefix)`, that is:
+/// - start bound: `Included(prefix)`
+/// - end bound: `Excluded(next lexicographic term after the prefix)`
+///
+/// "abc"    -> start: "abc", end: "abd" (excluded)
+/// "ab\xFF" -> start: "ab\xFF", end: "ac" (excluded)
+/// "\xFF\xFF" -> start: "\xFF\xFF", end: Unbounded
 fn prefix_term_to_range(prefix: Term) -> (Bound<Term>, Bound<Term>) {
-    let mut end_bound = prefix.serialized_term().to_vec();
-    while !end_bound.is_empty() {
-        let last_byte = end_bound.last_mut().unwrap();
+    // Start from the given prefix and try to find the successor
+    let mut end_bound = prefix.clone();
+    let mut end_bound_value_bytes = prefix.serialized_value_bytes().to_vec();
+    while !end_bound_value_bytes.is_empty() {
+        let last_byte = end_bound_value_bytes.last_mut().unwrap();
         if *last_byte != u8::MAX {
             *last_byte += 1;
-            return (
-                Bound::Included(prefix),
-                Bound::Excluded(Term::wrap(end_bound)),
-            );
+            // The last non-`u8::MAX` byte incremented
+            // gives us the exclusive upper bound.
+            end_bound.set_bytes(&end_bound_value_bytes);
+            return (Bound::Included(prefix), Bound::Excluded(end_bound));
         }
-        end_bound.pop();
+        // pop u8::MAX byte and try next
+        end_bound_value_bytes.pop();
     }
-    // prefix is something like [255, 255, ..]
+    // All bytes were `u8::MAX`: there is no successor, so the upper bound is unbounded.
     (Bound::Included(prefix), Bound::Unbounded)
 }
 
@@ -194,6 +306,7 @@ struct ExtractPrefixTermRanges<'a> {
     schema: &'a Schema,
     tokenizer_manager: &'a TokenizerManager,
     term_ranges_to_warm_up: HashMap<Field, HashMap<TermRange, PositionNeeded>>,
+    automatons_to_warm_up: HashMap<Field, HashSet<Automaton>>,
 }
 
 impl<'a> ExtractPrefixTermRanges<'a> {
@@ -202,6 +315,7 @@ impl<'a> ExtractPrefixTermRanges<'a> {
             schema,
             tokenizer_manager,
             term_ranges_to_warm_up: HashMap::new(),
+            automatons_to_warm_up: HashMap::new(),
         }
     }
 
@@ -224,6 +338,13 @@ impl<'a> ExtractPrefixTermRanges<'a> {
             .or_default()
             .entry(term_range)
             .or_default() |= position_needed;
+    }
+
+    fn add_automaton(&mut self, field: Field, automaton: Automaton) {
+        self.automatons_to_warm_up
+            .entry(field)
+            .or_default()
+            .insert(automaton);
     }
 }
 
@@ -248,7 +369,9 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
     ) -> Result<(), Self::Err> {
         let terms = match phrase_prefix.get_terms(self.schema, self.tokenizer_manager) {
             Ok((_, terms)) => terms,
-            Err(InvalidQuery::SchemaError(_)) => return Ok(()), /* the query will be nullified when casting to a tantivy ast */
+            Err(InvalidQuery::SchemaError(_)) | Err(InvalidQuery::FieldDoesNotExist { .. }) => {
+                return Ok(());
+            } /* the query will be nullified when casting to a tantivy ast */
             Err(e) => return Err(e),
         };
         if let Some((_, term)) = terms.last() {
@@ -258,35 +381,63 @@ impl<'a, 'b: 'a> QueryAstVisitor<'a> for ExtractPrefixTermRanges<'b> {
     }
 
     fn visit_wildcard(&mut self, wildcard_query: &'a WildcardQuery) -> Result<(), Self::Err> {
-        let (_, term) = wildcard_query.extract_prefix_term(self.schema, self.tokenizer_manager)?;
-        self.add_prefix_term(term, u32::MAX, false);
+        let (field, path, regex) =
+            match wildcard_query.to_regex(self.schema, self.tokenizer_manager) {
+                Ok(res) => res,
+                /* the query will be nullified when casting to a tantivy ast */
+                Err(InvalidQuery::FieldDoesNotExist { .. }) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+
+        self.add_automaton(field, Automaton::Regex(path, regex));
+        Ok(())
+    }
+
+    fn visit_regex(&mut self, regex_query: &'a RegexQuery) -> Result<(), Self::Err> {
+        let (field, path, regex) = match regex_query.to_field_and_regex(self.schema) {
+            Ok(res) => res,
+            /* the query will be nullified when casting to a tantivy ast */
+            Err(InvalidQuery::FieldDoesNotExist { .. }) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        self.add_automaton(field, Automaton::Regex(path, regex));
         Ok(())
     }
 }
 
-fn extract_prefix_term_ranges(
+type TermRangeWarmupInfo = HashMap<Field, HashMap<TermRange, PositionNeeded>>;
+type AutomatonWarmupInfo = HashMap<Field, HashSet<Automaton>>;
+
+fn extract_prefix_term_ranges_and_automaton(
     query_ast: &QueryAst,
     schema: &Schema,
     tokenizer_manager: &TokenizerManager,
-) -> anyhow::Result<HashMap<Field, HashMap<TermRange, PositionNeeded>>> {
+) -> anyhow::Result<(TermRangeWarmupInfo, AutomatonWarmupInfo)> {
     let mut visitor = ExtractPrefixTermRanges::with_schema(schema, tokenizer_manager);
     visitor.visit(query_ast)?;
-    Ok(visitor.term_ranges_to_warm_up)
+    Ok((
+        visitor.term_ranges_to_warm_up,
+        visitor.automatons_to_warm_up,
+    ))
 }
 
 #[cfg(test)]
 mod test {
     use std::ops::Bound;
 
+    use quickwit_common::shared_consts::FIELD_PRESENCE_FIELD_NAME;
     use quickwit_query::query_ast::{
-        query_ast_from_user_text, FullTextMode, FullTextParams, PhrasePrefixQuery, QueryAstVisitor,
+        BuildTantivyAstContext, FullTextMode, FullTextParams, PhrasePrefixQuery, QueryAstVisitor,
+        UserInputQuery, query_ast_from_user_text,
     };
-    use quickwit_query::{create_default_quickwit_tokenizer_manager, MatchAllOrNone};
-    use tantivy::schema::{DateOptions, DateTimePrecision, Schema, FAST, INDEXED, STORED, TEXT};
+    use quickwit_query::{
+        BooleanOperand, MatchAllOrNone, create_default_quickwit_tokenizer_manager,
+    };
     use tantivy::Term;
+    use tantivy::schema::{DateOptions, DateTimePrecision, FAST, INDEXED, STORED, Schema, TEXT};
 
-    use super::{build_query, ExtractPrefixTermRanges};
-    use crate::{TermRange, DYNAMIC_FIELD_NAME, SOURCE_FIELD_NAME};
+    use super::{ExtractPrefixTermRanges, build_query};
+    use crate::{DYNAMIC_FIELD_NAME, SOURCE_FIELD_NAME, TermRange};
 
     enum TestExpectation<'a> {
         Err(&'a str),
@@ -295,6 +446,7 @@ mod test {
 
     fn make_schema(dynamic_mode: bool) -> Schema {
         let mut schema_builder = Schema::builder();
+        schema_builder.add_i64_field(FIELD_PRESENCE_FIELD_NAME, INDEXED);
         schema_builder.add_text_field("title", TEXT);
         schema_builder.add_text_field("desc", TEXT | STORED);
         schema_builder.add_text_field("server.name", TEXT | STORED);
@@ -311,6 +463,8 @@ mod test {
         schema_builder.add_u64_field("u64_fast", FAST | STORED);
         schema_builder.add_i64_field("i64_fast", FAST | STORED);
         schema_builder.add_f64_field("f64_fast", FAST | STORED);
+        schema_builder.add_json_field("json_fast", FAST);
+        schema_builder.add_json_field("json_text", TEXT);
         if dynamic_mode {
             schema_builder.add_json_field(DYNAMIC_FIELD_NAME, TEXT);
         }
@@ -323,7 +477,7 @@ mod test {
         search_fields: Vec<String>,
         expected: TestExpectation,
     ) {
-        check_build_query(user_query, search_fields, expected, true);
+        check_build_query(user_query, search_fields, expected, true, false);
     }
 
     #[track_caller]
@@ -332,27 +486,37 @@ mod test {
         search_fields: Vec<String>,
         expected: TestExpectation,
     ) {
-        check_build_query(user_query, search_fields, expected, false);
+        check_build_query(user_query, search_fields, expected, false, false);
+    }
+
+    #[track_caller]
+    fn check_build_query_static_lenient_mode(
+        user_query: &str,
+        search_fields: Vec<String>,
+        expected: TestExpectation,
+    ) {
+        check_build_query(user_query, search_fields, expected, false, true);
     }
 
     fn test_build_query(
         user_query: &str,
         search_fields: Vec<String>,
         dynamic_mode: bool,
+        lenient: bool,
     ) -> Result<String, String> {
-        let query_ast = query_ast_from_user_text(user_query, Some(search_fields))
+        let user_input_query = UserInputQuery {
+            user_text: user_query.to_string(),
+            default_fields: Some(search_fields),
+            default_operator: BooleanOperand::And,
+            lenient,
+        };
+        let query_ast = user_input_query
             .parse_user_query(&[])
             .map_err(|err| err.to_string())?;
         let schema = make_schema(dynamic_mode);
-        let query_result = build_query(
-            &query_ast,
-            schema,
-            &create_default_quickwit_tokenizer_manager(),
-            &[],
-            true,
-        );
+        let query_result = build_query(query_ast, &BuildTantivyAstContext::for_test(&schema), None);
         query_result
-            .map(|query| format!("{:?}", query))
+            .map(|query| format!("{query:?}"))
             .map_err(|err| err.to_string())
     }
 
@@ -362,8 +526,9 @@ mod test {
         search_fields: Vec<String>,
         expected: TestExpectation,
         dynamic_mode: bool,
+        lenient: bool,
     ) {
-        let query_result = test_build_query(user_query, search_fields, dynamic_mode);
+        let query_result = test_build_query(user_query, search_fields, dynamic_mode, lenient);
         match (query_result, expected) {
             (Err(query_err_msg), TestExpectation::Err(sub_str)) => {
                 assert!(
@@ -393,7 +558,7 @@ mod test {
             "foo:bar",
             Vec::new(),
             TestExpectation::Ok(
-                r#"TermQuery(Term(field=13, type=Json, path=foo, type=Str, "bar"))"#,
+                r#"TermQuery(Term(field=16, type=Json, path=foo, type=Str, "bar"))"#,
             ),
         );
         check_build_query_dynamic_mode(
@@ -425,15 +590,25 @@ mod test {
             Vec::new(),
             TestExpectation::Err("invalid query: field does not exist: `foo`"),
         );
+        check_build_query_static_lenient_mode(
+            "foo:bar",
+            Vec::new(),
+            TestExpectation::Ok("EmptyQuery"),
+        );
         check_build_query_static_mode(
             "title:bar",
             Vec::new(),
-            TestExpectation::Ok(r#"TermQuery(Term(field=0, type=Str, "bar"))"#),
+            TestExpectation::Ok(r#"TermQuery(Term(field=1, type=Str, "bar"))"#),
         );
         check_build_query_static_mode(
             "bar",
             vec!["fieldnotinschema".to_string()],
             TestExpectation::Err("invalid query: field does not exist: `fieldnotinschema`"),
+        );
+        check_build_query_static_lenient_mode(
+            "bar",
+            vec!["fieldnotinschema".to_string()],
+            TestExpectation::Ok("EmptyQuery"),
         );
         check_build_query_static_mode(
             "title:[a TO b]",
@@ -504,6 +679,63 @@ mod test {
     }
 
     #[test]
+    fn test_wildcard_query() {
+        check_build_query_static_mode("title:hello*", Vec::new(), TestExpectation::Ok("Regex"));
+        check_build_query_static_mode(
+            "title:\"hello world\"*",
+            Vec::new(),
+            TestExpectation::Ok("PhrasePrefixQuery"),
+        );
+        // the tokenizer removes '*' chars, making it a simple PhraseQuery (not RegexPhraseQuery)
+        check_build_query_static_mode(
+            "title:\"hello* world*\"",
+            Vec::new(),
+            TestExpectation::Ok("PhraseQuery"),
+        );
+        check_build_query_static_mode(
+            "foo:bar*",
+            Vec::new(),
+            TestExpectation::Err("invalid query: field does not exist: `foo`"),
+        );
+        check_build_query_static_mode("title:hello*yo", Vec::new(), TestExpectation::Ok("Regex"));
+    }
+
+    #[test]
+    fn test_existence_query() {
+        check_build_query_static_mode(
+            "title:*",
+            Vec::new(),
+            TestExpectation::Ok("TermQuery(Term(field=0, type=U64"),
+        );
+
+        check_build_query_static_mode(
+            "ip:*",
+            Vec::new(),
+            TestExpectation::Ok("ExistsQuery { field_name: \"ip\", json_subpaths: true }"),
+        );
+        check_build_query_static_mode(
+            "json_text:*",
+            Vec::new(),
+            TestExpectation::Ok("TermSetQuery"),
+        );
+        check_build_query_static_mode(
+            "json_fast:*",
+            Vec::new(),
+            TestExpectation::Ok("ExistsQuery { field_name: \"json_fast\", json_subpaths: true }"),
+        );
+        check_build_query_static_mode(
+            "foo:*",
+            Vec::new(),
+            TestExpectation::Err("invalid query: field does not exist: `foo`"),
+        );
+        check_build_query_static_mode(
+            "server:*",
+            Vec::new(),
+            TestExpectation::Ok("BooleanQuery { subqueries: [(Should, TermQuery(Term"),
+        );
+    }
+
+    #[test]
     fn test_datetime_range_query() {
         {
             // Check range on datetime in millisecond, precision has no impact as it is in
@@ -555,8 +787,8 @@ mod test {
             "ip:[127.0.0.1 TO 127.1.1.1]",
             Vec::new(),
             TestExpectation::Ok(
-                "RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=6, \
-                 type=IpAddr, ::ffff:127.0.0.1)), upper_bound: Included(Term(field=6, \
+                "RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=7, \
+                 type=IpAddr, ::ffff:127.0.0.1)), upper_bound: Included(Term(field=7, \
                  type=IpAddr, ::ffff:127.1.1.1)) } }",
             ),
         );
@@ -564,7 +796,7 @@ mod test {
             "ip:>127.0.0.1",
             Vec::new(),
             TestExpectation::Ok(
-                "RangeQuery { bounds: BoundsRange { lower_bound: Excluded(Term(field=6, \
+                "RangeQuery { bounds: BoundsRange { lower_bound: Excluded(Term(field=7, \
                  type=IpAddr, ::ffff:127.0.0.1)), upper_bound: Unbounded } }",
             ),
         );
@@ -576,14 +808,14 @@ mod test {
             "f64_fast:[7.7 TO 77.7]",
             Vec::new(),
             TestExpectation::Ok(
-                r#"RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=12, type=F64, 7.7)), upper_bound: Included(Term(field=12, type=F64, 77.7)) } }"#,
+                r#"RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=13, type=F64, 7.7)), upper_bound: Included(Term(field=13, type=F64, 77.7)) } }"#,
             ),
         );
         check_build_query_static_mode(
             "f64_fast:>7",
             Vec::new(),
             TestExpectation::Ok(
-                r#"RangeQuery { bounds: BoundsRange { lower_bound: Excluded(Term(field=12, type=F64, 7.0)), upper_bound: Unbounded } }"#,
+                r#"RangeQuery { bounds: BoundsRange { lower_bound: Excluded(Term(field=13, type=F64, 7.0)), upper_bound: Unbounded } }"#,
             ),
         );
     }
@@ -593,12 +825,12 @@ mod test {
         check_build_query_static_mode(
             "i64_fast:[-7 TO 77]",
             Vec::new(),
-            TestExpectation::Ok(r#"field=11"#),
+            TestExpectation::Ok(r#"field=12"#),
         );
         check_build_query_static_mode(
             "i64_fast:>7",
             Vec::new(),
-            TestExpectation::Ok(r#"field=11"#),
+            TestExpectation::Ok(r#"field=12"#),
         );
     }
 
@@ -607,12 +839,12 @@ mod test {
         check_build_query_static_mode(
             "u64_fast:[7 TO 77]",
             Vec::new(),
-            TestExpectation::Ok(r#"field=10,"#),
+            TestExpectation::Ok(r#"field=11,"#),
         );
         check_build_query_static_mode(
             "u64_fast:>7",
             Vec::new(),
-            TestExpectation::Ok(r#"field=10,"#),
+            TestExpectation::Ok(r#"field=11,"#),
         );
     }
 
@@ -622,8 +854,8 @@ mod test {
             "ips:[127.0.0.1 TO 127.1.1.1]",
             Vec::new(),
             TestExpectation::Ok(
-                "RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=7, \
-                 type=IpAddr, ::ffff:127.0.0.1)), upper_bound: Included(Term(field=7, \
+                "RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=8, \
+                 type=IpAddr, ::ffff:127.0.0.1)), upper_bound: Included(Term(field=8, \
                  type=IpAddr, ::ffff:127.1.1.1)) } }",
             ),
         );
@@ -656,27 +888,18 @@ mod test {
             .parse_user_query(&[])
             .unwrap();
 
-        let (_, warmup_info) = build_query(
-            &query_with_set,
-            make_schema(true),
-            &create_default_quickwit_tokenizer_manager(),
-            &[],
-            true,
-        )
-        .unwrap();
-        assert_eq!(warmup_info.term_dict_fields.len(), 1);
-        assert!(warmup_info
-            .term_dict_fields
-            .contains(&tantivy::schema::Field::from_field_id(1)));
+        let schema = make_schema(true);
+        let context = BuildTantivyAstContext::for_test(&schema);
 
-        let (_, warmup_info) = build_query(
-            &query_without_set,
-            make_schema(true),
-            &create_default_quickwit_tokenizer_manager(),
-            &[],
-            true,
-        )
-        .unwrap();
+        let (_, warmup_info) = build_query(query_with_set, &context, None).unwrap();
+        assert_eq!(warmup_info.term_dict_fields.len(), 1);
+        assert!(
+            warmup_info
+                .term_dict_fields
+                .contains(&tantivy::schema::Field::from_field_id(2))
+        );
+
+        let (_, warmup_info) = build_query(query_without_set, &context, None).unwrap();
         assert!(warmup_info.term_dict_fields.is_empty());
     }
 
@@ -695,12 +918,14 @@ mod test {
             phrase: "short".to_string(),
             max_expansions: 50,
             params: params.clone(),
+            lenient: false,
         };
         let long = PhrasePrefixQuery {
             field: "title".to_string(),
             phrase: "not so short".to_string(),
             max_expansions: 50,
             params: params.clone(),
+            lenient: false,
         };
         let mut extractor1 = ExtractPrefixTermRanges::with_schema(&schema, &tokenizer_manager);
         extractor1.visit_phrase_prefix(&short).unwrap();
@@ -715,7 +940,7 @@ mod test {
             extractor2.term_ranges_to_warm_up
         );
 
-        let field = tantivy::schema::Field::from_field_id(0);
+        let field = tantivy::schema::Field::from_field_id(1);
         let mut expected_inner = std::collections::HashMap::new();
         expected_inner.insert(
             TermRange {

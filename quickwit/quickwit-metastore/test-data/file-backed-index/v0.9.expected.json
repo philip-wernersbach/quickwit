@@ -96,8 +96,11 @@
           "maturation_period": "2days"
         },
         "resources": {
-          "heap_size": "50.0 MB"
+          "heap_size": 50000000
         }
+      },
+      "ingest_settings": {
+        "min_shards": 12
       },
       "search_settings": {
         "default_search_fields": [
@@ -190,7 +193,7 @@
       "opstamp": 10,
       "delete_query": {
         "index_uid": "my-index:00000000000000000000000001",
-        "query_ast": "{\"type\":\"bool\",\"must\":[{\"type\":\"full_text\",\"field\":\"body\",\"text\":\"Harry\",\"params\":{\"mode\":{\"type\":\"phrase_fallback_to_intersection\"}}},{\"type\":\"full_text\",\"field\":\"body\",\"text\":\"Potter\",\"params\":{\"mode\":{\"type\":\"phrase_fallback_to_intersection\"}}}]}"
+        "query_ast": "{\"type\":\"bool\",\"must\":[{\"type\":\"full_text\",\"field\":\"body\",\"text\":\"Harry\",\"params\":{\"mode\":{\"type\":\"phrase_fallback_to_intersection\"}},\"lenient\":false},{\"type\":\"full_text\",\"field\":\"body\",\"text\":\"Potter\",\"params\":{\"mode\":{\"type\":\"phrase_fallback_to_intersection\"}},\"lenient\":false}]}"
       }
     }
   ]

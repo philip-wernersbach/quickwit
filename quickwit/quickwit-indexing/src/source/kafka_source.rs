@@ -1,27 +1,22 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use itertools::Itertools;
@@ -39,17 +34,17 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::util::Timeout;
 use rdkafka::{ClientContext, Message, Offset, TopicPartitionList};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use tokio::sync::{mpsc, watch};
-use tokio::task::{spawn_blocking, JoinHandle};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::actors::DocProcessor;
 use crate::models::{NewPublishLock, PublishLock};
 use crate::source::{
-    BatchBuilder, Source, SourceContext, SourceRuntime, TypedSourceFactory, BATCH_NUM_BYTES_LIMIT,
-    EMIT_BATCHES_TIMEOUT,
+    BATCH_NUM_BYTES_LIMIT, BatchBuilder, EMIT_BATCHES_TIMEOUT, Source, SourceContext,
+    SourceRuntime, TypedSourceFactory,
 };
 
 type GroupId = String;
@@ -125,14 +120,14 @@ macro_rules! return_if_err {
 /// The rebalance protocol at a very high level:
 /// - A consumer joins or leaves a consumer group.
 /// - Consumers receive a revoke partitions notification, which gives them the opportunity to commit
-/// the work in progress.
+///   the work in progress.
 /// - Broker waits for ALL the consumers to ack the revoke notification (synchronization barrier).
 /// - Consumers receive new partition assignmennts.
 ///
 /// The API of the rebalance callback is better explained in the docs of `librdkafka`:
 /// <https://docs.confluent.io/2.0.0/clients/librdkafka/classRdKafka_1_1RebalanceCb.html>
 impl ConsumerContext for RdKafkaContext {
-    fn pre_rebalance(&self, rebalance: &Rebalance) {
+    fn pre_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
         crate::metrics::INDEXER_METRICS.kafka_rebalance_total.inc();
         quickwit_common::rate_limited_info!(limit_per_min = 3, topic = self.topic, "rebalance");
         if let Rebalance::Revoke(tpl) = rebalance {
@@ -465,7 +460,7 @@ impl Source for KafkaSource {
     ) -> Result<Duration, ActorExitStatus> {
         let now = Instant::now();
         let mut batch_builder = BatchBuilder::new(SourceType::Kafka);
-        let deadline = time::sleep(EMIT_BATCHES_TIMEOUT);
+        let deadline = time::sleep(*EMIT_BATCHES_TIMEOUT);
         tokio::pin!(deadline);
 
         loop {
@@ -526,7 +521,7 @@ impl Source for KafkaSource {
     }
 
     fn name(&self) -> String {
-        format!("{:?}", self)
+        format!("{self:?}")
     }
 
     fn observable_state(&self) -> JsonValue {
@@ -779,7 +774,7 @@ mod kafka_broker_tests {
     use super::*;
     use crate::source::test_setup_helper::setup_index;
     use crate::source::tests::SourceRuntimeBuilder;
-    use crate::source::{quickwit_supported_sources, RawDocBatch, SourceActor};
+    use crate::source::{RawDocBatch, SourceActor, quickwit_supported_sources};
 
     fn create_base_consumer(group_id: &str) -> BaseConsumer {
         ClientConfig::new()
@@ -790,11 +785,10 @@ mod kafka_broker_tests {
     }
 
     fn create_admin_client() -> AdminClient<DefaultClientContext> {
-        let admin_client = ClientConfig::new()
+        ClientConfig::new()
             .set("bootstrap.servers", "localhost:9092")
             .create()
-            .unwrap();
-        admin_client
+            .unwrap()
     }
 
     async fn create_topic(
@@ -859,7 +853,7 @@ mod kafka_broker_tests {
                     Duration::from_secs(1),
                 )
                 .await
-                .map(|(partition, offset)| (id, partition, offset))
+                .map(|delivery| (id, delivery.partition, delivery.offset))
                 .map_err(|(err, _)| err)
         });
         let message_map = futures::future::try_join_all(tasks)
@@ -878,9 +872,11 @@ mod kafka_broker_tests {
 
     fn get_source_config(topic: &str, auto_offset_reset: &str) -> (String, SourceConfig) {
         let source_id = append_random_suffix("test-kafka-source--source");
+        // Setting explicitly ip v4 with `broker.address.family` is required
+        // because of https://github.com/fede1024/rust-rdkafka/issues/809
         let source_config = SourceConfig {
             source_id: source_id.clone(),
-            num_pipelines: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params: SourceParams::Kafka(KafkaSourceParams {
                 topic: topic.to_string(),
@@ -888,6 +884,7 @@ mod kafka_broker_tests {
                 client_params: json!({
                     "auto.offset.reset": auto_offset_reset,
                     "bootstrap.servers": "localhost:9092",
+                    "broker.address.family": "v4",
                 }),
                 enable_backfill_mode: true,
             }),

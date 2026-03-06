@@ -1,27 +1,23 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![deny(clippy::disallowed_methods)]
 
+use std::hash::Hasher;
 use std::str::FromStr;
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{Context, bail, ensure};
 use json_comments::StripComments;
 use once_cell::sync::Lazy;
 use quickwit_common::get_bool_from_env;
@@ -38,6 +34,7 @@ pub mod merge_policy_config;
 mod metastore_config;
 mod node_config;
 mod qw_env_vars;
+pub(crate) mod serde_utils;
 pub mod service;
 mod source_config;
 mod storage_config;
@@ -48,20 +45,22 @@ pub use cluster_config::ClusterConfig;
 // See #2048
 use index_config::serialize::{IndexConfigV0_8, VersionedIndexConfig};
 pub use index_config::{
-    build_doc_mapper, load_index_config_from_user_config, load_index_config_update, IndexConfig,
-    IndexingResources, IndexingSettings, RetentionPolicy, SearchSettings,
+    IndexConfig, IndexingResources, IndexingSettings, IngestSettings, RetentionPolicy,
+    SearchSettings, build_doc_mapper, load_index_config_from_user_config, load_index_config_update,
+    prepare_doc_mapping_update,
 };
 pub use quickwit_doc_mapper::DocMapping;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
+use siphasher::sip::SipHasher;
 use source_config::FileSourceParamsForSerde;
 pub use source_config::{
-    load_source_config_from_user_config, FileSourceMessageType, FileSourceNotification,
-    FileSourceParams, FileSourceSqs, KafkaSourceParams, KinesisSourceParams, PubSubSourceParams,
-    PulsarSourceAuth, PulsarSourceParams, RegionOrEndpoint, SourceConfig, SourceInputFormat,
-    SourceParams, TransformConfig, VecSourceParams, VoidSourceParams, CLI_SOURCE_ID,
-    INGEST_API_SOURCE_ID, INGEST_V2_SOURCE_ID,
+    CLI_SOURCE_ID, FileSourceMessageType, FileSourceNotification, FileSourceParams, FileSourceSqs,
+    INGEST_API_SOURCE_ID, INGEST_V2_SOURCE_ID, KafkaSourceParams, KinesisSourceParams,
+    PubSubSourceParams, PulsarSourceAuth, PulsarSourceParams, RegionOrEndpoint, SourceConfig,
+    SourceInputFormat, SourceParams, TransformConfig, VecSourceParams, VoidSourceParams,
+    load_source_config_from_user_config, load_source_config_update,
 };
 use tracing::warn;
 
@@ -74,8 +73,9 @@ pub use crate::metastore_config::{
     MetastoreBackend, MetastoreConfig, MetastoreConfigs, PostgresMetastoreConfig,
 };
 pub use crate::node_config::{
-    IndexerConfig, IngestApiConfig, JaegerConfig, NodeConfig, SearcherConfig, SplitCacheLimits,
-    DEFAULT_QW_CONFIG_PATH,
+    CacheConfig, CachePolicy, DEFAULT_QW_CONFIG_PATH, GrpcConfig, IndexerConfig, IngestApiConfig,
+    JaegerConfig, KeepAliveConfig, LambdaConfig, LambdaDeployConfig, NodeConfig, RestConfig,
+    SearcherConfig, SplitCacheLimits, StorageTimeoutPolicy, TlsConfig,
 };
 use crate::source_config::serialize::{SourceConfigV0_7, SourceConfigV0_8, VersionedSourceConfig};
 pub use crate::storage_config::{
@@ -86,7 +86,7 @@ pub use crate::storage_config::{
 /// Returns true if the ingest API v2 is enabled.
 pub fn enable_ingest_v2() -> bool {
     static ENABLE_INGEST_V2: Lazy<bool> =
-        Lazy::new(|| get_bool_from_env("QW_ENABLE_INGEST_V2", false));
+        Lazy::new(|| get_bool_from_env("QW_ENABLE_INGEST_V2", true));
     *ENABLE_INGEST_V2
 }
 
@@ -99,35 +99,36 @@ pub fn disable_ingest_v1() -> bool {
 
 #[derive(utoipa::OpenApi)]
 #[openapi(components(schemas(
-    IndexingResources,
-    IndexingSettings,
-    SearchSettings,
-    RetentionPolicy,
-    MergePolicyConfig,
+    ConstWriteAmplificationMergePolicyConfig,
     DocMapping,
-    VersionedSourceConfig,
-    SourceConfigV0_7,
-    SourceConfigV0_8,
-    VersionedIndexConfig,
-    IndexConfigV0_8,
-    VersionedIndexTemplate,
-    IndexTemplateV0_8,
-    SourceInputFormat,
-    SourceParams,
     FileSourceMessageType,
     FileSourceNotification,
     FileSourceParamsForSerde,
     FileSourceSqs,
-    PubSubSourceParams,
+    IndexConfigV0_8,
+    IndexingResources,
+    IndexingSettings,
+    IndexTemplateV0_8,
+    IngestSettings,
     KafkaSourceParams,
     KinesisSourceParams,
-    PulsarSourceParams,
+    MergePolicyConfig,
+    PubSubSourceParams,
     PulsarSourceAuth,
+    PulsarSourceParams,
     RegionOrEndpoint,
-    ConstWriteAmplificationMergePolicyConfig,
+    RetentionPolicy,
+    SearchSettings,
+    SourceConfigV0_7,
+    SourceConfigV0_8,
+    SourceInputFormat,
+    SourceParams,
     StableLogMergePolicyConfig,
     TransformConfig,
     VecSourceParams,
+    VersionedIndexConfig,
+    VersionedIndexTemplate,
+    VersionedSourceConfig,
     VoidSourceParams,
 )))]
 /// Schema used for the OpenAPI generation which are apart of this crate.
@@ -286,6 +287,18 @@ pub trait TestableForRegression: Serialize + DeserializeOwned {
     fn assert_equality(&self, other: &Self);
 }
 
+/// Returns a fingerprint (a hash) of all the parameters that should force an
+/// indexing pipeline to restart upon index or source config updates.
+pub fn indexing_pipeline_params_fingerprint(
+    index_config: &IndexConfig,
+    source_config: &SourceConfig,
+) -> u64 {
+    let mut hasher = SipHasher::new();
+    hasher.write_u64(index_config.indexing_params_fingerprint());
+    hasher.write_u64(source_config.indexing_params_fingerprint());
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_identifier;
@@ -305,10 +318,12 @@ mod tests {
         validate_identifier("cluster", "f-_").unwrap();
         validate_identifier("index", "foo.bar").unwrap();
 
-        assert!(validate_identifier("cluster", "foo!")
-            .unwrap_err()
-            .to_string()
-            .contains("cluster ID `foo!` is invalid"));
+        assert!(
+            validate_identifier("cluster", "foo!")
+                .unwrap_err()
+                .to_string()
+                .contains("cluster ID `foo!` is invalid")
+        );
     }
 
     #[test]
@@ -318,10 +333,12 @@ mod tests {
         validate_index_id_pattern("ab", false).unwrap_err();
         validate_index_id_pattern("", false).unwrap_err();
         validate_index_id_pattern("**", false).unwrap_err();
-        assert!(validate_index_id_pattern("foo!", false)
-            .unwrap_err()
-            .to_string()
-            .contains("index ID pattern `foo!` is invalid:"));
+        assert!(
+            validate_index_id_pattern("foo!", false)
+                .unwrap_err()
+                .to_string()
+                .contains("index ID pattern `foo!` is invalid:")
+        );
         validate_index_id_pattern("-abc", true).unwrap();
         validate_index_id_pattern("-abc", false).unwrap_err();
     }

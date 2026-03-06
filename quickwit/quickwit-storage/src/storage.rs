@@ -1,24 +1,19 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
-use std::io::{self, ErrorKind};
+use std::io::{self};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -167,17 +162,13 @@ impl DownloadTempFile {
     /// Creates or truncate temp file.
     pub async fn with_target_path(target_filepath: PathBuf) -> io::Result<DownloadTempFile> {
         let Some(filename) = target_filepath.file_name() else {
-            return Err(io::Error::new(
-                ErrorKind::Other,
+            return Err(io::Error::other(
                 "Target filepath is not a directory path. Expected a filepath.",
             ));
         };
-        let filename: &str = filename.to_str().ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::Other,
-                "Target filepath is not a valid UTF-8 string.",
-            )
-        })?;
+        let filename: &str = filename
+            .to_str()
+            .ok_or_else(|| io::Error::other("target filepath is not a valid UTF-8 string"))?;
         let mut temp_filepath = target_filepath.clone();
         temp_filepath.set_file_name(format!("{filename}.temp"));
         let file = tokio::fs::File::create(temp_filepath.clone()).await?;
@@ -250,8 +241,7 @@ mod tests {
     async fn test_copy_to_file_deletes_tempfile_on_failure() {
         let mut storage = MockStorage::default();
         storage.expect_copy_to().return_once(|_, _| {
-            Box::pin(futures::future::err(StorageError::from(io::Error::new(
-                io::ErrorKind::Other,
+            Box::pin(futures::future::err(StorageError::from(io::Error::other(
                 "fake storage error",
             ))))
         });

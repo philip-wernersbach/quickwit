@@ -1,35 +1,23 @@
-// Copyright (C) 2023 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import { render, unmountComponentAtNode } from "react-dom";
-import { waitFor } from "@testing-library/react";
-import { screen } from '@testing-library/dom';
-import ClusterView from './ClusterView';
-import { act } from "react-dom/test-utils";
+import { render, screen, waitFor } from "@testing-library/react";
+import { act } from "react";
 import { Client } from "../services/client";
+import ClusterView from "./ClusterView";
 
-jest.mock('../services/client');
-const mockedUsedNavigate = jest.fn();
-jest.mock('react-router-dom', () => ({
-  ...jest.requireActual('react-router-dom'),
-  useNavigate: () => mockedUsedNavigate,
-}));
+jest.mock("../services/client");
 
 let container = null;
 beforeEach(() => {
@@ -40,43 +28,46 @@ beforeEach(() => {
 
 afterEach(() => {
   // cleanup on exiting
-  unmountComponentAtNode(container);
   container.remove();
   container = null;
 });
 
-test('renders ClusterStateView', async () => {
+test("renders ClusterStateView", async () => {
   const clusterState = {
-      "state": {
-        "seed_addrs": [],
-        "node_states": {
-          "node-green-uCdq/1656700092": {
-            "key_values": {
-              "available_services": {
-                "value": "searcher",
-                "version": 3
-              },
-              "grpc_address": {
-                "value": "127.0.0.1:7281",
-                "version": 2
-              },
-              "heartbeat": {
-                "value": "24",
-                "version": 27
-              }
+    state: {
+      seed_addrs: [],
+      node_states: {
+        "node-green-uCdq/1656700092": {
+          key_values: {
+            available_services: {
+              value: "searcher",
+              version: 3,
             },
-            "max_version": 27
-          }
-        }
+            grpc_address: {
+              value: "127.0.0.1:7281",
+              version: 2,
+            },
+            heartbeat: {
+              value: "24",
+              version: 27,
+            },
+          },
+          max_version: 27,
+        },
       },
-      "live_nodes": [],
-      "dead_nodes": []
+    },
+    live_nodes: [],
+    dead_nodes: [],
   };
-  Client.prototype.cluster.mockImplementation(() => Promise.resolve(clusterState));
+  Client.prototype.cluster.mockImplementation(() =>
+    Promise.resolve(clusterState),
+  );
 
   await act(async () => {
     render(<ClusterView />, container);
   });
 
-  await waitFor(() => expect(screen.getByText(/node-green-uCdq/)).toBeInTheDocument());
+  await waitFor(() =>
+    expect(screen.getByText(/node-green-uCdq/)).toBeInTheDocument(),
+  );
 });

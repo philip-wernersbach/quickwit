@@ -1,36 +1,31 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 mod error;
 
 #[path = "codegen/hello.rs"]
 mod hello;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use quickwit_common::uri::Uri;
 use quickwit_common::ServiceStream;
+use quickwit_common::uri::Uri;
 use tower::{Layer, Service};
 
 pub use crate::error::HelloError;
@@ -62,6 +57,7 @@ where S: Service<R>
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct CounterLayer {
     counter: Arc<AtomicUsize>,
 }
@@ -77,6 +73,7 @@ impl<S> Layer<S> for CounterLayer {
     }
 }
 
+#[allow(dead_code)]
 fn spawn_ping_response_stream(
     mut request_stream: ServiceStream<PingRequest>,
 ) -> ServiceStream<HelloResult<PingResponse>> {
@@ -114,6 +111,7 @@ fn spawn_ping_response_stream(
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct HelloImpl {
     delay: Duration,
 }
@@ -164,14 +162,16 @@ mod tests {
 
     use bytesize::ByteSize;
     use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Universe};
-    use quickwit_common::tower::{BalanceChannel, Change};
+    use quickwit_common::tower::{BalanceChannel, Change, TimeoutLayer};
     use tokio::sync::mpsc::error::TrySendError;
     use tokio_stream::StreamExt;
+    use tonic::codec::CompressionEncoding;
     use tonic::transport::{Endpoint, Server};
+    use tonic::{Code, Status};
 
     use super::*;
-    use crate::hello::hello_grpc_server::HelloGrpcServer;
     use crate::hello::MockHello;
+    use crate::hello::hello_grpc_server::HelloGrpcServer;
     use crate::hello_grpc_client::HelloGrpcClient;
     use crate::{CounterLayer, GoodbyeRequest, GoodbyeResponse};
 
@@ -265,9 +265,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_hello_codegen_grpc() {
-        let grpc_server_adapter = HelloGrpcServerAdapter::new(HelloImpl::default());
-        let grpc_server: HelloGrpcServer<HelloGrpcServerAdapter> =
-            HelloGrpcServer::new(grpc_server_adapter);
+        let grpc_server =
+            HelloClient::new(HelloImpl::default()).as_grpc_service(MAX_GRPC_MESSAGE_SIZE);
         let addr: SocketAddr = "127.0.0.1:6666".parse().unwrap();
 
         tokio::spawn({
@@ -283,7 +282,7 @@ mod tests {
             "127.0.0.1:6666".parse().unwrap(),
             Endpoint::from_static("http://127.0.0.1:6666").connect_lazy(),
         );
-        let grpc_client = HelloClient::from_balance_channel(channel, MAX_GRPC_MESSAGE_SIZE);
+        let grpc_client = HelloClient::from_balance_channel(channel, MAX_GRPC_MESSAGE_SIZE, None);
 
         assert_eq!(
             grpc_client
@@ -342,7 +341,8 @@ mod tests {
 
         // The connectivity check fails if there is no client behind the channel.
         let (balance_channel, _): (BalanceChannel<SocketAddr>, _) = BalanceChannel::new();
-        let grpc_client = HelloClient::from_balance_channel(balance_channel, MAX_GRPC_MESSAGE_SIZE);
+        let grpc_client =
+            HelloClient::from_balance_channel(balance_channel, MAX_GRPC_MESSAGE_SIZE, None);
         assert_eq!(
             grpc_client
                 .check_connectivity()
@@ -351,6 +351,146 @@ mod tests {
                 .to_string(),
             "no server currently available"
         );
+    }
+
+    #[tokio::test]
+    async fn test_hello_codegen_grpc_with_compression() {
+        #[derive(Debug, Clone)]
+        struct CheckCompression<S> {
+            inner: S,
+        }
+
+        impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for CheckCompression<S>
+        where
+            S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>>
+                + Clone
+                + Send
+                + 'static,
+            S::Future: Send + 'static,
+            ReqBody: Send + 'static,
+        {
+            type Response = S::Response;
+            type Error = S::Error;
+            type Future = BoxFuture<Self::Response, Self::Error>;
+
+            fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                self.inner.poll_ready(cx)
+            }
+
+            fn call(&mut self, request: http::Request<ReqBody>) -> Self::Future {
+                let Some(grpc_encoding) = request.headers().get("grpc-encoding") else {
+                    panic!("request should be compressed");
+                };
+                assert!(grpc_encoding.to_str().unwrap().contains("zstd"));
+
+                let Some(grpc_accept_encoding) = request.headers().get("grpc-accept-encoding")
+                else {
+                    panic!("client should accept compressed responses");
+                };
+                assert!(grpc_accept_encoding.to_str().unwrap().contains("zstd"));
+                let fut = self.inner.call(request);
+
+                Box::pin(async move {
+                    let response = fut.await?;
+
+                    let grpc_status_code = Status::from_header_map(response.headers())
+                        .map(|status| status.code())
+                        .unwrap_or(Code::Ok);
+
+                    if grpc_status_code == Code::Ok {
+                        let Some(grpc_encoding) = response.headers().get("grpc-encoding") else {
+                            panic!("response should be compressed");
+                        };
+                        assert!(grpc_encoding.to_str().unwrap().contains("zstd"));
+                    }
+                    Ok(response)
+                })
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct CheckCompressionLayer;
+
+        impl<S> Layer<S> for CheckCompressionLayer {
+            type Service = CheckCompression<S>;
+
+            fn layer(&self, inner: S) -> Self::Service {
+                Self::Service { inner }
+            }
+        }
+
+        let grpc_server =
+            HelloClient::new(HelloImpl::default()).as_grpc_service(MAX_GRPC_MESSAGE_SIZE);
+        let addr: SocketAddr = "127.0.0.1:33333".parse().unwrap();
+
+        tokio::spawn({
+            async move {
+                Server::builder()
+                    .layer(CheckCompressionLayer)
+                    .add_service(grpc_server)
+                    .serve(addr)
+                    .await
+                    .unwrap();
+            }
+        });
+        let channel = BalanceChannel::from_channel(
+            "127.0.0.1:33333".parse().unwrap(),
+            Endpoint::from_static("http://127.0.0.1:33333").connect_lazy(),
+        );
+        let grpc_client = HelloClient::from_balance_channel(
+            channel,
+            MAX_GRPC_MESSAGE_SIZE,
+            Some(CompressionEncoding::Zstd),
+        );
+
+        assert_eq!(
+            grpc_client
+                .hello(HelloRequest {
+                    name: "gRPC client".to_string()
+                })
+                .await
+                .unwrap(),
+            HelloResponse {
+                message: "Hello, gRPC client!".to_string()
+            }
+        );
+
+        assert!(matches!(
+            grpc_client
+                .hello(HelloRequest {
+                    name: "".to_string()
+                })
+                .await
+                .unwrap_err(),
+            HelloError::InvalidArgument(_)
+        ));
+
+        let (ping_stream_tx, ping_stream) = ServiceStream::new_bounded(1);
+        let mut pong_stream = grpc_client.ping(ping_stream).await.unwrap();
+
+        ping_stream_tx
+            .try_send(PingRequest {
+                name: "gRPC client".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            pong_stream.next().await.unwrap().unwrap().message,
+            "Pong, gRPC client!"
+        );
+
+        ping_stream_tx
+            .try_send(PingRequest {
+                name: "stop".to_string(),
+            })
+            .unwrap();
+        assert!(pong_stream.next().await.is_none());
+
+        let error = ping_stream_tx
+            .try_send(PingRequest {
+                name: "stop".to_string(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, TrySendError::Closed(_)));
     }
 
     #[tokio::test]
@@ -427,11 +567,13 @@ mod tests {
         actor_client.check_connectivity().await.unwrap();
         assert_eq!(
             actor_client.endpoints(),
-            vec![Uri::from_str(&format!(
-                "actor://localhost/{}",
-                actor_mailbox.actor_instance_id()
-            ))
-            .unwrap()]
+            vec![
+                Uri::from_str(&format!(
+                    "actor://localhost/{}",
+                    actor_mailbox.actor_instance_id()
+                ))
+                .unwrap()
+            ]
         );
 
         let (ping_stream_tx, ping_stream) = ServiceStream::new_bounded(1);
@@ -646,7 +788,7 @@ mod tests {
             "127.0.0.1:7777".parse().unwrap(),
             Endpoint::from_static("http://127.0.0.1:7777").connect_lazy(),
         );
-        HelloClient::from_balance_channel(balance_channed, MAX_GRPC_MESSAGE_SIZE);
+        HelloClient::from_balance_channel(balance_channed, MAX_GRPC_MESSAGE_SIZE, None);
     }
 
     #[tokio::test]
@@ -734,7 +876,7 @@ mod tests {
             .timeout(Duration::from_millis(100))
             .connect_lazy();
         let max_message_size = ByteSize::mib(1);
-        let grpc_client = HelloClient::from_channel(addr, channel, max_message_size);
+        let grpc_client = HelloClient::from_channel(addr, channel, max_message_size, None);
 
         let error = grpc_client
             .hello(HelloRequest {
@@ -768,5 +910,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, HelloError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn test_balanced_channel_timeout_with_server_crash() {
+        let addr_str = "127.0.0.1:11112";
+        let addr: SocketAddr = addr_str.parse().unwrap();
+        // We want to abruptly stop a server without even sending the connection
+        // RST packet. Simply dropping the tonic Server is not enough, so we
+        // spawn a thread and freeze it with thread::park().
+        std::thread::spawn(move || {
+            let server_fut = async {
+                let hello = HelloImpl {
+                    // delay the response so that the server freezes in the middle of the request
+                    delay: Duration::from_millis(1000),
+                };
+                let grpc_server_adapter = HelloGrpcServerAdapter::new(hello);
+                let grpc_server = HelloGrpcServer::new(grpc_server_adapter);
+                tokio::select! {
+                    // wait just enough to let the client perform its request
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    _ = Server::builder().add_service(grpc_server).serve(addr) => {}
+                };
+                std::thread::park();
+                println!("Thread unparked, unexpected");
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(server_fut);
+        });
+
+        // create a client that will try to connect to the server
+        let (balance_channel, balance_channel_tx) = BalanceChannel::new();
+        let channel = Endpoint::from_str(&format!("http://{addr_str}"))
+            .unwrap()
+            .connect_lazy();
+        balance_channel_tx
+            .send(Change::Insert(addr, channel))
+            .unwrap();
+
+        let grpc_client = HelloClient::tower()
+            // this test hangs forever if we comment out the TimeoutLayer, which
+            // shows that a request without explicit timeout might hang forever
+            .stack_layer(TimeoutLayer::new(Duration::from_secs(3)))
+            .build_from_balance_channel(balance_channel, ByteSize::mib(1), None);
+
+        let response_fut = async move {
+            grpc_client
+                .hello(HelloRequest {
+                    name: "World".to_string(),
+                })
+                .await
+        };
+        response_fut
+            .await
+            .expect_err("should have timed out at the client level");
     }
 }

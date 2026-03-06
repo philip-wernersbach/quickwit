@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #![recursion_limit = "256"]
 
@@ -23,13 +18,12 @@ use std::collections::BTreeMap;
 
 use anyhow::Context;
 use colored::Colorize;
-use opentelemetry::global;
-use quickwit_cli::busy_detector;
 use quickwit_cli::checklist::RED_COLOR;
-use quickwit_cli::cli::{build_cli, CliCommand};
+use quickwit_cli::cli::{CliCommand, build_cli};
 #[cfg(feature = "jemalloc")]
 use quickwit_cli::jemalloc::start_jemalloc_metrics_loop;
 use quickwit_cli::logger::setup_logging_and_tracing;
+use quickwit_cli::{busy_detector, install_default_crypto_ring_provider};
 use quickwit_common::runtimes::scrape_tokio_runtime_metrics;
 use quickwit_serve::BuildInfo;
 use tracing::error;
@@ -38,7 +32,11 @@ use tracing::error;
 /// QW_RUNTIME_NUM_THREADS environment variable.
 fn get_main_runtime_num_threads() -> usize {
     let default_num_runtime_threads: usize = quickwit_common::num_cpus().div_ceil(3);
-    quickwit_common::get_from_env("QW_TOKIO_RUNTIME_NUM_THREADS", default_num_runtime_threads)
+    quickwit_common::get_from_env(
+        "QW_TOKIO_RUNTIME_NUM_THREADS",
+        default_num_runtime_threads,
+        false,
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -74,7 +72,9 @@ fn register_build_info_metric() {
 
 async fn main_impl() -> anyhow::Result<()> {
     #[cfg(feature = "openssl-support")]
-    openssl_probe::init_ssl_cert_env_vars();
+    unsafe {
+        openssl_probe::init_openssl_env_vars()
+    };
     register_build_info_metric();
 
     let about_text = about_text();
@@ -92,11 +92,13 @@ async fn main_impl() -> anyhow::Result<()> {
         }
     };
 
+    install_default_crypto_ring_provider();
+
     #[cfg(feature = "jemalloc")]
     start_jemalloc_metrics_loop();
 
     let build_info = BuildInfo::get();
-    let env_filter_reload_fn =
+    let (env_filter_reload_fn, tracer_provider_opt) =
         setup_logging_and_tracing(command.default_log_level(), ansi_colors, build_info)?;
 
     let return_code: i32 = if let Err(command_error) = command.execute(env_filter_reload_fn).await {
@@ -111,7 +113,12 @@ async fn main_impl() -> anyhow::Result<()> {
         0
     };
 
-    global::shutdown_tracer_provider();
+    if let Some(provider) = tracer_provider_opt {
+        provider
+            .shutdown()
+            .context("failed to shutdown OpenTelemetry tracer provider")?;
+    }
+
     std::process::exit(return_code)
 }
 
@@ -128,12 +135,12 @@ fn about_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::str::FromStr;
     use std::time::Duration;
 
     use bytesize::ByteSize;
-    use quickwit_cli::cli::{build_cli, CliCommand};
+    use quickwit_cli::ClientArgs;
+    use quickwit_cli::cli::{CliCommand, build_cli};
     use quickwit_cli::index::{
         ClearIndexArgs, CreateIndexArgs, DeleteIndexArgs, DescribeIndexArgs, IndexCliCommand,
         IngestDocsArgs, SearchIndexArgs,
@@ -143,7 +150,6 @@ mod tests {
         ExtractSplitArgs, GarbageCollectIndexArgs, LocalIngestDocsArgs, LocalSearchArgs, MergeArgs,
         ToolCliCommand,
     };
-    use quickwit_cli::ClientArgs;
     use quickwit_common::uri::Uri;
     use quickwit_config::SourceInputFormat;
     use quickwit_rest_client::models::Timeout;
@@ -222,32 +228,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ingest_v2_args() {
-        let app = build_cli().no_binary_name(true);
-        let matches = app
-            .try_get_matches_from(["index", "ingest", "--index", "wikipedia", "--v2"])
-            .unwrap();
-        let command = CliCommand::parse_cli_args(matches).unwrap();
-        assert!(matches!(
-            command,
-            CliCommand::Index(IndexCliCommand::Ingest(
-                IngestDocsArgs {
-                    client_args,
-                    index_id,
-                    input_path_opt: None,
-                    batch_size_limit_opt: None,
-                    commit_type: CommitType::Auto,
-                })) if &index_id == "wikipedia"
-                && client_args.timeout.is_none()
-                && client_args.connect_timeout.is_none()
-                && client_args.commit_timeout.is_none()
-                && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
-                && client_args.ingest_v2
-
-        ));
-    }
-
-    #[test]
     fn test_parse_ingest_args() -> anyhow::Result<()> {
         let app = build_cli().no_binary_name(true);
         let matches = app.try_get_matches_from([
@@ -257,6 +237,8 @@ mod tests {
             "wikipedia",
             "--endpoint",
             "http://127.0.0.1:8000",
+            "--retries",
+            "2",
         ])?;
         let command = CliCommand::parse_cli_args(matches)?;
         assert!(matches!(
@@ -268,12 +250,13 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: None,
                     commit_type: CommitType::Auto,
+                    detailed_response: false,
                 })) if &index_id == "wikipedia"
                 && client_args.timeout.is_none()
                 && client_args.connect_timeout.is_none()
                 && client_args.commit_timeout.is_none()
                 && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:8000").unwrap()
-                && !client_args.ingest_v2
+                && client_args.num_retries == 2
         ));
 
         let app = build_cli().no_binary_name(true);
@@ -282,6 +265,7 @@ mod tests {
             "ingest",
             "--index",
             "wikipedia",
+            "--detailed-response",
             "--batch-size-limit",
             "8MB",
             "--force",
@@ -296,12 +280,13 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: Some(batch_size_limit),
                     commit_type: CommitType::Force,
+                    detailed_response: true,
                 })) if &index_id == "wikipedia"
                         && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
                         && client_args.timeout.is_none()
                         && client_args.connect_timeout.is_none()
                         && client_args.commit_timeout.is_none()
-                        && !client_args.ingest_v2
+                        && client_args.num_retries == 0
                         && batch_size_limit == ByteSize::mb(8)
         ));
 
@@ -325,12 +310,13 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: Some(batch_size_limit),
                     commit_type: CommitType::WaitFor,
+                    detailed_response: false,
                 })) if &index_id == "wikipedia"
                     && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
                     && client_args.timeout.is_none()
                     && client_args.connect_timeout.is_none()
                     && client_args.commit_timeout.is_none()
-                    && !client_args.ingest_v2
+                    && client_args.num_retries == 0
                     && batch_size_limit == ByteSize::kb(4)
         ));
 
@@ -355,11 +341,13 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: None,
                     commit_type: CommitType::Auto,
+                    detailed_response: false,
                 })) if &index_id == "wikipedia"
                         && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
                         && client_args.timeout == Some(Timeout::from_secs(10))
                         && client_args.connect_timeout == Some(Timeout::from_secs(2))
                         && client_args.commit_timeout.is_none()
+                        && client_args.num_retries == 0
         ));
 
         let app = build_cli().no_binary_name(true);
@@ -386,6 +374,7 @@ mod tests {
                     input_path_opt: None,
                     batch_size_limit_opt: None,
                     commit_type: CommitType::WaitFor,
+                    detailed_response: false,
                 })) if &index_id == "wikipedia"
                         && client_args.cluster_endpoint == Url::from_str("http://127.0.0.1:7280").unwrap()
                         && client_args.timeout == Some(Timeout::none())
@@ -695,7 +684,7 @@ mod tests {
                 split_id,
                 target_dir,
                 ..
-            })) if &index_id == "wikipedia" && &split_id == "ABC" && target_dir == PathBuf::from("datadir")
+            })) if &index_id == "wikipedia" && &split_id == "ABC" && target_dir == *"datadir"
         ));
         Ok(())
     }
@@ -775,9 +764,13 @@ mod tests {
 
     #[test]
     fn test_parse_no_color() {
+        // SAFETY: this test may not be entirely sound if not run with nextest or --test-threads=1
+        // as this is only a test, and it would be extremly inconvenient to run it in a different
+        // way, we are keeping it that way
+
         let previous_no_color_res = std::env::var("NO_COLOR");
         {
-            std::env::set_var("NO_COLOR", "whatever_interpreted_as_true");
+            unsafe { std::env::set_var("NO_COLOR", "whatever_interpreted_as_true") };
             let app = build_cli().no_binary_name(true);
             let matches = app.try_get_matches_from(["run"]).unwrap();
             let no_color = matches.get_flag("no-color");
@@ -785,7 +778,7 @@ mod tests {
         }
         {
             // empty string is false.
-            std::env::set_var("NO_COLOR", "");
+            unsafe { std::env::set_var("NO_COLOR", "") };
             let app = build_cli().no_binary_name(true);
             let matches = app.try_get_matches_from(["run"]).unwrap();
             let no_color = matches.get_flag("no-color");
@@ -799,7 +792,7 @@ mod tests {
             assert!(no_color);
         }
         if let Ok(previous_no_color) = previous_no_color_res {
-            std::env::set_var("NO_COLOR", previous_no_color);
+            unsafe { std::env::set_var("NO_COLOR", previous_no_color) };
         }
     }
 }

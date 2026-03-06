@@ -1,33 +1,28 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
-use aws_sdk_sqs::config::{BehaviorVersion, Builder, Region, SharedAsyncSleep};
+use aws_sdk_sqs::config::{Builder, Region, SharedAsyncSleep};
 use aws_sdk_sqs::types::{DeleteMessageBatchRequestEntry, MessageSystemAttributeName};
 use aws_sdk_sqs::{Client, Config};
 use itertools::Itertools;
-use quickwit_aws::retry::{aws_retry, AwsRetryable};
-use quickwit_aws::{get_aws_config, DEFAULT_AWS_REGION};
+use quickwit_aws::retry::{AwsRetryable, aws_retry};
+use quickwit_aws::{DEFAULT_AWS_REGION, aws_behavior_version, get_aws_config};
 use quickwit_common::rate_limited_error;
 use quickwit_common::retry::RetryParams;
 use quickwit_storage::OwnedBytes;
@@ -208,7 +203,7 @@ impl Queue for SqsQueue {
 async fn preconfigured_builder() -> anyhow::Result<Builder> {
     let aws_config = get_aws_config().await;
 
-    let mut sqs_config = Config::builder().behavior_version(BehaviorVersion::v2024_03_28());
+    let mut sqs_config = Config::builder().behavior_version(aws_behavior_version());
     sqs_config.set_retry_config(aws_config.retry_config().cloned());
     sqs_config.set_credentials_provider(aws_config.credentials_provider());
     sqs_config.set_http_client(aws_config.http_client());
@@ -261,10 +256,11 @@ pub(crate) async fn check_connectivity(queue_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "sqs-localstack-tests")]
+#[cfg(feature = "sqs-test-helpers")]
 pub mod test_helpers {
     use aws_sdk_sqs::types::QueueAttributeName;
     use ulid::Ulid;
+    use warp::Filter;
 
     use super::*;
 
@@ -315,6 +311,36 @@ pub mod test_helpers {
             .get(&attribute)
             .unwrap()
             .to_string()
+    }
+
+    /// Runs a mock SQS GetQueueAttributes endpoint to enable creating SQS
+    /// sources that pass the connectivity check
+    ///
+    /// Returns the queue URL to use for the source and a guard for the
+    /// temporary mock server
+    pub async fn start_mock_sqs_get_queue_attributes_endpoint() -> (String, oneshot::Sender<()>) {
+        let hello = warp::path!().map(|| "{}");
+        let (tx, rx) = oneshot::channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().unwrap();
+
+        let server = warp::serve(hello).incoming(listener).graceful(async {
+            rx.await.ok();
+        });
+        tokio::spawn(server.run());
+
+        let queue_url = format!("http://{}:{}/", addr.ip(), addr.port());
+        (queue_url, tx)
+    }
+
+    #[tokio::test]
+    async fn test_mock_sqs_get_queue_attributes_endpoint() {
+        let (queue_url, _shutdown) = start_mock_sqs_get_queue_attributes_endpoint().await;
+        check_connectivity(&queue_url).await.unwrap();
+        drop(_shutdown);
+        check_connectivity(&queue_url).await.unwrap_err();
     }
 }
 
@@ -455,7 +481,7 @@ mod localstack_tests {
     async fn test_receive_wrong_queue() {
         let client = test_helpers::get_localstack_sqs_client().await.unwrap();
         let queue_url = test_helpers::create_queue(&client, "test-receive-existing-msg").await;
-        let bad_queue_url = format!("{}wrong", queue_url);
+        let bad_queue_url = format!("{queue_url}wrong");
         let queue = Arc::new(SqsQueue::try_new(bad_queue_url).await.unwrap());
         tokio::time::timeout(
             Duration::from_millis(500),

@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 mod serialize;
 
@@ -30,34 +25,78 @@ use anyhow::{bail, ensure};
 use bytesize::ByteSize;
 use http::HeaderMap;
 use quickwit_common::net::HostAddr;
-use quickwit_common::shared_consts::DEFAULT_SHARD_THROUGHPUT_LIMIT;
+use quickwit_common::shared_consts::{
+    DEFAULT_SHARD_BURST_LIMIT, DEFAULT_SHARD_SCALE_UP_FACTOR, DEFAULT_SHARD_THROUGHPUT_LIMIT,
+};
 use quickwit_common::uri::Uri;
 use quickwit_proto::indexing::CpuCapacity;
+use quickwit_proto::tonic::codec::CompressionEncoding;
 use quickwit_proto::types::NodeId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{info, warn};
 
 use crate::node_config::serialize::load_node_config_with_env;
+use crate::serde_utils::DurationAsStr;
 use crate::service::QuickwitService;
 use crate::storage_config::StorageConfigs;
 use crate::{ConfigFormat, MetastoreConfigs};
 
 pub const DEFAULT_QW_CONFIG_PATH: &str = "config/quickwit.yaml";
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestConfig {
     pub listen_addr: SocketAddr,
     pub cors_allow_origins: Vec<String>,
     #[serde(with = "http_serde::header_map")]
     pub extra_headers: HeaderMap,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrpcConfig {
     #[serde(default = "GrpcConfig::default_max_message_size")]
     pub max_message_size: ByteSize,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    // If set, keeps idle connection alive by periodically perform a
+    // keep alive ping request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<KeepAliveConfig>,
+}
+
+fn default_http2_keep_alive_interval() -> DurationAsStr {
+    DurationAsStr::try_from("10s".to_string()).unwrap()
+}
+
+fn default_keep_alive_timeout() -> DurationAsStr {
+    DurationAsStr::try_from("5s".to_string()).unwrap()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KeepAliveConfig {
+    // Set the HTTP/2 KEEP_ALIVE_INTERVAL. This is the time the connection
+    // should be idle before sending a keepalive ping.
+    #[serde(default = "default_http2_keep_alive_interval")]
+    pub interval: DurationAsStr,
+
+    // Set the HTTP/2 KEEP_ALIVE_TIMEOUT. This is the time to wait for an ACK
+    // after sending a keepalive ping. If the server doesn't respond within
+    // this time, the connection might be considered dead.
+    // Tonic uses hyper's default (20 seconds) if not set.
+    #[serde(default = "default_keep_alive_timeout")]
+    pub timeout: DurationAsStr,
+}
+
+impl From<KeepAliveConfig> for quickwit_common::tower::KeepAliveConfig {
+    fn from(val: KeepAliveConfig) -> Self {
+        quickwit_common::tower::KeepAliveConfig {
+            interval: *val.interval,
+            timeout: *val.timeout,
+        }
+    }
 }
 
 impl GrpcConfig {
@@ -79,8 +118,23 @@ impl Default for GrpcConfig {
     fn default() -> Self {
         Self {
             max_message_size: Self::default_max_message_size(),
+            tls: None,
+            keep_alive: None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    #[serde(default)]
+    pub ca_path: String,
+    #[serde(default)]
+    pub expected_name: Option<String>,
+    #[serde(default)]
+    pub validate_client: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -140,8 +194,7 @@ impl IndexerConfig {
     }
 
     pub fn default_merge_concurrency() -> NonZeroUsize {
-        NonZeroUsize::new(quickwit_common::num_cpus() * 2 / 3)
-            .unwrap_or(NonZeroUsize::new(1).unwrap())
+        NonZeroUsize::new(quickwit_common::num_cpus() * 2 / 3).unwrap_or(NonZeroUsize::MIN)
     }
 
     fn default_cpu_capacity() -> CpuCapacity {
@@ -180,7 +233,7 @@ impl Default for IndexerConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SplitCacheLimits {
     pub max_num_bytes: ByteSize,
@@ -206,39 +259,282 @@ impl SplitCacheLimits {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SearcherConfig {
     pub aggregation_memory_limit: ByteSize,
     pub aggregation_bucket_limit: u32,
-    pub fast_field_cache_capacity: ByteSize,
-    pub split_footer_cache_capacity: ByteSize,
-    pub partial_request_cache_capacity: ByteSize,
+
+    #[serde(alias = "fast_field_cache_capacity")]
+    #[serde(
+        deserialize_with = "CacheConfig::deserialize_with_default::<_, {ByteSize::gb(1).as_u64()}>"
+    )]
+    pub fast_field_cache: CacheConfig,
+    #[serde(alias = "split_footer_cache_capacity")]
+    #[serde(deserialize_with = "CacheConfig::deserialize_with_default::<_, \
+                                {ByteSize::mb(500).as_u64()}>")]
+    pub split_footer_cache: CacheConfig,
+    #[serde(alias = "partial_request_cache_capacity")]
+    #[serde(deserialize_with = "CacheConfig::deserialize_with_default::<_, \
+                                {ByteSize::mb(64).as_u64()}>")]
+    pub partial_request_cache: CacheConfig,
+    #[serde(alias = "predicate_cache_capacity")]
+    #[serde(deserialize_with = "CacheConfig::deserialize_with_default::<_, \
+                                {ByteSize::mb(256).as_u64()}>")]
+    pub predicate_cache: CacheConfig,
+
     pub max_num_concurrent_split_searches: usize,
-    pub max_num_concurrent_split_streams: usize,
+    pub max_splits_per_search: Option<usize>,
+    // Deprecated: stream search requests are no longer supported.
+    #[serde(alias = "max_num_concurrent_split_streams", default, skip_serializing)]
+    pub _max_num_concurrent_split_streams: Option<serde::de::IgnoredAny>,
     // Strangely, if None, this will also have the effect of not forwarding
     // to searcher.
     // TODO document and fix if necessary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_cache: Option<SplitCacheLimits>,
+    #[serde(default = "SearcherConfig::default_request_timeout_secs")]
+    request_timeout_secs: NonZeroU64,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_timeout_policy: Option<StorageTimeoutPolicy>,
+    pub warmup_memory_budget: ByteSize,
+    pub warmup_single_split_initial_allocation: ByteSize,
+    /// Lambda configuration for serverless leaf search execution.
+    /// If set, enables Lambda execution for leaf search.
+    ///
+    /// If set, and Quickwit cannot access the Lambda (after a deploy attempt if
+    /// auto deploy is set up), Quickwit will log an error and
+    /// fail on startup.
+    #[serde(default)]
+    pub lambda: Option<LambdaConfig>,
+}
+
+/// Configuration for AWS Lambda leaf search execution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LambdaConfig {
+    /// AWS Lambda function name.
+    #[serde(default = "LambdaConfig::default_function_name")]
+    pub function_name: String,
+    /// Maximum number of splits per Lambda invocation.
+    #[serde(default = "LambdaConfig::default_max_splits_per_invocation")]
+    pub max_splits_per_invocation: NonZeroUsize,
+    /// Maximum number of splits to process locally before offloading to Lambda.
+    /// When the number of pending split searches exceeds this threshold,
+    /// new splits are offloaded to Lambda instead of being queued locally.
+    /// A value of 0 offloads everything to Lambda.
+    #[serde(default = "LambdaConfig::default_offload_threshold")]
+    pub offload_threshold: usize,
+    /// Auto-deploy configuration. If set, Quickwit will automatically deploy
+    /// the Lambda function at startup.
+    /// If deploying a lambda fails, Quickwit will log an error and fail.
+    #[serde(default)]
+    pub auto_deploy: Option<LambdaDeployConfig>,
+}
+
+impl LambdaConfig {
+    #[cfg(feature = "testsuite")]
+    pub fn for_test() -> Self {
+        Self {
+            function_name: Self::default_function_name(),
+            max_splits_per_invocation: Self::default_max_splits_per_invocation(),
+            offload_threshold: Self::default_offload_threshold(),
+            auto_deploy: None,
+        }
+    }
+
+    fn default_function_name() -> String {
+        "quickwit-lambda-search".to_string()
+    }
+    fn default_max_splits_per_invocation() -> NonZeroUsize {
+        NonZeroUsize::new(10).unwrap()
+    }
+    fn default_offload_threshold() -> usize {
+        100
+    }
+}
+
+/// Configuration for automatic Lambda function deployment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LambdaDeployConfig {
+    /// IAM execution role ARN for the Lambda function.
+    /// The role only requires GetObject permission to the targeted S3 bucket.
+    pub execution_role_arn: String,
+    /// Memory size for the Lambda function.
+    /// It will be rounded up to the nearest multiple of 1MiB.
+    #[serde(default = "LambdaDeployConfig::default_memory_size")]
+    pub memory_size: ByteSize,
+    /// Timeout for Lambda invocations in seconds.
+    #[serde(default = "LambdaDeployConfig::default_invocation_timeout_secs")]
+    pub invocation_timeout_secs: u64,
+}
+
+impl LambdaDeployConfig {
+    fn default_memory_size() -> ByteSize {
+        // Empirically this implies between 4 and 6 vCPUs.
+        ByteSize::gib(5)
+    }
+    fn default_invocation_timeout_secs() -> u64 {
+        15
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    #[serde(default)]
+    capacity: Option<ByteSize>,
+    #[serde(default)]
+    policy: Option<CachePolicy>,
+
+    // Cache configs inside the virtual cache aren't allowed to contain virtual cache
+    #[serde(default)]
+    pub virtual_caches: Vec<CacheConfig>,
+}
+
+impl CacheConfig {
+    pub fn no_cache() -> Self {
+        CacheConfig {
+            capacity: None,
+            policy: None,
+            virtual_caches: Vec::new(),
+        }
+    }
+
+    pub fn default_with_capacity(capacity: ByteSize) -> Self {
+        CacheConfig {
+            capacity: Some(capacity),
+            policy: None,
+            virtual_caches: Vec::new(),
+        }
+    }
+
+    pub fn capacity(&self) -> ByteSize {
+        // this should always be there
+        self.capacity.unwrap_or_default()
+    }
+
+    pub fn capacity_for_virtual_cache(&mut self, real_capacity: ByteSize) -> ByteSize {
+        let capacity = self.capacity.unwrap_or(real_capacity);
+        self.capacity = Some(capacity);
+        capacity
+    }
+
+    pub fn policy(&self) -> CachePolicy {
+        self.policy.unwrap_or_default()
+    }
+
+    pub fn policy_for_virtual_cache(&mut self, real_policy: CachePolicy) -> CachePolicy {
+        let policy = self.policy.unwrap_or(real_policy);
+        self.policy = Some(policy);
+        policy
+    }
+
+    fn deserialize_with_default<'de, D, const DEFAULT_CAPACITY: u64>(
+        deserializer: D,
+    ) -> Result<CacheConfig, D::Error>
+    where D: Deserializer<'de> {
+        use serde_with::{DeserializeAs, FromInto, PickFirst, Same};
+
+        let mut cache_config: CacheConfig =
+            PickFirst::<(Same, FromInto<ByteSize>)>::deserialize_as(deserializer)?;
+        if cache_config.capacity.is_none() {
+            cache_config.capacity = Some(ByteSize::b(DEFAULT_CAPACITY));
+        }
+        Ok(cache_config)
+    }
+}
+
+impl From<ByteSize> for CacheConfig {
+    fn from(capacity: ByteSize) -> Self {
+        CacheConfig::default_with_capacity(capacity)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CachePolicy {
+    #[default]
+    Lru,
+    S3Fifo,
+    TinyLfu,
+}
+
+impl std::fmt::Display for CachePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            CachePolicy::Lru => f.write_str("lru"),
+            CachePolicy::S3Fifo => f.write_str("s3-fifo"),
+            CachePolicy::TinyLfu => f.write_str("tiny-lfu"),
+        }
+    }
+}
+
+/// Configuration controlling how fast a searcher should timeout a `get_slice`
+/// request to retry it.
+///
+/// [Amazon's best practise](https://docs.aws.amazon.com/whitepapers/latest/s3-optimizing-performance-best-practices/timeouts-and-retries-for-latency-sensitive-applications.html)
+/// suggests that to ensure low latency, it is best to:
+/// - retry small GET request after 2s
+/// - retry large GET request when the throughput is below some percentile.
+///
+/// This policy is inspired by this guidance. It does not track instanteneous throughput, but
+/// computes an overall timeout using the following formula:
+/// `timeout_offset + num_bytes_get_request / min_throughtput`
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StorageTimeoutPolicy {
+    pub min_throughtput_bytes_per_secs: u64,
+    pub timeout_millis: u64,
+    // Disclaimer: this is a number of retry, so the overall max number of
+    // attempts is `max_num_retries + 1``.
+    pub max_num_retries: usize,
+}
+
+impl StorageTimeoutPolicy {
+    pub fn compute_timeout(&self, num_bytes: usize) -> impl Iterator<Item = Duration> {
+        let min_download_time_secs: f64 = if self.min_throughtput_bytes_per_secs == 0 {
+            0.0f64
+        } else {
+            num_bytes as f64 / self.min_throughtput_bytes_per_secs as f64
+        };
+        let timeout = Duration::from_millis(self.timeout_millis)
+            + Duration::from_secs_f64(min_download_time_secs);
+        std::iter::repeat_n(timeout, self.max_num_retries + 1)
+    }
 }
 
 impl Default for SearcherConfig {
     fn default() -> Self {
-        Self {
-            fast_field_cache_capacity: ByteSize::gb(1),
-            split_footer_cache_capacity: ByteSize::mb(500),
-            partial_request_cache_capacity: ByteSize::mb(64),
-            max_num_concurrent_split_streams: 100,
+        SearcherConfig {
+            fast_field_cache: CacheConfig::default_with_capacity(ByteSize::gb(1)),
+            split_footer_cache: CacheConfig::default_with_capacity(ByteSize::mb(500)),
+            partial_request_cache: CacheConfig::default_with_capacity(ByteSize::mb(64)),
+            predicate_cache: CacheConfig::default_with_capacity(ByteSize::mb(256)),
             max_num_concurrent_split_searches: 100,
+            max_splits_per_search: None,
+            _max_num_concurrent_split_streams: None,
             aggregation_memory_limit: ByteSize::mb(500),
             aggregation_bucket_limit: 65000,
             split_cache: None,
+            request_timeout_secs: Self::default_request_timeout_secs(),
+            storage_timeout_policy: None,
+            warmup_memory_budget: ByteSize::gb(100),
+            warmup_single_split_initial_allocation: ByteSize::gb(1),
+            lambda: None,
         }
     }
 }
 
 impl SearcherConfig {
+    /// The timeout after which a search should be cancelled
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_timeout_secs.get())
+    }
+    fn default_request_timeout_secs() -> NonZeroU64 {
+        NonZeroU64::new(30).unwrap()
+    }
     fn validate(&self) -> anyhow::Result<()> {
         if let Some(split_cache_limits) = self.split_cache {
             if self.max_num_concurrent_split_searches
@@ -251,14 +547,12 @@ impl SearcherConfig {
                     split_cache_limits.max_file_descriptors
                 );
             }
-            if self.max_num_concurrent_split_streams
-                > split_cache_limits.max_file_descriptors.get() as usize
-            {
+            if self.warmup_single_split_initial_allocation > self.warmup_memory_budget {
                 anyhow::bail!(
-                    "max_num_concurrent_split_streams ({}) must be lower or equal to \
-                     split_cache.max_file_descriptors ({})",
-                    self.max_num_concurrent_split_streams,
-                    split_cache_limits.max_file_descriptors
+                    "warmup_single_split_initial_allocation ({}) must be lower or equal to \
+                     warmup_memory_budget ({})",
+                    self.warmup_single_split_initial_allocation,
+                    self.warmup_memory_budget
                 );
             }
         }
@@ -266,14 +560,34 @@ impl SearcherConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionAlgorithm {
+    Gzip,
+    Zstd,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IngestApiConfig {
+    /// Maximum memory space taken by the ingest WAL
     pub max_queue_memory_usage: ByteSize,
+    /// Maximum disk space taken by the ingest WAL
     pub max_queue_disk_usage: ByteSize,
     replication_factor: usize,
     pub content_length_limit: ByteSize,
+    /// (hidden) Targeted throughput for each shard
     pub shard_throughput_limit: ByteSize,
+    /// (hidden) Maximum accumulated throughput capacity for underutilized
+    /// shards, allowing the throughput limit to be temporarily exceeded
+    pub shard_burst_limit: ByteSize,
+    /// (hidden) new_shard_count = ceil(old_shard_count * shard_scale_up_factor)
+    ///
+    /// Setting this too high will be cancelled out by the arbiter that prevents
+    /// creating too many shards at once.
+    pub shard_scale_up_factor: f32,
+    #[serde(default)]
+    pub grpc_compression_algorithm: Option<CompressionAlgorithm>,
 }
 
 impl Default for IngestApiConfig {
@@ -284,6 +598,9 @@ impl Default for IngestApiConfig {
             replication_factor: 1,
             content_length_limit: ByteSize::mib(10),
             shard_throughput_limit: DEFAULT_SHARD_THROUGHPUT_LIMIT,
+            shard_burst_limit: DEFAULT_SHARD_BURST_LIMIT,
+            shard_scale_up_factor: DEFAULT_SHARD_SCALE_UP_FACTOR,
+            grpc_compression_algorithm: None,
         }
     }
 }
@@ -312,34 +629,57 @@ impl IngestApiConfig {
             .expect("replication factor should be either 1 or 2"))
     }
 
+    pub fn grpc_compression_encoding(&self) -> Option<CompressionEncoding> {
+        self.grpc_compression_algorithm
+            .as_ref()
+            .map(|algorithm| match algorithm {
+                CompressionAlgorithm::Gzip => CompressionEncoding::Gzip,
+                CompressionAlgorithm::Zstd => CompressionEncoding::Zstd,
+            })
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         self.replication_factor()?;
         ensure!(
             self.max_queue_disk_usage > ByteSize::mib(256),
             "max_queue_disk_usage must be at least 256 MiB, got `{}`",
-            self.max_queue_disk_usage
+            self.max_queue_disk_usage.display().si()
         );
         ensure!(
             self.max_queue_disk_usage >= self.max_queue_memory_usage,
             "max_queue_disk_usage ({}) must be at least max_queue_memory_usage ({})",
-            self.max_queue_disk_usage,
-            self.max_queue_memory_usage
+            self.max_queue_disk_usage.display().si(),
+            self.max_queue_memory_usage.display().si()
         );
         info!(
-            "ingestion shard throughput limit: {:?}",
-            self.shard_throughput_limit
+            "ingestion shard throughput limit: {}",
+            self.shard_throughput_limit.display().si()
         );
         ensure!(
             self.shard_throughput_limit >= ByteSize::mib(1)
                 && self.shard_throughput_limit <= ByteSize::mib(20),
-            "shard_throughput_limit ({:?}) must be within 1mb and 20mb",
-            self.shard_throughput_limit
+            "shard_throughput_limit ({}) must be within 1mb and 20mb",
+            self.shard_throughput_limit.display().si()
+        );
+        // The newline delimited format is persisted as something a bit larger
+        // (lines prefixed with their length)
+        let estimated_persist_size = ByteSize::b(3 * self.content_length_limit.as_u64() / 2);
+        ensure!(
+            self.shard_burst_limit >= estimated_persist_size,
+            "shard_burst_limit ({}) must be at least 1.5*content_length_limit ({})",
+            self.shard_burst_limit,
+            estimated_persist_size,
+        );
+        ensure!(
+            self.shard_scale_up_factor > 1.0,
+            "shard_scale_up_factor ({}) must be greater than 1",
+            self.shard_scale_up_factor,
         );
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JaegerConfig {
     /// Enables the gRPC endpoint that allows the Jaeger Query Service to connect and retrieve
@@ -412,6 +752,7 @@ impl Default for JaegerConfig {
 pub struct NodeConfig {
     pub cluster_id: String,
     pub node_id: NodeId,
+    pub availability_zone: Option<String>,
     pub enabled_services: HashSet<QuickwitService>,
     pub gossip_listen_addr: SocketAddr,
     pub grpc_listen_addr: SocketAddr,
@@ -460,15 +801,17 @@ impl NodeConfig {
         // validation purposes. Additionally, we need to append a default port if necessary and
         // finally return the addresses as strings, which is tricky for IPv6. We let the logic baked
         // in `HostAddr` handle this complexity.
+        let mut found_something = false;
         for peer_seed in &self.peer_seeds {
             let peer_seed_addr = HostAddr::parse_with_default_port(peer_seed, default_gossip_port)?;
             if let Err(error) = peer_seed_addr.resolve().await {
                 warn!(peer_seed = %peer_seed_addr, error = ?error, "failed to resolve peer seed address");
-                continue;
+            } else {
+                found_something = true;
             }
             peer_seed_addrs.push(peer_seed_addr.to_string())
         }
-        if !self.peer_seeds.is_empty() && peer_seed_addrs.is_empty() {
+        if !self.peer_seeds.is_empty() && !found_something {
             warn!("failed to resolve all the peer seed addresses")
         }
         Ok(peer_seed_addrs)
@@ -480,9 +823,17 @@ impl NodeConfig {
         self.storage_configs.redact();
     }
 
+    /// Creates a config with defaults suitable for testing.
+    ///
+    /// Uses the default ports without ensuring that they are available.
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test() -> Self {
-        serialize::node_config_for_test()
+        serialize::node_config_for_tests_from_ports(7280, 7281)
+    }
+
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn for_test_from_ports(rest_listen_port: u16, grpc_listen_port: u16) -> Self {
+        serialize::node_config_for_tests_from_ports(rest_listen_port, grpc_listen_port)
     }
 }
 
@@ -567,12 +918,17 @@ mod tests {
             let ingest_api_config: IngestApiConfig = serde_yaml::from_str(
                 r#"
                     max_queue_disk_usage: 100M
+                    grpc_compression_algorithm: zstd
                 "#,
             )
             .unwrap();
             assert_eq!(
                 ingest_api_config.validate().unwrap_err().to_string(),
                 "max_queue_disk_usage must be at least 256 MiB, got `100.0 MB`"
+            );
+            assert_eq!(
+                ingest_api_config.grpc_compression_encoding().unwrap(),
+                CompressionEncoding::Zstd
             );
         }
         {
@@ -603,8 +959,47 @@ mod tests {
         }
     }
 
+    #[track_caller]
+    fn test_keepalive_config_serialization_aux(
+        keep_alive_json: serde_json::Value,
+        expected: quickwit_common::tower::KeepAliveConfig,
+    ) {
+        let keep_alive_config: KeepAliveConfig =
+            serde_json::from_value(keep_alive_json.clone()).unwrap();
+        let keep_alive_deser: quickwit_common::tower::KeepAliveConfig =
+            keep_alive_config.clone().into();
+        assert_eq!(&keep_alive_deser, &expected);
+        let keep_alive_config_deser_ser = serde_json::to_value(keep_alive_config).unwrap();
+        let keep_alive_config_deser_ser_deser: KeepAliveConfig =
+            serde_json::from_value(keep_alive_config_deser_ser).unwrap();
+        let keep_alive_config_deser_ser_deser: quickwit_common::tower::KeepAliveConfig =
+            keep_alive_config_deser_ser_deser.into();
+        assert_eq!(&keep_alive_config_deser_ser_deser, &expected);
+    }
+
     #[test]
-    fn test_grpc_config_serialization() {
+    fn test_keepalive_config_serialization() {
+        test_keepalive_config_serialization_aux(
+            serde_json::json!({}),
+            quickwit_common::tower::KeepAliveConfig {
+                interval: Duration::from_secs(10),
+                timeout: Duration::from_secs(5),
+            },
+        );
+        test_keepalive_config_serialization_aux(
+            serde_json::json!({
+                "interval": "3s",
+                "timeout": "1s",
+            }),
+            quickwit_common::tower::KeepAliveConfig {
+                interval: Duration::from_secs(3),
+                timeout: Duration::from_secs(1),
+            },
+        );
+    }
+
+    #[test]
+    fn test_grpc_config_serialization_default() {
         let grpc_config: GrpcConfig = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(
             grpc_config.max_message_size,
@@ -624,11 +1019,15 @@ mod tests {
     fn test_grpc_config_validate() {
         let grpc_config = GrpcConfig {
             max_message_size: ByteSize::mb(1),
+            tls: None,
+            keep_alive: None,
         };
         assert!(grpc_config.validate().is_ok());
 
         let grpc_config = GrpcConfig {
             max_message_size: ByteSize::kb(1),
+            tls: None,
+            keep_alive: None,
         };
         assert!(grpc_config.validate().is_err());
     }

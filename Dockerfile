@@ -1,4 +1,4 @@
-FROM node:20 as ui-builder
+FROM node:24@sha256:b2b2184ba9b78c022e1d6a7924ec6fba577adf28f15c9d9c457730cc4ad3807a AS ui-builder
 
 COPY quickwit/quickwit-ui /quickwit/quickwit-ui
 
@@ -8,7 +8,7 @@ RUN touch .gitignore_for_build_directory \
     && NODE_ENV=production make install build
 
 
-FROM rust:bookworm AS bin-builder
+FROM rust:bookworm@sha256:b5efaabfd787a695d2e46b37d3d9c54040e11f4c10bc2e714bbadbfcc0cd6c39 AS bin-builder
 
 ARG CARGO_FEATURES=release-feature-set
 ARG CARGO_PROFILE=release
@@ -22,15 +22,12 @@ ENV QW_COMMIT_TAGS=$QW_COMMIT_TAGS
 
 RUN apt-get -y update \
     && apt-get -y install ca-certificates \
-                          clang \
-                          cmake \
-                          libssl-dev \
-                          llvm \
-                          protobuf-compiler \
+    clang \
+    cmake \
+    libssl-dev \
+    llvm \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
-
-# Required by tonic
-RUN rustup component add rustfmt
 
 COPY quickwit /quickwit
 COPY config/quickwit.yaml /quickwit/config/quickwit.yaml
@@ -38,28 +35,30 @@ COPY --from=ui-builder /quickwit/quickwit-ui/build /quickwit/quickwit-ui/build
 
 WORKDIR /quickwit
 
+RUN rustup toolchain install
+
 RUN echo "Building workspace with feature(s) '$CARGO_FEATURES' and profile '$CARGO_PROFILE'" \
     && RUSTFLAGS="--cfg tokio_unstable" \
-        cargo build \
-        -p quickwit-cli \
-        --features $CARGO_FEATURES \
-        --bin quickwit \
-        $(test "$CARGO_PROFILE" = "release" && echo "--release") \
+    cargo build \
+    -p quickwit-cli \
+    --features $CARGO_FEATURES \
+    --bin quickwit \
+    $(test "$CARGO_PROFILE" = "release" && echo "--release") \
     && echo "Copying binaries to /quickwit/bin" \
     && mkdir -p /quickwit/bin \
     && find target/$CARGO_PROFILE -maxdepth 1 -perm /a+x -type f -exec mv {} /quickwit/bin \;
 
 
-FROM debian:bookworm-slim AS quickwit
+FROM debian:bookworm-slim@sha256:e899040a73d36e2b36fa33216943539d9957cba8172b858097c2cabcdb20a3e2 AS quickwit
 
 LABEL org.opencontainers.image.title="Quickwit"
 LABEL maintainer="Quickwit, Inc. <hello@quickwit.io>"
 LABEL org.opencontainers.image.vendor="Quickwit, Inc."
-LABEL org.opencontainers.image.licenses="AGPL-3.0"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get -y update \
     && apt-get -y install ca-certificates \
-                          libssl3 \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /quickwit

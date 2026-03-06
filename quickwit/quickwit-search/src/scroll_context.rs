@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,28 +20,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
+use quickwit_common::metrics::GaugeGuard;
+use quickwit_common::shared_consts::SCROLL_BATCH_LEN;
 use quickwit_metastore::SplitMetadata;
-use quickwit_proto::search::{LeafSearchResponse, PartialHit, SearchRequest};
+use quickwit_proto::search::{LeafSearchResponse, PartialHit, SearchRequest, SplitSearchError};
 use quickwit_proto::types::IndexUid;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use ttl_cache::TtlCache;
 use ulid::Ulid;
 
+use crate::ClusterClient;
 use crate::root::IndexMetasForLeafSearch;
 use crate::service::SearcherContext;
-use crate::ClusterClient;
 
-/// Maximum capacity of the search after cache.
+/// Maximum number of values in the local search KV store.
 ///
-/// For the moment this value is hardcoded.
 /// TODO make configurable.
 ///
 /// Assuming a search context of 1MB, this can
 /// amount to up to 1GB.
-const SCROLL_BATCH_LEN: usize = 1_000;
+const LOCAL_KV_CACHE_SIZE: usize = 1_000;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ScrollContext {
@@ -57,6 +53,8 @@ pub(crate) struct ScrollContext {
     pub max_hits_per_page: u64,
     pub cached_partial_hits_start_offset: u64,
     pub cached_partial_hits: Vec<PartialHit>,
+    pub failed_splits: Vec<SplitSearchError>,
+    pub num_successful_splits: u64,
 }
 
 impl ScrollContext {
@@ -123,29 +121,51 @@ impl ScrollContext {
     }
 }
 
+struct TrackedValue {
+    content: Vec<u8>,
+    _total_size_metric_guard: GaugeGuard<'static>,
+}
+
+/// In memory key value store with TTL and limited size.
+///
+/// Once the capacity [LOCAL_KV_CACHE_SIZE] is reached, the oldest entries are
+/// removed.
+///
+/// Currently this store is only used for caching scroll contexts. Using it for
+/// other purposes is risky as use cases would compete for its capacity.
 #[derive(Clone)]
 pub(crate) struct MiniKV {
-    ttl_with_cache: Arc<RwLock<TtlCache<Vec<u8>, Vec<u8>>>>,
+    ttl_with_cache: Arc<RwLock<TtlCache<Vec<u8>, TrackedValue>>>,
 }
 
 impl Default for MiniKV {
     fn default() -> MiniKV {
         MiniKV {
-            ttl_with_cache: Arc::new(RwLock::new(TtlCache::new(SCROLL_BATCH_LEN))),
+            ttl_with_cache: Arc::new(RwLock::new(TtlCache::new(LOCAL_KV_CACHE_SIZE))),
         }
     }
 }
 
 impl MiniKV {
     pub async fn put(&self, key: Vec<u8>, payload: Vec<u8>, ttl: Duration) {
+        let mut metric_guard =
+            GaugeGuard::from_gauge(&crate::SEARCH_METRICS.searcher_local_kv_store_size_bytes);
+        metric_guard.add(payload.len() as i64);
         let mut cache_lock = self.ttl_with_cache.write().await;
-        cache_lock.insert(key, payload, ttl);
+        cache_lock.insert(
+            key,
+            TrackedValue {
+                content: payload,
+                _total_size_metric_guard: metric_guard,
+            },
+            ttl,
+        );
     }
 
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let cache_lock = self.ttl_with_cache.read().await;
-        let search_after_context_bytes = cache_lock.get(key)?;
-        Some(search_after_context_bytes.clone())
+        let tracked_value = cache_lock.get(key)?;
+        Some(tracked_value.content.clone())
     }
 }
 
@@ -202,7 +222,7 @@ impl fmt::Display for ScrollKeyAndStartOffset {
         serde_json::to_writer(&mut payload, &self.search_after)
             .expect("serializing PartialHit should never fail");
         let b64_payload = BASE64_STANDARD.encode(payload);
-        write!(formatter, "{}", b64_payload)
+        write!(formatter, "{b64_payload}")
     }
 }
 

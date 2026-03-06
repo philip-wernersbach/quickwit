@@ -1,63 +1,65 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import MonacoEditor from 'react-monaco-editor';
+import { BeforeMount, Editor, OnMount } from "@monaco-editor/react";
 import { useCallback } from "react";
 import { EDITOR_THEME } from "../utils/theme";
 
-export function JsonEditor({content, resizeOnMount}: {content: unknown, resizeOnMount: boolean}) {
+export function JsonEditor({
+  content,
+  resizeOnMount,
+}: {
+  content: unknown;
+  resizeOnMount: boolean;
+}) {
   // Setting editor height based on lines height and count to stretch and fit its content.
-  const onMount = useCallback((editor) => {
-    if (!resizeOnMount) {
-      return;
-    }
-    const editorElement = editor.getDomNode();
+  const onMount: OnMount = useCallback(
+    (editor) => {
+      if (!resizeOnMount) {
+        return;
+      }
+      const editorElement = editor.getDomNode();
 
-    if (!editorElement) {
-      return;
-    }
+      if (!editorElement) {
+        return;
+      }
 
-    // Weirdly enough, we have to wait a few ms to get the right height
-    // from `editor.getContentHeight()`. If not, we sometimes end up with
-    // a height > 7000px... and I don't know why.
-    setTimeout(() => {
-      const height = Math.min(800, editor.getContentHeight());
-      editorElement.style.height = `${height}px`;
-      editor.layout();
-    }, 10);
+      // Weirdly enough, we have to wait a few ms to get the right height
+      // from `editor.getContentHeight()`. If not, we sometimes end up with
+      // a height > 7000px... and I don't know why.
+      setTimeout(() => {
+        const height = Math.min(800, editor.getContentHeight());
+        editorElement.style.height = `${height}px`;
+        editor.layout();
+      }, 10);
+    },
+    [resizeOnMount],
+  );
 
-  }, [resizeOnMount]);
-
-  /* eslint-disable  @typescript-eslint/no-explicit-any */
-  function beforeMount(monaco: any) {
-    monaco.editor.defineTheme('quickwit-light', EDITOR_THEME);
-  }
+  const beforeMount: BeforeMount = (monaco) => {
+    monaco.editor.defineTheme("quickwit-light", EDITOR_THEME);
+  };
 
   return (
-    <MonacoEditor
-      language='json'
+    <Editor
+      language="json"
       value={JSON.stringify(content, null, 2)}
-      editorWillMount={beforeMount}
-      editorDidMount={onMount}
+      beforeMount={beforeMount}
+      onMount={onMount}
       options={{
         readOnly: true,
-        fontFamily: 'monospace',
+        fontFamily: "monospace",
         overviewRulerBorder: false,
         overviewRulerLanes: 0,
         minimap: {
@@ -71,10 +73,10 @@ export function JsonEditor({content, resizeOnMount}: {content: unknown, resizeOn
         fixedOverflowWidgets: true,
         scrollBeyondLastLine: false,
         automaticLayout: true,
-        wordWrap: 'on',
-        wrappingIndent: 'deepIndent',
+        wordWrap: "on",
+        wrappingIndent: "deepIndent",
       }}
-      theme='quickwit-light'
+      theme="quickwit-light"
     />
-  )
+  );
 }

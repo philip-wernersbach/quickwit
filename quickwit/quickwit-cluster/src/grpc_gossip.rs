@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeMap;
 use std::iter::zip;
@@ -26,11 +21,12 @@ use std::time::{Duration, Instant};
 use chitchat::{Chitchat, ChitchatId, NodeState, VersionedValue};
 use futures::Future;
 use quickwit_common::pretty::PrettyDisplay;
+use quickwit_common::tower::ClientGrpcConfig;
 use quickwit_proto::cluster::{ClusterService, ClusterServiceClient, FetchClusterStateRequest};
 use rand::seq::IteratorRandom;
-use tokio::sync::{watch, Mutex};
-use tokio_stream::wrappers::WatchStream;
+use tokio::sync::{Mutex, watch};
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::WatchStream;
 use tracing::{info, warn};
 
 use crate::grpc_service::cluster_grpc_client;
@@ -46,6 +42,7 @@ pub(crate) async fn spawn_catchup_callback_task(
     weak_chitchat: Weak<Mutex<Chitchat>>,
     live_nodes_rx: watch::Receiver<BTreeMap<ChitchatId, NodeState>>,
     mut catchup_callback_rx: watch::Receiver<()>,
+    client_grpc_config: ClientGrpcConfig,
 ) {
     let catchup_callback_future = async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -60,7 +57,7 @@ pub(crate) async fn spawn_catchup_callback_task(
                 &self_chitchat_id,
                 chitchat,
                 live_nodes_rx.clone(),
-                cluster_grpc_client,
+                |socket_addr| cluster_grpc_client(socket_addr, client_grpc_config.clone()),
             )
             .await;
 
@@ -74,14 +71,14 @@ pub(crate) async fn spawn_catchup_callback_task(
     tokio::spawn(catchup_callback_future);
 }
 
-async fn perform_grpc_gossip_rounds<Factory, Fut>(
+async fn perform_grpc_gossip_rounds<ClusterServiceClientFactory, Fut>(
     cluster_id: String,
     self_chitchat_id: &ChitchatId,
     chitchat: Arc<Mutex<Chitchat>>,
     live_nodes_rx: watch::Receiver<BTreeMap<ChitchatId, NodeState>>,
-    grpc_client_factory: Factory,
+    grpc_client_factory: ClusterServiceClientFactory,
 ) where
-    Factory: Fn(SocketAddr) -> Fut,
+    ClusterServiceClientFactory: Fn(SocketAddr) -> Fut,
     Fut: Future<Output = ClusterServiceClient>,
 {
     wait_for_gossip_candidates(
@@ -150,7 +147,7 @@ async fn perform_grpc_gossip_rounds<Factory, Fut>(
                     },
                 )
             });
-            chitchat_guard.reset_node_state(
+            chitchat_guard.reset_node_state_if_update(
                 &chitchat_id,
                 key_values,
                 proto_node_state.max_version,
@@ -196,7 +193,7 @@ fn select_gossip_candidates(
             find_gossip_candidate_grpc_addr(self_chitchat_id, node_state)
                 .map(|grpc_addr| (&node_state.chitchat_id().node_id, grpc_addr))
         })
-        .choose_multiple(&mut rand::thread_rng(), MAX_GOSSIP_PEERS)
+        .choose_multiple(&mut rand::rng(), MAX_GOSSIP_PEERS)
         .into_iter()
         .map(|(node_id, grpc_addr)| (node_id.clone(), grpc_addr))
         .unzip()

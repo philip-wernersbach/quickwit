@@ -32,6 +32,7 @@ libz-sys = { workspace = true, optional = true }
 once_cell = { workspace = true }
 oneshot = { workspace = true }
 openssl = { workspace = true, optional = true }
+percent-encoding = { workspace = true }
 pulsar = { workspace = true, optional = true }
 quickwit-query = { workspace = true }
 regex = { workspace = true }
@@ -47,6 +48,7 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 utoipa = { workspace = true }
 vrl = { workspace = true, optional = true }
+warp = { workspace = true, optional = true }
 
 quickwit-actors = { workspace = true }
 quickwit-aws = { workspace = true }
@@ -84,7 +86,8 @@ sqs = [
   "queue-sources",
   "quickwit-aws/sqs",
 ]
-sqs-localstack-tests = []
+sqs-test-helpers = ["warp"]
+sqs-localstack-tests = ["sqs-test-helpers"]
 vendored-kafka = [
   "kafka",
   "libz-sys/static",
@@ -101,6 +104,7 @@ testsuite = [
   "quickwit-storage/testsuite"
 ]
 vrl = ["dep:vrl", "quickwit-config/vrl"]
+ci-test = []
 
 [dev-dependencies]
 bytes = { workspace = true }

@@ -1,39 +1,39 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub(crate) mod serialize;
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use bytesize::ByteSize;
 use chrono::Utc;
 use cron::Schedule;
 use humantime::parse_duration;
 use quickwit_common::uri::Uri;
-use quickwit_doc_mapper::{DefaultDocMapperBuilder, DocMapper, DocMapping};
+use quickwit_common::{is_true, true_fn};
+use quickwit_doc_mapper::{DocMapper, DocMapperBuilder, DocMapping};
 use quickwit_proto::types::IndexId;
-use rand::{distributions, thread_rng, Rng};
+use rand::{Rng, distr, rng};
 use serde::{Deserialize, Serialize};
 pub use serialize::{load_index_config_from_user_config, load_index_config_update};
+use siphasher::sip::SipHasher;
 use tracing::warn;
 
 use crate::index_config::serialize::VersionedIndexConfig;
@@ -44,6 +44,7 @@ use crate::merge_policy_config::MergePolicyConfig;
 pub struct IndexingResources {
     #[schema(value_type = String, default = "2 GB")]
     #[serde(default = "IndexingResources::default_heap_size")]
+    #[serde(with = "crate::serde_utils::bytesize_serde")]
     pub heap_size: ByteSize,
     // DEPRECATED: See #4439
     #[schema(value_type = String)]
@@ -55,6 +56,12 @@ pub struct IndexingResources {
 impl PartialEq for IndexingResources {
     fn eq(&self, other: &Self) -> bool {
         self.heap_size == other.heap_size
+    }
+}
+
+impl Hash for IndexingResources {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.heap_size.hash(state);
     }
 }
 
@@ -91,7 +98,7 @@ impl Default for IndexingResources {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Hash, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingSettings {
     #[schema(default = 60)]
@@ -155,6 +162,41 @@ impl Default for IndexingSettings {
             split_num_docs_target: Self::default_split_num_docs_target(),
             merge_policy: MergePolicyConfig::default(),
             resources: IndexingResources::default(),
+        }
+    }
+}
+
+/// Settings for ingestion.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IngestSettings {
+    /// Configures the minimum number of shards to use for ingestion.
+    #[schema(default = 1, value_type = usize)]
+    #[serde(default = "IngestSettings::default_min_shards")]
+    pub min_shards: NonZeroUsize,
+    /// Whether to validate documents against the current doc mapping during ingestion.
+    /// Defaults to true. When false, documents will be written directly to the WAL without
+    /// validation, but might still be rejected during indexing when applying the doc mapping
+    /// in the doc processor, in that case the documents are dropped and a warning is logged.
+    ///
+    /// Note that when a source has a VRL transform configured, documents are not validated against
+    /// the doc mapping during ingestion either.
+    #[schema(default = true, value_type = bool)]
+    #[serde(default = "true_fn", skip_serializing_if = "is_true")]
+    pub validate_docs: bool,
+}
+
+impl IngestSettings {
+    pub fn default_min_shards() -> NonZeroUsize {
+        NonZeroUsize::MIN
+    }
+}
+
+impl Default for IngestSettings {
+    fn default() -> Self {
+        Self {
+            min_shards: Self::default_min_shards(),
+            validate_docs: true,
         }
     }
 }
@@ -235,7 +277,7 @@ impl RetentionPolicy {
                 0
             }
         });
-        let jitter = thread_rng().sample::<u64, _>(distributions::Standard) % (jitter_secs + 1);
+        let jitter = rng().sample::<u64, _>(distr::StandardUniform) % (jitter_secs + 1);
         duration += Duration::from_secs(jitter);
         Ok(duration)
     }
@@ -270,11 +312,34 @@ pub struct IndexConfig {
     pub index_uri: Uri,
     pub doc_mapping: DocMapping,
     pub indexing_settings: IndexingSettings,
+    pub ingest_settings: IngestSettings,
     pub search_settings: SearchSettings,
     pub retention_policy_opt: Option<RetentionPolicy>,
 }
 
 impl IndexConfig {
+    /// Return a fingerprint of parameters relevant for indexers
+    ///
+    /// This should remain private to this crate to avoid confusion with the
+    /// full indexing pipeline fingerprint that also includes the source's
+    /// fingerprint.
+    pub(crate) fn indexing_params_fingerprint(&self) -> u64 {
+        let mut hasher = SipHasher::new();
+        self.doc_mapping.doc_mapping_uid.hash(&mut hasher);
+        self.indexing_settings.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Compares IndexConfig level fingerprints
+    ///
+    /// This method is meant to enable IndexConfig level fingerprint comparison
+    /// without taking the risk of mixing them up with pipeline level
+    /// fingerprints (computed by
+    /// [`crate::indexing_pipeline_params_fingerprint()`]).
+    pub fn equals_fingerprint(&self, other: &Self) -> bool {
+        self.indexing_params_fingerprint() == other.indexing_params_fingerprint()
+    }
+
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test(index_id: &str, index_uri: &str) -> Self {
         let index_uri = Uri::from_str(index_uri).unwrap();
@@ -356,8 +421,9 @@ impl IndexConfig {
             index_uri,
             doc_mapping,
             indexing_settings,
+            ingest_settings: IngestSettings::default(),
             search_settings,
-            retention_policy_opt: Default::default(),
+            retention_policy_opt: None,
         }
     }
 }
@@ -432,11 +498,6 @@ impl crate::TestableForRegression for IndexConfig {
             store_source: true,
             tokenizers: vec![tokenizer],
         };
-        let retention_policy = Some(RetentionPolicy {
-            retention_period: "90 days".to_string(),
-            evaluation_schedule: "daily".to_string(),
-            jitter_secs: None,
-        });
         let stable_log_config = StableLogMergePolicyConfig {
             merge_factor: 9,
             max_merge_factor: 11,
@@ -454,16 +515,26 @@ impl crate::TestableForRegression for IndexConfig {
             resources: indexing_resources,
             ..Default::default()
         };
+        let ingest_settings = IngestSettings {
+            min_shards: NonZeroUsize::new(12).unwrap(),
+            validate_docs: true,
+        };
         let search_settings = SearchSettings {
             default_search_fields: vec!["message".to_string()],
         };
+        let retention_policy_opt = Some(RetentionPolicy {
+            retention_period: "90 days".to_string(),
+            evaluation_schedule: "daily".to_string(),
+            jitter_secs: None,
+        });
         IndexConfig {
             index_id: "my-index".to_string(),
             index_uri: Uri::for_test("s3://quickwit-indexes/my-index"),
             doc_mapping,
             indexing_settings,
-            retention_policy_opt: retention_policy,
+            ingest_settings,
             search_settings,
+            retention_policy_opt,
         }
     }
 
@@ -472,7 +543,9 @@ impl crate::TestableForRegression for IndexConfig {
         assert_eq!(self.index_uri, other.index_uri);
         assert_eq!(self.doc_mapping, other.doc_mapping);
         assert_eq!(self.indexing_settings, other.indexing_settings);
+        assert_eq!(self.ingest_settings, other.ingest_settings);
         assert_eq!(self.search_settings, other.search_settings);
+        assert_eq!(self.retention_policy_opt, other.retention_policy_opt);
     }
 }
 
@@ -480,12 +553,14 @@ impl crate::TestableForRegression for IndexConfig {
 pub fn build_doc_mapper(
     doc_mapping: &DocMapping,
     search_settings: &SearchSettings,
-) -> anyhow::Result<Arc<dyn DocMapper>> {
-    let builder = DefaultDocMapperBuilder {
+) -> anyhow::Result<Arc<DocMapper>> {
+    let builder = DocMapperBuilder {
         doc_mapping: doc_mapping.clone(),
         default_search_fields: search_settings.default_search_fields.clone(),
+        legacy_type_tag: None,
     };
-    Ok(Arc::new(builder.try_build()?))
+    let doc_mapper = builder.try_build()?;
+    Ok(Arc::new(doc_mapper))
 }
 
 /// Validates the objects that make up an index configuration. This is a "free" function as opposed
@@ -515,15 +590,71 @@ pub(super) fn validate_index_config(
     Ok(())
 }
 
+/// Returns the updated doc mapping and a boolean indicating whether a mutation occurred.
+///
+/// The logic goes as follows:
+/// 1. If the new doc mapping is the same as the current doc mapping, ignoring their UIDs, returns
+///    the current doc mapping and `false`, indicating that no mutation occurred.
+/// 2. If the new doc mapping is different from the current doc mapping, verifies the following
+///    constraints before returning the new doc mapping and `true`, indicating that a mutation
+///    occurred:
+///    - The doc mapping UID should differ from the current one
+///    - The timestamp field should remain the same
+///    - The tokenizers should be a superset of the current tokenizers
+///    - A doc mapper can be built from the new doc mapping
+pub fn prepare_doc_mapping_update(
+    mut new_doc_mapping: DocMapping,
+    current_doc_mapping: &DocMapping,
+    search_settings: &SearchSettings,
+) -> anyhow::Result<(DocMapping, bool)> {
+    // Save the new doc mapping UID in a temporary variable and override it with the current doc
+    // mapping UID to compare the two doc mappings, ignoring their UIDs.
+    let new_doc_mapping_uid = new_doc_mapping.doc_mapping_uid;
+    new_doc_mapping.doc_mapping_uid = current_doc_mapping.doc_mapping_uid;
+
+    if new_doc_mapping == *current_doc_mapping {
+        return Ok((new_doc_mapping, false));
+    }
+    // Restore the new doc mapping UID.
+    new_doc_mapping.doc_mapping_uid = new_doc_mapping_uid;
+
+    ensure!(
+        new_doc_mapping.doc_mapping_uid != current_doc_mapping.doc_mapping_uid,
+        "new doc mapping UID should differ from the current one, current UID `{}`, new UID `{}`",
+        current_doc_mapping.doc_mapping_uid,
+        new_doc_mapping.doc_mapping_uid,
+    );
+    let new_timestamp_field = new_doc_mapping.timestamp_field.as_deref();
+    let current_timestamp_field = current_doc_mapping.timestamp_field.as_deref();
+    ensure!(
+        new_timestamp_field == current_timestamp_field,
+        "updating timestamp field is not allowed, current timestamp field `{}`, new timestamp \
+         field `{}`",
+        current_timestamp_field.unwrap_or("none"),
+        new_timestamp_field.unwrap_or("none"),
+    );
+    // TODO: Unsure this constraint is required, should we relax it?
+    let new_tokenizers: HashSet<_> = new_doc_mapping.tokenizers.iter().collect();
+    let current_tokenizers: HashSet<_> = current_doc_mapping.tokenizers.iter().collect();
+    ensure!(
+        new_tokenizers.is_superset(&current_tokenizers),
+        "updating tokenizers is allowed only if adding new tokenizers, current tokenizers \
+         `{current_tokenizers:?}`, new tokenizers `{new_tokenizers:?}`",
+    );
+    build_doc_mapper(&new_doc_mapping, search_settings).context("invalid doc mapping")?;
+    Ok((new_doc_mapping, true))
+}
+
 #[cfg(test)]
 mod tests {
 
     use cron::TimeUnitSpec;
-    use quickwit_doc_mapper::ModeType;
+    use quickwit_doc_mapper::{Mode, ModeType, TokenizerEntry};
+    use quickwit_proto::types::DocMappingUid;
 
     use super::*;
-    use crate::merge_policy_config::MergePolicyConfig;
     use crate::ConfigFormat;
+    use crate::merge_policy_config::MergePolicyConfig;
 
     fn get_index_config_filepath(index_config_filename: &str) -> String {
         format!(
@@ -596,6 +727,7 @@ mod tests {
                 ..Default::default()
             }
         );
+        assert_eq!(index_config.ingest_settings.min_shards.get(), 12);
         assert_eq!(
             index_config.search_settings,
             SearchSettings {
@@ -638,12 +770,13 @@ mod tests {
             assert_eq!(index_config.doc_mapping.field_mappings[0].name, "body");
             assert!(!index_config.doc_mapping.store_source);
             assert_eq!(index_config.indexing_settings, IndexingSettings::default());
-            assert_eq!(
-                index_config.search_settings,
-                SearchSettings {
-                    default_search_fields: vec!["body".to_string()],
-                }
-            );
+            assert_eq!(index_config.ingest_settings, IngestSettings::default());
+
+            let expected_search_settings = SearchSettings {
+                default_search_fields: vec!["body".to_string()],
+            };
+            assert_eq!(index_config.search_settings, expected_search_settings);
+            assert!(index_config.retention_policy_opt.is_none());
         }
         {
             let index_config_filepath = get_index_config_filepath("partial-hdfs-logs.yaml");
@@ -732,10 +865,12 @@ mod tests {
         )
         .unwrap_err();
         println!("{parsing_config_error:?}");
-        assert!(parsing_config_error
-            .root_cause()
-            .to_string()
-            .contains("failed to parse human-readable duration `x`"));
+        assert!(
+            parsing_config_error
+                .root_cause()
+                .to_string()
+                .contains("failed to parse human-readable duration `x`")
+        );
     }
 
     #[test]
@@ -997,5 +1132,126 @@ mod tests {
         schedule_test_helper_fn("weekly");
         schedule_test_helper_fn("monthly");
         schedule_test_helper_fn("* * * ? * ?");
+    }
+
+    #[test]
+    fn test_ingest_settings_serde() {
+        let settings = IngestSettings {
+            min_shards: NonZeroUsize::MIN,
+            validate_docs: false,
+        };
+        let settings_yaml = serde_yaml::to_string(&settings).unwrap();
+        assert!(settings_yaml.contains("validate_docs"));
+
+        let expected_settings: IngestSettings = serde_yaml::from_str(&settings_yaml).unwrap();
+        assert_eq!(settings, expected_settings);
+
+        let settings = IngestSettings {
+            min_shards: NonZeroUsize::MIN,
+            validate_docs: true,
+        };
+        let settings_yaml = serde_yaml::to_string(&settings).unwrap();
+        assert!(!settings_yaml.contains("validate_docs"));
+
+        let expected_settings: IngestSettings = serde_yaml::from_str(&settings_yaml).unwrap();
+        assert_eq!(settings, expected_settings);
+
+        let settings_yaml = r#"
+            min_shards: 0
+        "#;
+        let error = serde_yaml::from_str::<IngestSettings>(settings_yaml).unwrap_err();
+        assert!(error.to_string().contains("expected a nonzero"));
+    }
+
+    #[test]
+    fn test_prepare_doc_mapping_update() {
+        let current_index_config = IndexConfig::for_test("test-index", "s3://test-index");
+        let mut current_doc_mapping = current_index_config.doc_mapping;
+        let search_settings = current_index_config.search_settings;
+
+        let tokenizer_json = r#"
+            {
+                "name": "breton-tokenizer",
+                "type": "regex",
+                "pattern": "crêpes*"
+            }
+            "#;
+        let tokenizer: TokenizerEntry = serde_json::from_str(tokenizer_json).unwrap();
+
+        current_doc_mapping.tokenizers.push(tokenizer.clone());
+
+        // The new doc mapping should have a different doc mapping UID.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.store_source = false; // This is set to `true` for the current doc mapping.
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("doc mapping UID should differ"));
+
+        // The new doc mapping should not change the timestamp field.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.timestamp_field = Some("ts".to_string()); // This is set to `timestamp` for the current doc mapping.
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("timestamp field"));
+
+        // The new doc mapping should not remove the timestamp field.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.timestamp_field = None;
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("timestamp field"));
+
+        // The new doc mapping should not remove tokenizers.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.tokenizers.clear();
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("tokenizers"));
+
+        // The new doc mapping should be "buildable" into a doc mapper.
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.tokenizers.push(tokenizer);
+        let error =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap_err()
+                .source()
+                .unwrap()
+                .to_string();
+        assert!(error.contains("duplicated custom tokenizer"));
+
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        new_doc_mapping.doc_mapping_uid = DocMappingUid::random();
+        let (updated_doc_mapping, mutation_occurred) =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap();
+        assert!(!mutation_occurred);
+        assert_eq!(
+            updated_doc_mapping.doc_mapping_uid,
+            current_doc_mapping.doc_mapping_uid
+        );
+        assert_eq!(updated_doc_mapping, current_doc_mapping);
+
+        let mut new_doc_mapping = current_doc_mapping.clone();
+        let new_doc_mapping_uid = DocMappingUid::random();
+        new_doc_mapping.doc_mapping_uid = new_doc_mapping_uid;
+        new_doc_mapping.mode = Mode::Strict;
+        let (updated_doc_mapping, mutation_occurred) =
+            prepare_doc_mapping_update(new_doc_mapping, &current_doc_mapping, &search_settings)
+                .unwrap();
+        assert!(mutation_occurred);
+        assert_eq!(updated_doc_mapping.doc_mapping_uid, new_doc_mapping_uid);
+        assert_eq!(updated_doc_mapping.mode, Mode::Strict);
     }
 }

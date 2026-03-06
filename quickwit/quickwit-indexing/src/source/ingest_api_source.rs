@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::fmt;
 use std::time::Duration;
@@ -24,8 +19,8 @@ use anyhow::bail;
 use async_trait::async_trait;
 use quickwit_actors::{ActorContext, ActorExitStatus, Mailbox};
 use quickwit_ingest::{
-    get_ingest_api_service, CreateQueueIfNotExistsRequest, DocCommand, FetchRequest, FetchResponse,
-    GetPartitionId, IngestApiService, SuggestTruncateRequest,
+    CreateQueueIfNotExistsRequest, DocCommand, FetchRequest, FetchResponse, GetPartitionId,
+    IngestApiService, SuggestTruncateRequest, get_ingest_api_service,
 };
 use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
 use quickwit_proto::metastore::SourceType;
@@ -259,16 +254,16 @@ mod tests {
     use quickwit_actors::Universe;
     use quickwit_common::rand::append_random_suffix;
     use quickwit_config::{
-        IngestApiConfig, SourceConfig, SourceInputFormat, SourceParams, INGEST_API_SOURCE_ID,
+        INGEST_API_SOURCE_ID, IngestApiConfig, SourceConfig, SourceInputFormat, SourceParams,
     };
-    use quickwit_ingest::{init_ingest_api, CommitType, DocBatchBuilder, IngestRequest};
+    use quickwit_ingest::{CommitType, DocBatchBuilder, IngestRequest, init_ingest_api};
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
     use quickwit_proto::types::{IndexId, IndexUid};
 
     use super::*;
     use crate::models::RawDocBatch;
-    use crate::source::tests::SourceRuntimeBuilder;
     use crate::source::SourceActor;
+    use crate::source::tests::SourceRuntimeBuilder;
 
     fn make_ingest_request(
         index_id: IndexId,
@@ -298,7 +293,7 @@ mod tests {
     fn make_source_config() -> SourceConfig {
         SourceConfig {
             source_id: INGEST_API_SOURCE_ID.to_string(),
-            num_pipelines: NonZeroUsize::new(1).unwrap(),
+            num_pipelines: NonZeroUsize::MIN,
             enabled: true,
             source_params: SourceParams::IngestApi,
             transform_config: None,

@@ -1,45 +1,43 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 import styled from "@emotion/styled";
-import { Paper } from "@mui/material";
+import { Alert, Paper } from "@mui/material";
 import dayjs from "dayjs";
-import utc from "dayjs/plugin/utc"
+import utc from "dayjs/plugin/utc";
 import { FC, ReactNode } from "react";
-import NumberFormat from "react-number-format";
+import { NumericFormat } from "react-number-format";
 import { Index } from "../utils/models";
+
 dayjs.extend(utc);
 
 const ItemContainer = styled.div`
-padding: 10px;
-display: flex;
-flex-direction: column;
-`
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+`;
 const Row = styled.div`
-padding: 5px;
-display: flex;
-flex-direction: row;
-&:nth-of-type(odd){ background: rgba(0,0,0,0.05) }
-`
+  padding: 5px;
+  display: flex;
+  flex-direction: row;
+  &:nth-of-type(odd) {
+    background: rgba(0, 0, 0, 0.05);
+  }
+`;
 const RowKey = styled.div`
-width: 350px;
-`
+  width: 350px;
+`;
 const IndexRow: FC<{ title: string; children: ReactNode }> = ({
   title,
   children,
@@ -52,41 +50,55 @@ const IndexRow: FC<{ title: string; children: ReactNode }> = ({
 
 export function IndexSummary({ index }: { index: Index }) {
   const all_splits = index.splits;
-  const published_splits = all_splits.filter(split => split.split_state == "Published");
-  const num_of_staged_splits = all_splits.filter(split => split.split_state == "Staged").length;
-  const num_of_marked_for_delete_splits = all_splits.filter(split => split.split_state == "MarkedForDeletion").length;
+  const published_splits = all_splits.filter(
+    (split) => split.split_state === "Published",
+  );
+  const num_of_staged_splits = all_splits.filter(
+    (split) => split.split_state === "Staged",
+  ).length;
+  const num_of_marked_for_delete_splits = all_splits.filter(
+    (split) => split.split_state === "MarkedForDeletion",
+  ).length;
   const total_num_docs = published_splits
-    .map(split => split.num_docs)
+    .map((split) => split.num_docs)
     .reduce((sum, current) => sum + current, 0);
   const total_num_bytes = published_splits
-    .map(split => {
-      return split.footer_offsets.end
+    .map((split) => {
+      return split.footer_offsets.end;
     })
     .reduce((sum, current) => sum + current, 0);
   const total_uncompressed_num_bytes = published_splits
-    .map(split => {
-      return split.uncompressed_docs_size_in_bytes
+    .map((split) => {
+      return split.uncompressed_docs_size_in_bytes;
     })
     .reduce((sum, current) => sum + current, 0);
   return (
-    <Paper variant="outlined" >
+    <Paper variant="outlined">
       <ItemContainer>
+        {index.split_limit_reached && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            Split limit reached. Only the first 10,000 splits were retrieved.
+            The actual total may be higher. Statistics shown are incomplete.
+          </Alert>
+        )}
         <IndexRow title="Created at:">
           {dayjs
             .unix(index.metadata.create_timestamp)
             .utc()
             .format("YYYY/MM/DD HH:mm")}
         </IndexRow>
-        <IndexRow title="URI:">{index.metadata.index_config.index_uri}</IndexRow>
+        <IndexRow title="URI:">
+          {index.metadata.index_config.index_uri}
+        </IndexRow>
         <IndexRow title="Number of published documents:">
-          <NumberFormat
+          <NumericFormat
             value={total_num_docs}
             displayType={"text"}
             thousandSeparator={true}
           />
         </IndexRow>
         <IndexRow title="Size of published documents (uncompressed):">
-          <NumberFormat
+          <NumericFormat
             value={total_uncompressed_num_bytes / 1000000}
             displayType={"text"}
             thousandSeparator={true}
@@ -94,9 +106,11 @@ export function IndexSummary({ index }: { index: Index }) {
             decimalScale={2}
           />
         </IndexRow>
-        <IndexRow title="Number of published splits:">{published_splits.length}</IndexRow>
+        <IndexRow title="Number of published splits:">
+          {published_splits.length}
+        </IndexRow>
         <IndexRow title="Size of published splits:">
-          <NumberFormat
+          <NumericFormat
             value={total_num_bytes / 1000000}
             displayType={"text"}
             thousandSeparator={true}
@@ -104,9 +118,13 @@ export function IndexSummary({ index }: { index: Index }) {
             decimalScale={2}
           />
         </IndexRow>
-        <IndexRow title="Number of staged splits:">{num_of_staged_splits}</IndexRow>
-        <IndexRow title="Number of splits marked for deletion:">{num_of_marked_for_delete_splits}</IndexRow>
+        <IndexRow title="Number of staged splits:">
+          {num_of_staged_splits}
+        </IndexRow>
+        <IndexRow title="Number of splits marked for deletion:">
+          {num_of_marked_for_delete_splits}
+        </IndexRow>
       </ItemContainer>
     </Paper>
-  )
+  );
 }

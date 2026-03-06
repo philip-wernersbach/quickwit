@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -28,10 +23,10 @@ use std::time::Duration;
 
 use futures::stream::once;
 use futures::{Stream, StreamExt};
-use http::Uri;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::channel::ClientTlsConfig;
+use tonic::transport::{Channel, Endpoint, Uri};
 use tower::balance::p2c::Balance;
 use tower::buffer::Buffer;
 use tower::discover::Change as TowerChange;
@@ -82,14 +77,15 @@ where K: Hash + Eq + Clone
 
 impl<K> Unpin for ChangeStreamAdapter<K> where K: Hash + Eq + Clone {}
 
-type HttpRequest = http::Request<tonic::body::BoxBody>;
-type HttpResponse = http::Response<hyper::Body>;
+type HttpRequest = http::Request<tonic::body::Body>;
+type HttpResponse = http::Response<tonic::body::Body>;
 type ChangeStream<K> = UnboundedReceiverStream<Result<TowerChange<K, Channel>, Infallible>>;
 type Discover<K> = PendingRequestsDiscover<ChangeStream<K>, CompleteOnResponse>;
-type ChannelImpl<K> = Buffer<Balance<Discover<K>, HttpRequest>, HttpRequest>;
+type ChannelImpl<K> =
+    Buffer<HttpRequest, <Balance<Discover<K>, HttpRequest> as Service<HttpRequest>>::Future>;
 
 #[derive(Clone)]
-pub struct BalanceChannel<K: Hash + Eq + Clone> {
+pub struct BalanceChannel<K: Hash + Eq + Clone + Send> {
     inner: ChannelImpl<K>,
     connection_keys_rx: watch::Receiver<HashSet<K>>,
 }
@@ -172,7 +168,7 @@ where
 }
 
 impl<K> Service<HttpRequest> for BalanceChannel<K>
-where K: Hash + Eq + Clone
+where K: Hash + Eq + Clone + Send
 {
     type Response = HttpResponse;
     type Error = BoxError;
@@ -197,20 +193,51 @@ where K: Hash + Eq + Clone + Send + Sync + 'static
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeepAliveConfig {
+    pub interval: Duration,
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Default)]
+pub struct ClientGrpcConfig {
+    pub keep_alive_opt: Option<KeepAliveConfig>,
+    pub tls_config_opt: Option<ClientTlsConfig>,
+}
+
 /// Creates a channel from a socket address.
 ///
 /// The function is marked as `async` because it requires an executor (`connect_lazy`).
-pub async fn make_channel(socket_addr: SocketAddr) -> Channel {
+pub async fn make_channel(
+    socket_addr: SocketAddr,
+    client_grpc_config: ClientGrpcConfig,
+) -> Channel {
+    let ClientGrpcConfig {
+        keep_alive_opt,
+        tls_config_opt,
+    } = client_grpc_config;
+    let scheme = if tls_config_opt.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let uri = Uri::builder()
-        .scheme("http")
+        .scheme(scheme)
         .authority(socket_addr.to_string())
         .path_and_query("/")
         .build()
         .expect("provided arguments should be valid");
-    Endpoint::from(uri)
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .connect_lazy()
+    let mut endpoint = Endpoint::from(uri).connect_timeout(Duration::from_secs(5));
+    if let Some(tls_config) = tls_config_opt {
+        endpoint = endpoint.tls_config(tls_config).expect("sadness TODO");
+    }
+    if let Some(keep_alive) = keep_alive_opt {
+        endpoint = endpoint
+            .keep_alive_while_idle(true)
+            .http2_keep_alive_interval(keep_alive.interval)
+            .keep_alive_timeout(keep_alive.timeout);
+    }
+    endpoint.connect_lazy()
 }
 
 /// Forces a channel to initiate the underlying HTTP connection. Calling this function only makes

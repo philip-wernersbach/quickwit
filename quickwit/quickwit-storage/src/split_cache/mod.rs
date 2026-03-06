@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 mod download_task;
 mod split_table;
@@ -40,7 +35,7 @@ use ulid::Ulid;
 use crate::file_descriptor_cache::{FileDescriptorCache, SplitFile};
 use crate::split_cache::download_task::spawn_download_task;
 use crate::split_cache::split_table::SplitTable;
-use crate::{wrap_storage_with_cache, Storage, StorageCache};
+use crate::{Storage, StorageCache, wrap_storage_with_cache};
 
 /// On disk Cache of splits for searchers.
 ///
@@ -78,10 +73,10 @@ impl SplitCache {
                     // This file is a temporary file that was being downloaded, when Quickwit was
                     // stopped (killed for instance) in a way that prevented
                     // their cleanup. It is important to remove it.
-                    if let Err(io_err) = std::fs::remove_file(&path) {
-                        if io_err.kind() != io::ErrorKind::NotFound {
-                            error!(path=?path, "failed to remove temporary file");
-                        }
+                    if let Err(io_err) = std::fs::remove_file(&path)
+                        && io_err.kind() != io::ErrorKind::NotFound
+                    {
+                        error!(path=?path, "failed to remove temporary file");
                     }
                 }
                 "split" => {
@@ -222,7 +217,7 @@ impl SplitCacheBackingStorage {
     }
 
     fn record_hit_metrics(&self, result_opt: Option<&OwnedBytes>) {
-        let split_metrics = &crate::STORAGE_METRICS.searcher_split_cache;
+        let split_metrics = &crate::STORAGE_METRICS.searcher_split_cache.cache_metrics;
         if let Some(result) = result_opt {
             split_metrics.hits_num_items.inc();
             split_metrics.hits_num_bytes.inc_by(result.len() as u64);

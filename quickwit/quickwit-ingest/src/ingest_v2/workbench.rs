@@ -1,24 +1,20 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{BTreeMap, HashSet};
 
+use quickwit_common::pubsub::EventBroker;
 use quickwit_common::rate_limited_error;
 use quickwit_proto::control_plane::{
     GetOrCreateOpenShardsFailure, GetOrCreateOpenShardsFailureReason,
@@ -31,6 +27,7 @@ use quickwit_proto::ingest::{IngestV2Error, RateLimitingCause};
 use quickwit_proto::types::{NodeId, ShardId, SubrequestId};
 use tracing::warn;
 
+use super::publish_tracker::PublishTracker;
 use super::router::PersistRequestSummary;
 
 /// A helper struct for managing the state of the subrequests of an ingest request during multiple
@@ -38,19 +35,20 @@ use super::router::PersistRequestSummary;
 #[derive(Default)]
 pub(super) struct IngestWorkbench {
     pub subworkbenches: BTreeMap<SubrequestId, IngestSubworkbench>,
-    pub rate_limited_shard: HashSet<ShardId>,
+    pub rate_limited_shards: HashSet<ShardId>,
     pub num_successes: usize,
     /// The number of batch persist attempts. This is not sum of the number of attempts for each
     /// subrequest.
     pub num_attempts: usize,
     pub max_num_attempts: usize,
-    // List of leaders that have been marked as temporarily unavailable.
-    // These leaders have encountered a transport error during an attempt and will be treated as if
-    // they were out of the pool for subsequent attempts.
-    //
-    // (The point here is to make sure we do not wait for the failure detection to kick the node
-    // out of the ingest node.)
+    /// List of leaders that have been marked as temporarily unavailable.
+    /// These leaders have encountered a transport error during an attempt and will be treated as
+    /// if they were out of the pool for subsequent attempts.
+    ///
+    /// (The point here is to make sure we do not wait for the failure detection to kick the node
+    /// out of the ingest node.)
     pub unavailable_leaders: HashSet<NodeId>,
+    publish_tracker: Option<PublishTracker>,
 }
 
 /// Returns an iterator of pending of subrequests, sorted by sub request id.
@@ -67,7 +65,11 @@ pub(super) fn pending_subrequests(
 }
 
 impl IngestWorkbench {
-    pub fn new(ingest_subrequests: Vec<IngestSubrequest>, max_num_attempts: usize) -> Self {
+    fn new_inner(
+        ingest_subrequests: Vec<IngestSubrequest>,
+        max_num_attempts: usize,
+        publish_tracker: Option<PublishTracker>,
+    ) -> Self {
         let subworkbenches: BTreeMap<SubrequestId, IngestSubworkbench> = ingest_subrequests
             .into_iter()
             .map(|subrequest| {
@@ -81,16 +83,33 @@ impl IngestWorkbench {
         Self {
             subworkbenches,
             max_num_attempts,
+            publish_tracker,
             ..Default::default()
         }
+    }
+
+    pub fn new(ingest_subrequests: Vec<IngestSubrequest>, max_num_attempts: usize) -> Self {
+        Self::new_inner(ingest_subrequests, max_num_attempts, None)
+    }
+
+    pub fn new_with_publish_tracking(
+        ingest_subrequests: Vec<IngestSubrequest>,
+        max_num_attempts: usize,
+        event_broker: EventBroker,
+    ) -> Self {
+        Self::new_inner(
+            ingest_subrequests,
+            max_num_attempts,
+            Some(PublishTracker::new(event_broker)),
+        )
     }
 
     pub fn new_attempt(&mut self) {
         self.num_attempts += 1;
     }
 
-    /// Returns true if all subrequests were successful or if the number of
-    /// attempts has been exhausted.
+    /// Returns true if all subrequests were successfully persisted or if the
+    /// number of attempts has been exhausted.
     pub fn is_complete(&self) -> bool {
         self.num_successes >= self.subworkbenches.len()
             || self.num_attempts >= self.max_num_attempts
@@ -138,6 +157,14 @@ impl IngestWorkbench {
             );
             return;
         };
+        if let Some(publish_tracker) = &mut self.publish_tracker
+            && let Some(position) = &persist_success.replication_position_inclusive
+        {
+            publish_tracker.track_persisted_shard_position(
+                persist_success.shard_id().clone(),
+                position.clone(),
+            );
+        }
         self.num_successes += 1;
         subworkbench.num_attempts += 1;
         subworkbench.persist_success_opt = Some(persist_success);
@@ -201,6 +228,13 @@ impl IngestWorkbench {
         self.record_failure(subrequest_id, SubworkbenchFailure::NoShardsAvailable);
     }
 
+    pub fn record_rate_limited(&mut self, subrequest_id: SubrequestId) {
+        self.record_failure(
+            subrequest_id,
+            SubworkbenchFailure::RateLimited(RateLimitingCause::ShardRateLimiting),
+        );
+    }
+
     /// Marks a node as unavailable for the span of the workbench.
     ///
     /// Remaining attempts will treat the node as if it was not in the ingester pool.
@@ -223,7 +257,7 @@ impl IngestWorkbench {
         );
     }
 
-    pub fn into_ingest_result(self) -> IngestResponseV2 {
+    pub async fn into_ingest_result(self) -> IngestResponseV2 {
         let num_subworkbenches = self.subworkbenches.len();
         let mut successes = Vec::with_capacity(self.num_successes);
         let mut failures = Vec::with_capacity(num_subworkbenches - self.num_successes);
@@ -254,6 +288,10 @@ impl IngestWorkbench {
         let num_successes = successes.len();
         let num_failures = failures.len();
         assert_eq!(num_successes + num_failures, num_subworkbenches);
+
+        if let Some(publish_tracker) = self.publish_tracker {
+            publish_tracker.wait_publish_complete().await;
+        }
 
         // For tests, we sort the successes and failures by subrequest_id
         #[cfg(test)]
@@ -358,8 +396,11 @@ impl IngestSubworkbench {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use quickwit_proto::indexing::ShardPositionsUpdate;
     use quickwit_proto::ingest::ingester::PersistFailureReason;
-    use quickwit_proto::types::ShardId;
+    use quickwit_proto::types::{IndexUid, Position, ShardId, SourceUid};
 
     use super::*;
 
@@ -483,6 +524,136 @@ mod tests {
         assert!(workbench.is_complete());
         assert_eq!(workbench.num_successes, 2);
         assert_eq!(pending_subrequests(&workbench.subworkbenches).count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_workbench_publish_tracking_empty() {
+        let workbench =
+            IngestWorkbench::new_with_publish_tracking(Vec::new(), 1, EventBroker::default());
+        assert!(workbench.is_complete());
+        assert_eq!(
+            workbench.into_ingest_result().await,
+            IngestResponseV2::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workbench_publish_tracking_happy_path() {
+        let event_broker = EventBroker::default();
+        let shard_id_1 = ShardId::from("test-shard-1");
+        let shard_id_2 = ShardId::from("test-shard-2");
+        let ingest_subrequests = vec![
+            IngestSubrequest {
+                subrequest_id: 0,
+                ..Default::default()
+            },
+            IngestSubrequest {
+                subrequest_id: 1,
+                ..Default::default()
+            },
+        ];
+        let mut workbench =
+            IngestWorkbench::new_with_publish_tracking(ingest_subrequests, 1, event_broker.clone());
+        assert_eq!(pending_subrequests(&workbench.subworkbenches).count(), 2);
+        assert!(!workbench.is_complete());
+
+        let persist_success = PersistSuccess {
+            subrequest_id: 0,
+            shard_id: Some(shard_id_1.clone()),
+            replication_position_inclusive: Some(Position::offset(42usize)),
+            ..Default::default()
+        };
+        workbench.record_persist_success(persist_success);
+
+        let persist_failure = PersistFailure {
+            subrequest_id: 1,
+            shard_id: Some(shard_id_2.clone()),
+            ..Default::default()
+        };
+        workbench.record_persist_failure(&persist_failure);
+
+        let persist_success = PersistSuccess {
+            subrequest_id: 1,
+            shard_id: Some(shard_id_2.clone()),
+            replication_position_inclusive: Some(Position::offset(66usize)),
+            ..Default::default()
+        };
+
+        workbench.record_persist_success(persist_success);
+
+        assert!(workbench.is_complete());
+        assert_eq!(workbench.num_successes, 2);
+        assert_eq!(pending_subrequests(&workbench.subworkbenches).count(), 0);
+
+        event_broker.publish(ShardPositionsUpdate {
+            source_uid: SourceUid {
+                index_uid: IndexUid::for_test("test-index", 0),
+                source_id: "test-source".to_string(),
+            },
+            updated_shard_positions: vec![
+                (shard_id_1, Position::offset(42usize)),
+                (shard_id_2, Position::offset(66usize)),
+            ]
+            .into_iter()
+            .collect(),
+        });
+
+        let ingest_response = workbench.into_ingest_result().await;
+        assert_eq!(ingest_response.successes.len(), 2);
+        assert_eq!(ingest_response.failures.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_workbench_publish_tracking_waits() {
+        let event_broker = EventBroker::default();
+        let shard_id_1 = ShardId::from("test-shard-1");
+        let shard_id_2 = ShardId::from("test-shard-2");
+        let ingest_subrequests = vec![
+            IngestSubrequest {
+                subrequest_id: 0,
+                ..Default::default()
+            },
+            IngestSubrequest {
+                subrequest_id: 1,
+                ..Default::default()
+            },
+        ];
+        let mut workbench =
+            IngestWorkbench::new_with_publish_tracking(ingest_subrequests, 1, event_broker.clone());
+
+        let persist_success = PersistSuccess {
+            subrequest_id: 0,
+            shard_id: Some(shard_id_1.clone()),
+            replication_position_inclusive: Some(Position::offset(42usize)),
+            ..Default::default()
+        };
+        workbench.record_persist_success(persist_success);
+
+        let persist_success = PersistSuccess {
+            subrequest_id: 1,
+            shard_id: Some(shard_id_2.clone()),
+            replication_position_inclusive: Some(Position::offset(66usize)),
+            ..Default::default()
+        };
+        workbench.record_persist_success(persist_success);
+
+        assert!(workbench.is_complete());
+        assert_eq!(workbench.num_successes, 2);
+        assert_eq!(pending_subrequests(&workbench.subworkbenches).count(), 0);
+
+        event_broker.publish(ShardPositionsUpdate {
+            source_uid: SourceUid {
+                index_uid: IndexUid::for_test("test-index", 0),
+                source_id: "test-source".to_string(),
+            },
+            updated_shard_positions: vec![(shard_id_2, Position::offset(66usize))]
+                .into_iter()
+                .collect(),
+        });
+        // still waits for shard 1 to be published
+        tokio::time::timeout(Duration::from_millis(200), workbench.into_ingest_result())
+            .await
+            .unwrap_err();
     }
 
     #[test]
@@ -680,10 +851,10 @@ mod tests {
         assert_eq!(subworkbench.num_attempts, 1);
     }
 
-    #[test]
-    fn test_ingest_workbench_into_ingest_result() {
+    #[tokio::test]
+    async fn test_ingest_workbench_into_ingest_result() {
         let workbench = IngestWorkbench::new(Vec::new(), 0);
-        let response = workbench.into_ingest_result();
+        let response = workbench.into_ingest_result().await;
         assert!(response.successes.is_empty());
         assert!(response.failures.is_empty());
 
@@ -706,7 +877,7 @@ mod tests {
 
         workbench.record_no_shards_available(1);
 
-        let response = workbench.into_ingest_result();
+        let response = workbench.into_ingest_result().await;
         assert_eq!(response.successes.len(), 1);
         assert_eq!(response.successes[0].subrequest_id, 0);
 
@@ -725,7 +896,7 @@ mod tests {
         let failure = SubworkbenchFailure::Persist(PersistFailureReason::Timeout);
         workbench.record_failure(0, failure);
 
-        let ingest_response = workbench.into_ingest_result();
+        let ingest_response = workbench.into_ingest_result().await;
         assert_eq!(ingest_response.successes.len(), 0);
         assert_eq!(
             ingest_response.failures[0].reason(),

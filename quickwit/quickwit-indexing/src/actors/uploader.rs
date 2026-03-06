@@ -1,29 +1,24 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::mem;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use fail::fail_point;
 use itertools::Itertools;
@@ -31,6 +26,7 @@ use once_cell::sync::OnceCell;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::spawn_named_task;
+use quickwit_config::RetentionPolicy;
 use quickwit_metastore::checkpoint::IndexCheckpointDelta;
 use quickwit_metastore::{SplitMetadata, StageSplitsRequestExt};
 use quickwit_proto::metastore::{MetastoreService, MetastoreServiceClient, StageSplitsRequest};
@@ -39,15 +35,15 @@ use quickwit_proto::types::{IndexUid, PublishToken};
 use quickwit_storage::SplitPayloadBuilder;
 use serde::Serialize;
 use tokio::sync::oneshot::Sender;
-use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
-use tracing::{debug, info, instrument, warn, Instrument, Span};
+use tokio::sync::{Semaphore, SemaphorePermit, oneshot};
+use tracing::{Instrument, Span, debug, info, instrument, warn};
 
-use crate::actors::sequencer::{Sequencer, SequencerCommand};
 use crate::actors::Publisher;
+use crate::actors::sequencer::{Sequencer, SequencerCommand};
 use crate::merge_policy::{MergePolicy, MergeTask};
 use crate::metrics::INDEXER_METRICS;
 use crate::models::{
-    create_split_metadata, EmptySplit, PackagedSplit, PackagedSplitBatch, PublishLock, SplitsUpdate,
+    EmptySplit, PackagedSplit, PackagedSplitBatch, PublishLock, SplitsUpdate, create_split_metadata,
 };
 use crate::split_store::IndexingSplitStore;
 
@@ -68,6 +64,7 @@ pub enum UploaderType {
 }
 
 /// [`SplitsUpdateMailbox`] wraps either a [`Mailbox<Sequencer>`] or [`Mailbox<Publisher>`].
+///
 /// It makes it possible to send a [`SplitsUpdate`] either to the [`Sequencer`] or directly
 /// to [`Publisher`]. It is used in combination with `SplitsUpdateSender` that will do the send.
 ///
@@ -128,10 +125,10 @@ enum SplitsUpdateSender {
 
 impl SplitsUpdateSender {
     fn discard(self) -> anyhow::Result<()> {
-        if let SplitsUpdateSender::Sequencer(split_uploader_tx) = self {
-            if split_uploader_tx.send(SequencerCommand::Discard).is_err() {
-                bail!("failed to send cancel command to sequencer. the sequencer is probably dead");
-            }
+        if let SplitsUpdateSender::Sequencer(split_uploader_tx) = self
+            && split_uploader_tx.send(SequencerCommand::Discard).is_err()
+        {
+            bail!("failed to send cancel command to sequencer. the sequencer is probably dead");
         }
         Ok(())
     }
@@ -165,6 +162,7 @@ pub struct Uploader {
     uploader_type: UploaderType,
     metastore: MetastoreServiceClient,
     merge_policy: Arc<dyn MergePolicy>,
+    retention_policy: Option<RetentionPolicy>,
     split_store: IndexingSplitStore,
     split_update_mailbox: SplitsUpdateMailbox,
     max_concurrent_split_uploads: usize,
@@ -173,10 +171,12 @@ pub struct Uploader {
 }
 
 impl Uploader {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         uploader_type: UploaderType,
         metastore: MetastoreServiceClient,
         merge_policy: Arc<dyn MergePolicy>,
+        retention_policy: Option<RetentionPolicy>,
         split_store: IndexingSplitStore,
         split_update_mailbox: SplitsUpdateMailbox,
         max_concurrent_split_uploads: usize,
@@ -186,6 +186,7 @@ impl Uploader {
             uploader_type,
             metastore,
             merge_policy,
+            retention_policy,
             split_store,
             split_update_mailbox,
             max_concurrent_split_uploads,
@@ -299,6 +300,7 @@ impl Handler<PackagedSplitBatch> for Uploader {
         let index_uid = batch.index_uid();
         let ctx_clone = ctx.clone();
         let merge_policy = self.merge_policy.clone();
+        let retention_policy = self.retention_policy.clone();
         debug!(split_ids=?split_ids, "start-stage-and-store-splits");
         let event_broker = self.event_broker.clone();
         spawn_named_task(
@@ -312,17 +314,26 @@ impl Handler<PackagedSplitBatch> for Uploader {
                     if batch.publish_lock.is_dead() {
                         // TODO: Remove the junk right away?
                         info!("splits' publish lock is dead");
-                        split_update_sender.discard()?;
-                        return Ok(());
+                        if let Err(e) = split_update_sender.discard() {
+                            warn!(cause=?e, "could not discard split");
+                        }
+                        return;
                     }
 
-                    let split_streamer = SplitPayloadBuilder::get_split_payload(
+                    let split_streamer = match SplitPayloadBuilder::get_split_payload(
                         &packaged_split.split_files,
                         &packaged_split.serialized_split_fields,
                         &packaged_split.hotcache_bytes,
-                    )?;
+                    ) {
+                        Ok(split_streamer) => split_streamer,
+                        Err(e) => {
+                            warn!(cause=?e, split_id=packaged_split.split_id(), "could not create split streamer");
+                            return;
+                        }
+                    };
                     let split_metadata = create_split_metadata(
                         &merge_policy,
+                        retention_policy.as_ref(),
                         &packaged_split.split_attrs,
                         packaged_split.tags.clone(),
                         split_streamer.footer_range.start..split_streamer.footer_range.end,
@@ -337,11 +348,22 @@ impl Handler<PackagedSplitBatch> for Uploader {
 
                 }
 
-                let stage_splits_request = StageSplitsRequest::try_from_splits_metadata(index_uid.clone(), split_metadata_list.clone())?;
-                metastore
+                let stage_splits_request = match StageSplitsRequest::try_from_splits_metadata(index_uid.clone(), split_metadata_list.clone()) {
+                    Ok(stage_splits_request) => stage_splits_request,
+                    Err(e) => {
+                        warn!(cause=?e, "could not create stage splits request");
+                        return;
+                    }
+                };
+                if let Err(e) = metastore
                     .clone()
                     .stage_splits(stage_splits_request)
-                    .await?;
+                    .await
+                {
+                    warn!(cause=?e, "failed to stage splits");
+                    return;
+                };
+
                 counters.num_staged_splits.fetch_add(split_metadata_list.len() as u64, Ordering::SeqCst);
 
                 let mut packaged_splits_and_metadata = Vec::with_capacity(batch.splits.len());
@@ -360,7 +382,7 @@ impl Handler<PackagedSplitBatch> for Uploader {
                     if let Err(cause) = upload_result {
                         warn!(cause=?cause, split_id=packaged_split.split_id(), "Failed to upload split. Killing!");
                         kill_switch.kill();
-                        bail!("failed to upload split `{}`. killing the actor context", packaged_split.split_id());
+                        return;
                     }
 
                     packaged_splits_and_metadata.push((packaged_split, metadata));
@@ -376,11 +398,17 @@ impl Handler<PackagedSplitBatch> for Uploader {
                     batch.batch_parent_span,
                 );
 
-                split_update_sender.send(splits_update, &ctx_clone).await?;
+                let target = match &split_update_sender {
+                    SplitsUpdateSender::Sequencer(_) => "sequencer",
+                    SplitsUpdateSender::Publisher(_) => "publisher",
+                };
+                if let Err(e) = split_update_sender.send(splits_update, &ctx_clone).await {
+                    warn!(cause=?e, target, "failed to send uploaded split");
+                    return;
+                }
                 // We explicitly drop it in order to force move the permit guard into the async
                 // task.
                 mem::drop(permit_guard);
-                Result::<(), anyhow::Error>::Ok(())
             }
             .instrument(Span::current()),
             "upload_single_task"
@@ -498,7 +526,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::merge_policy::{default_merge_policy, NopMergePolicy};
+    use crate::merge_policy::{NopMergePolicy, default_merge_policy};
     use crate::models::{SplitAttrs, SplitsUpdate};
 
     #[tokio::test]
@@ -534,6 +562,7 @@ mod tests {
             UploaderType::IndexUploader,
             MetastoreServiceClient::from_mock(mock_metastore),
             merge_policy,
+            None,
             split_store,
             SplitsUpdateMailbox::Sequencer(sequencer_mailbox),
             4,
@@ -649,6 +678,7 @@ mod tests {
             UploaderType::IndexUploader,
             MetastoreServiceClient::from_mock(mock_metastore),
             merge_policy,
+            None,
             split_store,
             SplitsUpdateMailbox::Sequencer(sequencer_mailbox),
             4,
@@ -796,6 +826,7 @@ mod tests {
             UploaderType::IndexUploader,
             MetastoreServiceClient::from_mock(mock_metastore),
             merge_policy,
+            None,
             split_store,
             SplitsUpdateMailbox::Publisher(publisher_mailbox),
             4,
@@ -869,6 +900,7 @@ mod tests {
             UploaderType::IndexUploader,
             MetastoreServiceClient::from_mock(mock_metastore),
             default_merge_policy(),
+            None,
             split_store,
             SplitsUpdateMailbox::Sequencer(sequencer_mailbox),
             4,
@@ -973,6 +1005,7 @@ mod tests {
             UploaderType::IndexUploader,
             MetastoreServiceClient::from_mock(mock_metastore),
             merge_policy,
+            None,
             split_store,
             SplitsUpdateMailbox::Publisher(publisher_mailbox),
             4,

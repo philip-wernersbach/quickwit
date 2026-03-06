@@ -56,6 +56,9 @@ Required fields for the SQS `notifications` parameter items:
 - `message_type`: format of the message payload, either
   - `s3_notification`: an [S3 event notification](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)
   - `raw_uri`: a message containing just the file object URI (e.g. `s3://mybucket/mykey`)
+  - `deduplication_window_duration_sec`: maximum duration for which ingested files checkpoints are kept (default 3600)
+  - `deduplication_window_max_messages`: maximum number of ingested file checkpoints kept (default 100k)
+  - `deduplication_cleanup_interval_secs`: frequency at which outdated file checkpoints are cleaned up
 
 *Adding a file source with SQS notifications to an index with the [CLI](../reference/cli.md#source)*
 
@@ -82,6 +85,7 @@ EOF
   - the notification message could not be parsed (e.g it is not a valid S3 notification)
   - the file was not found
   - the file is corrupted (e.g unexpected compression)
+- AWS S3 notifications and AWS SQS provide "at least once" delivery guaranties. To avoid duplicates, the file source includes a mechanism that prevents the same file from being ingested twice. It works by storing checkpoints in the metastore that track the indexing progress for each file. You can decrease `deduplication_window_*` or increase `deduplication_cleanup_interval_secs` to reduce the load on the metastore.
 
 :::
 
@@ -253,11 +257,21 @@ transform:
 
 ## Input format
 
-The `input_format` parameter specifies the expected data format of the source. Two formats are currently supported:
-- `json`: JSON, the default
-- `plain_text`: unstructured text document
+The `input_format` parameter specifies the expected data format of the source. The formats currently supported are:
+- `json` (default)
+- `otlp_logs_json`
+- `otlp_logs_proto`
+- `otlp_traces_json`
+- `otlp_traces_proto`
+- `plain_text`
 
-Internally, Quickwit can only index JSON data. To allow the ingestion of plain text documents, Quickwit transform them on the fly into JSON objects of the following form: `{"plain_text": "<original plain text document>"}`. Then, they can be optionally transformed into more complex documents using a VRL script. (see [transform feature](#transform-parameters)).
+*OTLP formats*
+
+When ingesting OTLP data into an OTLP logs or traces index with a source other than the native OTEL endpoints, use this parameter to specify whether the exported logs or traces will be serialized in JSON or Protobuf. When possible, prefer the latter, which is a more compact encoding.
+
+*Plaint text format*
+
+Use this parameter for unstructured text data. Internally, Quickwit can only index JSON data. To allow the ingestion of plain text documents, Quickwit transform them on the fly into JSON objects of the following form: `{"plain_text": "<original plain text document>"}`. Then, they can be optionally transformed into more complex documents using a VRL script. (see [transform feature](#transform-parameters)).
 
 The following is an example of how one could parse and transform a CSV dataset containing a list of users described by 3 attributes: first name, last name, and age.
 
@@ -274,7 +288,7 @@ transform:
     del(.plain_text)
 ```
 
-## Enabling/Disabling a source from an index
+## Enabling/disabling a source from an index
 
 A source can be enabled or disabled from an index using the [CLI command](../reference/cli.md) `quickwit source enable` or `quickwit source disable`:
 

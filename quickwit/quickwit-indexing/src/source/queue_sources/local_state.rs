@@ -1,24 +1,18 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::Duration;
 
 use anyhow::bail;
 use quickwit_metastore::checkpoint::PartitionId;
@@ -56,7 +50,8 @@ impl QueueLocalState {
     pub fn is_read_in_progress(&self, partition_id: &PartitionId) -> bool {
         self.read_in_progress
             .as_ref()
-            .map_or(false, |msg| &msg.partition_id == partition_id)
+            .map(|msg| &msg.partition_id == partition_id)
+            .unwrap_or(false)
     }
 
     pub fn is_awaiting_commit(&self, partition_id: &PartitionId) -> bool {
@@ -95,10 +90,7 @@ impl QueueLocalState {
         self.read_in_progress.as_mut()
     }
 
-    pub async fn drop_currently_read(
-        &mut self,
-        deadline_for_last_extension: Duration,
-    ) -> anyhow::Result<()> {
+    pub async fn drop_currently_read(&mut self) -> anyhow::Result<()> {
         if let Some(in_progress) = self.read_in_progress.take() {
             self.awaiting_commit.insert(
                 in_progress.partition_id.clone(),
@@ -106,7 +98,7 @@ impl QueueLocalState {
             );
             in_progress
                 .visibility_handle
-                .request_last_extension(deadline_for_last_extension)
+                .request_last_extension()
                 .await?;
         }
         Ok(())

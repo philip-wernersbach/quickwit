@@ -91,7 +91,7 @@ The doc mapping defines how a document and the fields it contains are stored and
 | `field_mappings` | Collection of field mapping, each having its own data type (text, binary, datetime, bool, i64, u64, f64, ip, json).   | `[]` |
 | `mode`        | Defines how quickwit should handle document fields that are not present in the `field_mappings`. In particular, the "dynamic" mode makes it possible to use quickwit in a schemaless manner. (See [mode](#mode)) | `dynamic`
 | `dynamic_mapping` | This parameter is only allowed when `mode` is set to `dynamic`. It then defines whether dynamically mapped fields should be indexed, stored, etc.  | (See [mode](#mode))
-| `tag_fields` | Collection of fields* already defined in `field_mappings` whose values will be stored as part of the `tags` metadata. [Learn more about tags](../overview/concepts/querying.md#tag-pruning). | `[]` |
+| `tag_fields` | Collection of fields* explicitly defined in `field_mappings` whose values will be stored as part of the `tags` metadata. Allowed types are: `text` (with raw tokenizer), `i64` and `u64`. [Learn more about tags](../overview/concepts/querying.md#tag-pruning). | `[]` |
 | `store_source` | Whether or not the original JSON document is stored or not in the index.   | `false` |
 | `timestamp_field`      | Timestamp field* used for sharding documents in splits. The field has to be of type `datetime`. [Learn more about time sharding](./../overview/architecture.md).  | `None` |
 | `partition_key`   |  If set, quickwit will route documents into different splits depending on the field name declared as the `partition_key`. | `null` |
@@ -141,7 +141,7 @@ fast:
 
 | Tokenizer     | Description   |
 | ------------- | ------------- |
-| `raw`         | Does not process nor tokenize text. Filters out tokens larger than 255 bytes.  |
+| `raw`         | Does not process nor tokenize text. Filters out tokens larger than 255 bytes. This is similar to the `keyword` type in Elasticsearch. |
 | `raw_lowercase` | Does not tokenize text, but lowercase it. Filters out tokens larger than 255 bytes.  |
 | `default`     | Chops the text on according to whitespace and punctuation, removes tokens that are too long, and converts to lowercase. Filters out tokens larger than 255 bytes. |
 | `en_stem`     | Like `default`, but also applies stemming on the resulting tokens. Filters out tokens larger than 255 bytes.  |
@@ -225,7 +225,7 @@ The timezone name format specifier (`%Z`) is not supported currently.
 - `unix_timestamp`: parse float and integer numbers to Unix timestamps. Floating-point values are converted to timestamps expressed in seconds. Integer values are converted to Unix timestamps whose precision, determined in `seconds`, `milliseconds`, `microseconds`, or `nanoseconds`, is inferred from the number of input digits. Internally, datetimes are converted to UTC (if the time zone is specified) and stored as *i64* integers. As a result, Quickwit only supports timestamp values ranging from `Apr 13, 1972 23:59:55` to `Mar 16, 2242 12:56:31`.
 
 :::warning
-Converting timestamps from float to integer values may occurs with a loss of precision.
+Converting timestamps from float to integer values may occur with a loss of precision.
 :::
 
 When a `datetime` field is stored as a fast field, the `fast_precision` parameter indicates the precision used to truncate the values before encoding, which improves compression (truncation here means zeroing). The `fast_precision` parameter can take the following values: `seconds`, `milliseconds`, `microseconds`, or `nanoseconds`. It only affects what is stored in fast fields when a `datetime` field is marked as "fast". Finally, operations on `datetime` fast fields, e.g. via aggregations, need to be done at the nanosecond level.
@@ -358,6 +358,14 @@ fast:
   normalizer: lowercase
 ```
 
+Stored primitive types are inferred from the JSON value types using the following rules:
+- a boolean value `true` or `false` is stored as `bool`
+- numeric values are cast to the first compatible format between `i64`, `u64` or
+  `f64` (in this order)
+- for string values (surrounded with quotes), Tantivy attempts to parse a date
+  in `rfc3339` format. If the parsing fails, the value is stored as `text` using
+  the configured tokenization rules
+
 **Parameters for JSON field**
 
 | Variable      | Description   | Default value |
@@ -365,7 +373,7 @@ fast:
 | `description` | Optional description for the field. | `None` |
 | `stored`    | Whether value is stored in the document store | `true` |
 | `indexed`   | Whether value is indexed | `true` |
-| `fast`     | Whether value is stored in a fast field. The default behaviour for text in the JSON is to store the text unchanged. An normalizer can be configured via `normalizer: lowercase`. ([See normalizers](#description-of-available-normalizers)) for a list of available normalizers. | `true` |
+| `fast`     | Whether value is stored in a fast field. The default behaviour for text in the JSON is to store the text unchanged. A normalizer can be configured via `normalizer: lowercase`. ([See normalizers](#description-of-available-normalizers)) for a list of available normalizers. | `false` |
 | `tokenizer` | **Only affects strings in the json object**. Name of the `Tokenizer`, choices between `raw`, `default`, `en_stem` and `chinese_compatible` | `raw` |
 | `record`    | **Only affects strings in the json object**. Describes the amount of information indexed, choices between `basic`, `freq` and `position` | `basic` |
 | `expand_dots`    | If true, json keys containing a `.` should be expanded. For instance, if `expand_dots` is set to true, `{"k8s.node.id": "node-2"}` will be indexed as if it was `{"k8s": {"node": {"id": "node2"}}}`. The benefit is that escaping the `.` will not be required at query time. In other words, `k8s.node.id:node2` will match the document. This does not impact the way the document is stored.  | `true` |
@@ -418,13 +426,13 @@ field_mappings:
 #### concatenate
 
 Quickwit supports mapping the content of multiple fields to a single one. This can be more efficient at query time than
-searching through dozens of `default_search_fields`. It also allow querying inside a json field without knowing the path
+searching through dozens of `default_search_fields`. It also allows querying inside a json field without knowing the path
 to the field being searched.
 
 ```yaml
 name: my_default_field
 type: concatenate
-concatenated_fields:
+concatenate_fields:
   - text # things inside text, tokenized with the `default` tokenizer
   - resource.author # all fields in resource.author, assuming resource is an `object` field.
 include_dynamic_fields: true
@@ -435,10 +443,15 @@ record: basic
 Concatenate fields don't support fast fields, and are never stored. They uses their own tokenizer, independently of the
 tokenizer configured on the individual fields.
 At query time, concatenate fields don't support range queries.
-Only the following types are supported inside a concatenate field: text, bool, i64, u64, json. Other types are rejected
-at index creation, or silently discarded during indexation if they are found inside a json field.
+Only the following types are supported inside a concatenate field: text, bool,
+i64, u64, f64, json. Other types are rejected at index creation, or silently
+discarded during indexation if they are found inside a json field. Unlike
+regular JSON fields, JSON fields in a concatenate field don't store RFC3339
+dates as Tantivy dates. This means you can still perform prefix queries,
+e.g `my_default_field:"2025-12-12"*` to work around the lack of support for range
+queries.
 Adding an object field to a concatenate field doesn't automatically add its subfields (yet).
-<!-- typing is made so it wouldn't be too hard do add, as well as things like params_* matching all fields which starts name with params_ , but the feature isn't implemented yet -->
+<!-- typing is made so it wouldn't be too hard to add, as well as things like params_* matching all fields which starts name with params_ , but the feature isn't implemented yet -->
 It isn't possible to add subfields from a json field to a concatenate field. For instance if `attributes` is a json field, it's not possible to add only `attributes.color` to a concatenate field.
 
 For json fields and dynamic fields, the path is not indexed, only values are. For instance, given the following document:
@@ -497,7 +510,7 @@ doc_mapping:
   dynamic_mapping:
     indexed: true
     stored: true
-    tokenizer: default
+    tokenizer: raw
     record: basic
     expand_dots: true
     fast: true
@@ -507,7 +520,7 @@ When the `dynamic_mapping` is set as indexed (default), fields mapped through
 dynamic mode can be searched by targeting the path needed to access them from
 the root of the JSON object.
 
-For instance, in a entirely schemaless settings, a minimal index configuration could be:
+For instance, in an entirely schemaless settings, a minimal index configuration could be:
 
 ```yaml
 version: 0.7
@@ -552,6 +565,8 @@ src.port:53
 src.port:53 AND query_params.ctk:e42bb897d
 ```
 
+The stored primitive type inference is the [same as for JSON fields](#json-type).
+
 ### Field name validation rules
 
 Currently Quickwit only accepts field name that matches the following regular expression:
@@ -583,6 +598,14 @@ This section describes indexing settings for a given index.
 | `resources.heap_size`      | Indexer heap size per source per index.   | `2000000000` |
 | `docstore_compression_level` | Level of compression used by zstd for the docstore. Lower values may increase ingest speed, at the cost of index size | `8` |
 | `docstore_blocksize` | Size of blocks in the docstore, in bytes. Lower values may improve doc retrieval speed, at the cost of index size | `1000000` |
+
+:::note
+
+Choosing an appropriate commit timeout is critical. With a shorter commit timeout, ingested data is queryable faster. But the published splits will be smaller, increasing the overhead associated with [merges](#merge-policies). 
+
+When decommissioning definitively an indexer node that received data through the ingest API (including the [Elastic bulk API](/docs/reference/es_compatible_api) and the OTEL [log](/docs/log-management/otel-service.md) and [trace](/docs/distributed-tracing/otel-service.md) services), we need to make sure that all the data that was persisted locally (Write Ahead Log) is indexed and committed. After receiving the termination signal, the Quickwit process waits for the indexing pipelines to finish processing this local data. This can take as long as the longest commit timeout of all indexes. Make sure that the termination grace period of the infrastructure supporting the Quickwit indexer nodes is long enough (e.g [`terminationGracePeriodSeconds`](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/) in Kubernetes or [`stopTimeout`](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html) on AWS ECS).
+
+:::
 
 ### Merge policies
 

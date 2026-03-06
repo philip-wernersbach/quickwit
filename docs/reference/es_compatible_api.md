@@ -134,7 +134,8 @@ If a parameter appears both as a query string parameter and in the JSON payload,
 | `q`                | `String`      | The search query.                                                                | (Optional)    |
 | `size`             | `Integer`     | Number of hits to return.                                                        | 10            |
 | `sort`             | `String`      | Describes how documents should be ranked. See [Sort order](#sort-order)          | (Optional)    |
-| `scroll`           | `Duration`    | Creates a scroll context for "time to live". See [Scroll](#_scroll--scroll-api). | (Optional)    |
+| `scroll`           | `Duration`    | Creates a scroll context for "time to live". See [Scroll](#_searchscroll--scroll-api). | (Optional)    |
+| `allow_partial_search_results` | `Boolean` | Returns a partial response if some (but not all) of the split searches were unsuccessful. | `true` |
 
 #### Supported Request Body parameters
 
@@ -278,6 +279,11 @@ First, the client needs to call the `search api` with a `scroll` query parameter
 
 Each subsequent call to the `_search/scroll` endpoint will return a new `scroll_id` pointing to the next page.
 
+:::tip
+
+Using `_search` and then `_search/scroll` is somewhat similar to using `_search` with the `search_after` parameter, except that it creates a lightweight snapshot view of the dataset during the initial call to `_search`. Further calls to `_search/scroll` only return results from that view, thus ensuring more consistent results.
+
+:::
 
 ### `_cat` &nbsp; Cat API
 
@@ -301,7 +307,7 @@ GET api/v1/_elastic/_cat/indices
 
 Use the [cat indices API](https://www.elastic.co/guide/en/elasticsearch/reference/current/cat-indices.html) to get the following information for each index in a cluster:
 * Shard count
-* Document count 
+* Document count
 * Deleted document count
 * Primary store size
 * Total store size
@@ -393,6 +399,7 @@ The following query types are supported.
 | `fields`           | `String[]` (Optional) | Default search target fields.                                                                                               | -             |
 | `default_operator` | `"AND"` or `"OR"`     | In the absence of boolean operator defines whether terms should be combined as a conjunction (`AND`) or disjunction (`OR`). | `OR`          |
 | `boost`            | `Number`              | Multiplier boost for score computation.                                                                                     | 1.0           |
+| `lenient`          | `Boolean`             | [See note](#about-the-lenient-argument).                                                                                    | false         |
 
 
 ### `bool`
@@ -433,6 +440,7 @@ The following query types are supported.
 | `should`   | `JsonObject[]` (Optional) | Sub-queries that should match the documents.                      | []            |
 | `filter`   | `JsonObject[]`            | Like must queries, but the match does not influence the `_score`. | []            |
 | `boost`    | `Number`                  | Multiplier boost for score computation.                           | 1.0           |
+| `minimum_should_match`    | `Number` or `Str` | If present, quickwit will only match documents for which at least `minimum_should_match` should clauses are matching. `2`, `-1`, `"10%"` and `"-10%"` are supported. |  |
 
 ### `range`
 
@@ -492,7 +500,7 @@ The following query types are supported.
 | `operator`         | `"AND"` or `"OR"` | Defines whether all terms should be present (`AND`) or if at least one term is sufficient to match (`OR`).                     | OR      |
 | `zero_terms_query` | `all` or `none`   | Defines if all (`all`) or no documents (`none`) should be returned if the query does not contain any terms after tokenization. | `none`  |
 | `boost`            | `Number`          | Multiplier boost for score computation                                                                                         | 1.0     |
-
+| `lenient`          | `Boolean`         | [See note](#about-the-lenient-argument).                                                                                       | false   |
 
 
 
@@ -635,8 +643,17 @@ Contrary to ES/Opensearch, in Quickwit, at most 50 terms will be considered when
 }
 ```
 
-#### Supported Multi-match Queries
-| Type            | Description                                                                                 |
+#### Supported parameters
+
+| Variable           | Type                  | Description                                  | Default value |
+| ------------------ | --------------------- | ---------------------------------------------| ------------- |
+| `type`             | `String`              | See supported types below                    | `most_fields` |
+| `fields`           | `String[]` (Optional) | Default search target fields.                | -             |
+| `lenient`          | `Boolean`             | [See note](#about-the-lenient-argument).     | false         |
+
+Supported types:
+
+| `type` value    | Description                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------------- |
 | `most_fields`   | Finds documents matching any field and combines the `_score` from each field (default).  |
 | `phrase`        | Runs a `match_phrase` query on each field.       |
@@ -655,6 +672,12 @@ Moreover, while Quickwit does not support `best_fields` or `cross_fields`, it wi
 
 [Elasticsearch reference documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.8/query-dsl-term-query.html)
 
+:::note
+
+When working on text, it is recommended to only use `term` queries on fields configured with `tokenizer: raw`. This is the Quickwit equivalent of the Elasticsearch `keyword` type.
+
+:::
+
 #### Example
 
 ```json
@@ -672,10 +695,11 @@ Moreover, while Quickwit does not support `best_fields` or `cross_fields`, it wi
 
 #### Supported Parameters
 
-| Variable | Type     | Description                                                                  | Default |
-| -------- | -------- | ---------------------------------------------------------------------------- | ------- |
-| `value`  | String   | Term value. This is the string representation of a token after tokenization. | -       |
-| `boost`  | `Number` | Multiplier boost for score computation                                       | 1.0     |
+| Variable           | Type    | Description                                                                  | Default |
+| ------------------ | ------- | ---------------------------------------------------------------------------- | ------- |
+| `value`            | String  | Term value. This is the string representation of a token after tokenization. | -       |
+| `boost`            | Number  | Multiplier boost for score computation                                       | 1.0     |
+| `case_insensitive` | Boolean | Allows ASCII case insensitive matching of the value.                         | false   |
 
 
 
@@ -718,6 +742,97 @@ Query matching only documents containing a non-null value for a given field.
 | -------- | ------ | ------------------------------------------------------- | ------- |
 | `field`  | String | Only documents with a value for field will be returned. | -       |
 
+### `prefix`
+
+[Elasticsearch reference documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.8/query-dsl-prefix-query.html)
+
+Returns documents that contain a specific prefix in a provided field.
+
+#### Example
+
+```json
+{
+  "query": {
+    "prefix": {
+      "author.login" {
+        "value": "adm",
+      }
+    }
+  }
+}
+```
+
+#### Supported Parameters
+
+| Variable           | Type    | Description                                          | Default |
+| ------------------ | ------- | ---------------------------------------------------- | ------- |
+| `value`            | String  | Beginning characters of terms you wish to find.      | -       |
+| `case_insensitive` | Boolean | Allows ASCII case insensitive matching of the value. | false   |
+
+### `wildcard`
+
+[Elasticsearch reference documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.8/query-dsl-wildcard-query.html)
+
+Returns documents that contain terms matching a wildcard pattern:
+* `?` replaces one and only one term character
+* `*` replaces any number of term characters or an empty string
+
+#### Example
+
+```json
+{
+  "query": {
+    "wildcard": {
+      "author.login" {
+        "value": "adm?n*",
+      }
+    }
+  }
+}
+```
+
+#### Supported Parameters
+
+| Variable           | Type    | Description                                          | Default |
+| ------------------ | ------- | ---------------------------------------------------- | ------- |
+| `value`            | String  | Wildcard pattern for terms you wish to find.         | -       |
+| `boost`            | Number  | Multiplier boost for score computation.              | 1.0     |
+| `case_insensitive` | Boolean | Allows ASCII case insensitive matching of the value. | false   |
+
+
+### `regexp`
+
+[Elasticsearch reference documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.8/query-dsl-regexp-query.html)
+
+Returns documents that contain terms matching a regular expression.
+
+#### Example
+
+```json
+{
+  "query": {
+    "regexp": {
+      "author.login" {
+        "value": "adm.*n",
+      }
+    }
+  }
+}
+```
+
+#### Supported Parameters
+
+| Variable           | Type    | Description                                          | Default |
+| ------------------ | ------- | ---------------------------------------------------- | ------- |
+| `value`            | String  | Wildcard pattern for terms you wish to find.         | -       |
+| `case_insensitive` | Boolean | Allows ASCII case insensitive matching of the value. | false   |
+
+
+### About the `lenient` argument
+
+Quickwit and Elasticsearch have different interpretations of the `lenient` setting:
+- In Quickwit, lenient mode allows ignoring parts of the query that reference non-existing columns. This is a behavior that Elasticsearch supports by default.
+- In Elasticsearch, lenient mode primarily addresses type errors (such as searching for text in an integer field). Quickwit always supports this behavior, regardless of the `lenient` setting.
 
 ## Search multiple indices
 
@@ -731,7 +846,7 @@ The multi-target expression has the following constraints:
 
     - It must follow the regex `^[a-zA-Z\*][a-zA-Z0-9-_\.\*]{0,254}$`.
     - It cannot contain consecutive asterisks (`*`).
-    - If it contains an asterisk (`*`), the length must be greater than or equal to 3 characters.
+    - If it does not contain an asterisk (`*`), the length must be greater than or equal to 3 characters.
 
 ### Examples
 ```

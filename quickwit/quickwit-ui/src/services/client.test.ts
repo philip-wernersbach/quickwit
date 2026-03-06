@@ -1,55 +1,55 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import { SearchRequest } from '../utils/models';
-import { Client } from './client';
+import { describe, expect, it, jest } from "@jest/globals";
+import { SearchRequest } from "../utils/models";
+import { Client } from "./client";
 
-describe('Client unit test', () => {
-    it('Should construct correct search URL', async () => {
-        // Mocking the fetch function to simulate network requests
-        const mockFetch = jest.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }));
-        (global as any).fetch = mockFetch; // eslint-disable-line @typescript-eslint/no-explicit-any
+describe("Client unit test", () => {
+  it("Should construct correct search URL", async () => {
+    // Mocking the fetch function to simulate network requests
+    const mockFetch = jest.fn((_url: string, _options?: unknown) =>
+      Promise.resolve({ ok: true, json: () => Promise.resolve({}) }),
+    );
+    (global as any).fetch = mockFetch;
 
-        const searchRequest: SearchRequest = {
-            indexId: 'my-new-fresh-index-id',
-            query: 'severity_error:ERROR',
-            startTimestamp: 100,
-            endTimestamp: 200,
-            maxHits: 20,
-            sortByField: {
-              field_name: 'timestamp',
-              order: 'Desc',
-            },
-            aggregation: false,
-            aggregationConfig: {
-              metric: null,
-              term: null,
-              histogram: null,
-            },
-        };
+    const searchRequest: SearchRequest = {
+      indexId: "my-new-fresh-index-id",
+      query: "severity_error:ERROR",
+      startTimestamp: 100,
+      endTimestamp: 200,
+      maxHits: 20,
+      sortByField: {
+        field_name: "timestamp",
+        order: "Desc",
+      },
+      aggregation: false,
+      aggregationConfig: {
+        metric: null,
+        term: null,
+        histogram: null,
+      },
+    };
 
-        const client = new Client();
-        expect(client.buildSearchBody(searchRequest, null)).toBe('{"query":"severity_error:ERROR","max_hits":20,"start_timestamp":100,"end_timestamp":200,"sort_by_field":"+timestamp"}');
+    const client = new Client();
+    expect(client.buildSearchBody(searchRequest, null)).toBe(
+      '{"query":"severity_error:ERROR","max_hits":20,"start_timestamp":100,"end_timestamp":200,"sort_by_field":"+timestamp"}',
+    );
 
-        await client.search(searchRequest, null);
-        const expectedUrl = `${client.apiRoot()}my-new-fresh-index-id/search`;
-        expect(mockFetch).toHaveBeenCalledTimes(1);
-        expect(mockFetch).toHaveBeenCalledWith(expectedUrl, expect.any(Object));
-    });
+    await client.search(searchRequest, null);
+    const expectedUrl = `${client.apiRoot()}my-new-fresh-index-id/search`;
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledWith(expectedUrl, expect.any(Object));
+  });
 });

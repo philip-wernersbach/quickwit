@@ -3,7 +3,7 @@ title: Metrics
 sidebar_position: 70
 ---
 
-Quickwit exposes some key metrics via [Prometheus](https://prometheus.io/). You can use any front-end that supports Prometheus to examine the behavior of Quickwit visually.
+Quickwit exposes key metrics in the [Prometheus](https://prometheus.io/) format on the `/metrics` endpoint. You can use any front-end that supports Prometheus to examine the behavior of Quickwit visually.
 
 ## Cache Metrics
 
@@ -34,7 +34,7 @@ Currently Quickwit exposes metrics for three caches: `fastfields`, `shortlived`,
 | Namespace | Metric Name | Description | Labels | Type |
 | --------- | ----------- | ----------- | ------ | ---- |
 | `quickwit_indexing` | `processed_docs_total`| Number of processed docs by index, source and processed status in [`valid`, `schema_error`, `parse_error`, `transform_error`] | [`index`, `source`, `docs_processed_status`] | `counter` |
-| `quickwit_indexing` | `processed_docs_total`| Number of processed bytes by index, source and processed status in [`valid`, `schema_error`, `parse_error`, `transform_error`] | [`index`, `source`, `docs_processed_status`] | `counter` |
+| `quickwit_indexing` | `processed_bytes`| Number of processed bytes by index, source and processed status in [`valid`, `schema_error`, `parse_error`, `transform_error`] | [`index`, `source`, `docs_processed_status`] | `counter` |
 | `quickwit_indexing` | `available_concurrent_upload_permits`| Number of available concurrent upload permits by component in [`merger`, `indexer`] | [`component`] | `gauge` |
 | `quickwit_indexing` | `ongoing_merge_operations`| Number of available concurrent upload permits by component in [`merger`, `indexer`]. | [`index`, `source`] | `gauge` |
 
@@ -42,8 +42,8 @@ Currently Quickwit exposes metrics for three caches: `fastfields`, `shortlived`,
 
 | Namespace | Metric Name | Description | Type |
 | --------- | ----------- | ----------- | ---- |
-| `quickwit_ingest` | `ingested_num_bytes` | Total size of the docs ingested in bytes | `counter` |
-| `quickwit_ingest` | `ingested_num_docs` | Number of docs received to be ingested | `counter` |
+| `quickwit_ingest` | `docs_bytes_total` | Total size of the docs ingested, measured in ingester's leader, after validation and before persistence/replication | `counter` |
+| `quickwit_ingest` | `docs_total` | Total number of the docs ingested, measured in ingester's leader, after validation and before persistence/replication | `counter` |
 | `quickwit_ingest` | `queue_count` | Number of queues currently active | `counter` |
 
 ## Metastore Metrics

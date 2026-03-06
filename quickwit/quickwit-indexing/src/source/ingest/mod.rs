@@ -1,21 +1,16 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -29,14 +24,14 @@ use quickwit_actors::{ActorExitStatus, Mailbox};
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::retry::RetryParams;
 use quickwit_ingest::{
-    decoded_mrecords, FetchStreamError, IngesterPool, MRecord, MultiFetchStream,
+    FetchStreamError, IngesterPool, MRecord, MultiFetchStream, decoded_mrecords,
 };
 use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
-use quickwit_proto::ingest::ingester::{
-    fetch_message, FetchEof, FetchPayload, IngesterService, TruncateShardsRequest,
-    TruncateShardsSubrequest,
-};
 use quickwit_proto::ingest::IngestV2Error;
+use quickwit_proto::ingest::ingester::{
+    FetchEof, FetchPayload, IngesterService, TruncateShardsRequest, TruncateShardsSubrequest,
+    fetch_message,
+};
 use quickwit_proto::metastore::{
     AcquireShardsRequest, AcquireShardsResponse, MetastoreService, MetastoreServiceClient,
     SourceType,
@@ -51,8 +46,8 @@ use tracing::{debug, error, info, warn};
 use ulid::Ulid;
 
 use super::{
-    BatchBuilder, Source, SourceContext, SourceRuntime, TypedSourceFactory, BATCH_NUM_BYTES_LIMIT,
-    EMIT_BATCHES_TIMEOUT,
+    BATCH_NUM_BYTES_LIMIT, BatchBuilder, EMIT_BATCHES_TIMEOUT, Source, SourceContext,
+    SourceRuntime, TypedSourceFactory,
 };
 use crate::actors::DocProcessor;
 use crate::models::{LocalShardPositionsUpdate, NewPublishLock, NewPublishToken, PublishLock};
@@ -110,7 +105,7 @@ impl ClientId {
 
     fn new_publish_token(&self) -> String {
         let ulid = if cfg!(test) { Ulid::nil() } else { Ulid::new() };
-        format!("{}/{}", self, ulid)
+        format!("{self}/{ulid}")
     }
 }
 
@@ -307,10 +302,10 @@ impl IngestSource {
         );
         // Let's record all shards that have reached Eof as complete.
         for (shard, truncate_up_to_position_inclusive) in &truncate_up_to_positions {
-            if truncate_up_to_position_inclusive.is_eof() {
-                if let Some(assigned_shard) = self.assigned_shards.get_mut(shard) {
-                    assigned_shard.status = IndexingStatus::Complete;
-                }
+            if truncate_up_to_position_inclusive.is_eof()
+                && let Some(assigned_shard) = self.assigned_shards.get_mut(shard)
+            {
+                assigned_shard.status = IndexingStatus::Complete;
             }
         }
 
@@ -415,9 +410,8 @@ impl IngestSource {
                 .assigned_shards
                 .keys()
                 .filter(|&shard_id| !new_assigned_shard_ids.contains(shard_id))
-                .cloned()
                 .any(|removed_shard_id| {
-                    let Some(assigned_shard) = self.assigned_shards.get(&removed_shard_id) else {
+                    let Some(assigned_shard) = self.assigned_shards.get(removed_shard_id) else {
                         return false;
                     };
                     assigned_shard.status != IndexingStatus::Complete
@@ -470,8 +464,7 @@ impl Source for IngestSource {
         let mut batch_builder = BatchBuilder::new(SourceType::IngestV2);
 
         let now = time::Instant::now();
-        let deadline = now + EMIT_BATCHES_TIMEOUT;
-
+        let deadline = now + *EMIT_BATCHES_TIMEOUT;
         loop {
             match time::timeout_at(deadline, self.fetch_stream.next()).await {
                 Ok(Ok(fetch_message)) => match fetch_message.message {
@@ -524,10 +517,11 @@ impl Source for IngestSource {
 
         // As enforced by `reset_if_needed`, at this point, all currently assigned shards should be
         // in the new_assigned_shards.
-        debug_assert!(self
-            .assigned_shards
-            .keys()
-            .all(|shard_id| new_assigned_shard_ids.contains(shard_id)));
+        debug_assert!(
+            self.assigned_shards
+                .keys()
+                .all(|shard_id| new_assigned_shard_ids.contains(shard_id))
+        );
 
         if self.assigned_shards.len() == new_assigned_shard_ids.len() {
             // Nothing to do.
@@ -668,15 +662,15 @@ impl Source for IngestSource {
 mod tests {
     use std::iter::once;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use bytesize::ByteSize;
     use itertools::Itertools;
     use quickwit_actors::{ActorContext, Universe};
+    use quickwit_common::ServiceStream;
     use quickwit_common::metrics::MEMORY_METRICS;
     use quickwit_common::stream_utils::InFlightValue;
-    use quickwit_common::ServiceStream;
     use quickwit_config::{IndexingSettings, SourceConfig, SourceParams};
     use quickwit_proto::indexing::IndexingPipelineId;
     use quickwit_proto::ingest::ingester::{

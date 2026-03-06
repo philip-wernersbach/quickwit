@@ -1,24 +1,19 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -26,15 +21,15 @@ use chitchat::{ChitchatId, NodeState};
 use futures::Stream;
 use pin_project::pin_project;
 use quickwit_common::sorted_iter::{KeyDiff, SortedByKeyIterator};
-use quickwit_common::tower::{make_channel, warmup_channel};
+use quickwit_common::tower::{ClientGrpcConfig, make_channel, warmup_channel};
 use quickwit_proto::types::NodeId;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
-use crate::member::NodeStateExt;
 use crate::ClusterNode;
+use crate::member::NodeStateExt;
 
 /// Describes a change in the cluster.
 #[derive(Debug, Clone)]
@@ -79,6 +74,7 @@ pub(crate) async fn compute_cluster_change_events(
     previous_nodes: &mut BTreeMap<NodeId, ClusterNode>,
     previous_node_states: &BTreeMap<ChitchatId, NodeState>,
     new_node_states: &BTreeMap<ChitchatId, NodeState>,
+    client_grpc_config: &ClientGrpcConfig,
 ) -> Vec<ClusterChange> {
     let mut cluster_events = Vec::new();
 
@@ -95,6 +91,7 @@ pub(crate) async fn compute_cluster_change_events(
                     chitchat_id,
                     node_state,
                     previous_nodes,
+                    client_grpc_config.clone(),
                 )
                 .await;
 
@@ -139,6 +136,7 @@ async fn compute_cluster_change_events_on_added(
     new_chitchat_id: &ChitchatId,
     new_node_state: &NodeState,
     previous_nodes: &mut BTreeMap<NodeId, ClusterNode>,
+    client_grpc_config: ClientGrpcConfig,
 ) -> Vec<ClusterChange> {
     let is_self_node = self_chitchat_id == new_chitchat_id;
     let new_node_id: NodeId = new_chitchat_id.node_id.clone().into();
@@ -166,8 +164,14 @@ async fn compute_cluster_change_events_on_added(
             events.push(ClusterChange::Remove(previous_node));
         }
     }
-    let Some(new_node) =
-        try_new_node(cluster_id, new_chitchat_id, new_node_state, is_self_node).await
+    let Some(new_node) = try_new_node(
+        cluster_id,
+        new_chitchat_id,
+        new_node_state,
+        is_self_node,
+        &client_grpc_config,
+    )
+    .await
     else {
         return events;
     };
@@ -300,10 +304,11 @@ async fn try_new_node(
     chitchat_id: &ChitchatId,
     node_state: &NodeState,
     is_self_node: bool,
+    grpc_config: &ClientGrpcConfig,
 ) -> Option<ClusterNode> {
     match node_state.grpc_advertise_addr() {
         Ok(socket_addr) => {
-            let channel = make_channel(socket_addr).await;
+            let channel = make_channel(socket_addr, grpc_config.clone()).await;
             try_new_node_with_channel(cluster_id, chitchat_id, node_state, channel, is_self_node)
         }
         Err(error) => {
@@ -443,6 +448,7 @@ pub(crate) mod tests {
                 &new_chitchat_id,
                 &new_node_state,
                 &mut previous_nodes,
+                Default::default(),
             )
             .await;
             assert!(events.is_empty());
@@ -465,6 +471,7 @@ pub(crate) mod tests {
                 &new_chitchat_id,
                 &new_node_state,
                 &mut previous_nodes,
+                Default::default(),
             )
             .await;
             assert!(events.is_empty());
@@ -493,6 +500,7 @@ pub(crate) mod tests {
                 &new_chitchat_id,
                 &new_node_state,
                 &mut previous_nodes,
+                Default::default(),
             )
             .await;
 
@@ -515,6 +523,7 @@ pub(crate) mod tests {
                 &rejoined_chitchat_id,
                 &new_node_state,
                 &mut previous_nodes,
+                Default::default(),
             )
             .await;
             assert_eq!(events.len(), 2);
@@ -543,6 +552,7 @@ pub(crate) mod tests {
                 &new_chitchat_id,
                 &new_node_state,
                 &mut previous_nodes,
+                Default::default(),
             )
             .await;
             assert!(events.is_empty());
@@ -567,6 +577,7 @@ pub(crate) mod tests {
                 &new_chitchat_id,
                 &new_node_state,
                 &mut previous_nodes,
+                Default::default(),
             )
             .await;
             assert_eq!(events.len(), 1);
@@ -623,7 +634,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let ClusterChange::Add(node) = event else {
-                panic!("expected `ClusterChange::Add` event, got `{:?}`", event);
+                panic!("expected `ClusterChange::Add` event, got `{event:?}`");
             };
             assert_eq!(node.chitchat_id(), &updated_chitchat_id);
             assert_eq!(node.grpc_advertise_addr(), grpc_advertise_addr);
@@ -671,7 +682,7 @@ pub(crate) mod tests {
             .unwrap();
 
             let ClusterChange::Update(node) = event else {
-                panic!("expected `ClusterChange::Remove` event, got `{:?}`", event);
+                panic!("expected `ClusterChange::Remove` event, got `{event:?}`");
             };
             assert_eq!(node.chitchat_id(), &updated_chitchat_id);
             assert_eq!(node.grpc_advertise_addr(), grpc_advertise_addr);
@@ -718,7 +729,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             let ClusterChange::Remove(node) = event else {
-                panic!("expected `ClusterChange::Remove` event, got `{:?}`", event);
+                panic!("expected `ClusterChange::Remove` event, got `{event:?}`");
             };
             assert_eq!(node.chitchat_id(), &updated_chitchat_id);
             assert_eq!(node.grpc_advertise_addr(), grpc_advertise_addr);
@@ -838,7 +849,7 @@ pub(crate) mod tests {
                     .unwrap();
 
             let ClusterChange::Remove(node) = event else {
-                panic!("expected `ClusterChange::Remove` event, got `{:?}`", event);
+                panic!("expected `ClusterChange::Remove` event, got `{event:?}`");
             };
             assert_eq!(node.chitchat_id(), &removed_chitchat_id);
             assert_eq!(node.grpc_advertise_addr(), grpc_advertise_addr);
@@ -897,6 +908,7 @@ pub(crate) mod tests {
                 &mut previous_nodes,
                 &previous_node_states,
                 &new_node_states,
+                &Default::default(),
             )
             .await;
             assert!(events.is_empty());
@@ -926,6 +938,7 @@ pub(crate) mod tests {
                 &mut previous_nodes,
                 &previous_node_states,
                 &new_node_states,
+                &Default::default(),
             )
             .await;
             assert!(events.is_empty());
@@ -943,6 +956,7 @@ pub(crate) mod tests {
                 &mut previous_nodes,
                 &previous_node_states,
                 &new_node_states,
+                &Default::default(),
             )
             .await;
             assert_eq!(events.len(), 1);
@@ -957,6 +971,7 @@ pub(crate) mod tests {
                 &mut previous_nodes,
                 &new_node_states,
                 &new_node_states,
+                &Default::default(),
             )
             .await;
             assert_eq!(events.len(), 0);
@@ -989,6 +1004,7 @@ pub(crate) mod tests {
                 &mut previous_nodes,
                 &previous_node_states,
                 &new_node_states,
+                &Default::default(),
             )
             .await;
             assert_eq!(events.len(), 1);
@@ -1008,6 +1024,7 @@ pub(crate) mod tests {
                 &mut previous_nodes,
                 &previous_node_states,
                 &new_node_states,
+                &Default::default(),
             )
             .await;
             assert_eq!(events.len(), 1);

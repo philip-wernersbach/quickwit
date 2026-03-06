@@ -1,38 +1,44 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import { Autocomplete, Box, Chip, CircularProgress, IconButton, List, ListItem, ListItemText, TextField, Typography } from '@mui/material';
-import React, { useEffect, useMemo, useState } from 'react';
-import styled from '@emotion/styled';
-import { FieldMapping, getAllFields, IndexMetadata } from '../utils/models';
-import { ChevronRight, KeyboardArrowDown } from '@mui/icons-material';
-import Tooltip from '@mui/material/Tooltip';
-import { Client } from '../services/client';
+import styled from "@emotion/styled";
+import { ChevronRight, KeyboardArrowDown } from "@mui/icons-material";
+import {
+  Autocomplete,
+  Box,
+  Chip,
+  CircularProgress,
+  IconButton,
+  List,
+  ListItem,
+  ListItemText,
+  TextField,
+  Typography,
+} from "@mui/material";
+import Tooltip from "@mui/material/Tooltip";
+import React, { useEffect, useMemo, useState } from "react";
+import { Client } from "../services/client";
+import { FieldMapping, getAllFields, IndexMetadata } from "../utils/models";
 
-const IndexBarWrapper = styled('div')({
-  display: 'flex',
-  height: '100%',
-  flex: '0 0 260px',
-  maxWidth: '260px',
-  flexDirection: 'column',
-  borderRight: '1px solid rgba(0, 0, 0, 0.12)',
-  overflow: 'auto',
+const IndexBarWrapper = styled("div")({
+  display: "flex",
+  height: "100%",
+  flex: "0 0 260px",
+  maxWidth: "260px",
+  flexDirection: "column",
+  borderRight: "1px solid rgba(0, 0, 0, 0.12)",
+  overflow: "auto",
 });
 
 function IndexAutocomplete(props: IndexMetadataProps) {
@@ -58,7 +64,7 @@ function IndexAutocomplete(props: IndexMetadataProps) {
       (error) => {
         console.log("Index autocomplete error", error);
         setLoading(false);
-      }
+      },
     );
   }, [quickwitClient, open]);
 
@@ -71,7 +77,7 @@ function IndexAutocomplete(props: IndexMetadataProps) {
   }, [open, props.indexMetadata, options.length]);
 
   useEffect(() => {
-      setValue(props.indexMetadata);
+    setValue(props.indexMetadata);
   }, [props.indexMetadata]);
 
   return (
@@ -83,7 +89,10 @@ function IndexAutocomplete(props: IndexMetadataProps) {
       onChange={(_, updatedValue) => {
         setValue(updatedValue);
 
-        if (updatedValue == null || updatedValue.index_config.index_id == null) {
+        if (
+          updatedValue == null ||
+          updatedValue.index_config.index_id == null
+        ) {
           props.onIndexMetadataUpdate(null);
         } else {
           props.onIndexMetadataUpdate(updatedValue);
@@ -96,7 +105,9 @@ function IndexAutocomplete(props: IndexMetadataProps) {
         setOpen(false);
         setLoading(false);
       }}
-      isOptionEqualToValue={(option, value) => option.index_config.index_id === value.index_config.index_id}
+      isOptionEqualToValue={(option, value) =>
+        option.index_config.index_id === value.index_config.index_id
+      }
       getOptionLabel={(option) => option.index_config.index_id}
       options={options}
       noOptionsText="No indexes."
@@ -104,12 +115,14 @@ function IndexAutocomplete(props: IndexMetadataProps) {
       renderInput={(params) => (
         <TextField
           {...params}
-          placeholder='Select an index'
+          placeholder="Select an index"
           InputProps={{
             ...params.InputProps,
             endAdornment: (
               <React.Fragment>
-                {showLoading ? <CircularProgress color="inherit" size={20} /> : null}
+                {showLoading ? (
+                  <CircularProgress color="inherit" size={20} />
+                ) : null}
                 {params.InputProps.endAdornment}
               </React.Fragment>
             ),
@@ -121,14 +134,13 @@ function IndexAutocomplete(props: IndexMetadataProps) {
 }
 
 export interface IndexMetadataProps {
-  indexMetadata: null | IndexMetadata,
+  indexMetadata: null | IndexMetadata;
   onIndexMetadataUpdate(indexMetadata: IndexMetadata | null): void;
 }
 
 function fieldTypeLabel(fieldMapping: FieldMapping): string {
   if (fieldMapping.type[0] !== undefined) {
     return fieldMapping.type[0].toUpperCase();
-
   } else {
     return "";
   }
@@ -136,41 +148,64 @@ function fieldTypeLabel(fieldMapping: FieldMapping): string {
 
 export function IndexSideBar(props: IndexMetadataProps) {
   const [open, setOpen] = useState(true);
-  const fields = (props.indexMetadata === null) ? [] : getAllFields(props.indexMetadata.index_config.doc_mapping.field_mappings);
+  const fields =
+    props.indexMetadata === null
+      ? []
+      : getAllFields(
+          props.indexMetadata.index_config.doc_mapping.field_mappings,
+        );
   return (
     <IndexBarWrapper>
-      <Box sx={{ px: 3, py: 2}}>
-        <Typography variant='body1' mb={1}>
+      <Box sx={{ px: 3, py: 2 }}>
+        <Typography variant="body1" mb={1}>
           Index ID
         </Typography>
-        <IndexAutocomplete { ...props }/>
+        <IndexAutocomplete {...props} />
       </Box>
-      <Box sx={{ paddingLeft: "10px", height: '100%'}}>
+      <Box sx={{ paddingLeft: "10px", height: "100%" }}>
         <IconButton
-            aria-label="expand row"
-            size="small"
-            onClick={() => setOpen(!open)}
-          >
-            {open ? <KeyboardArrowDown /> : <ChevronRight />}
+          aria-label="expand row"
+          size="small"
+          onClick={() => setOpen(!open)}
+        >
+          {open ? <KeyboardArrowDown /> : <ChevronRight />}
         </IconButton>
         Fields
-        { open && <List dense={true} sx={{paddingTop: '0', overflowWrap: 'break-word'}}>
-          { fields.map(function(field) {
-            return <ListItem
-              key={ field.json_path }
-              secondaryAction={
-                <IconButton edge="end" aria-label="add"></IconButton>
-              }
-              sx={{paddingLeft: '10px'}}
-            >
-              <Tooltip title={field.field_mapping.type} arrow placement="left">
-                <Chip label={fieldTypeLabel(field.field_mapping)} size="small" sx={{marginRight: '10px', borderRadius: '3px', fontSize: '0.6rem'}}/>
-              </Tooltip>
-              <ListItemText primary={ field.json_path }/>
-            </ListItem>
-          })}
-        </List>
-        }
+        {open && (
+          <List
+            dense={true}
+            sx={{ paddingTop: "0", overflowWrap: "break-word" }}
+          >
+            {fields.map(function (field) {
+              return (
+                <ListItem
+                  key={field.json_path}
+                  secondaryAction={
+                    <IconButton edge="end" aria-label="add"></IconButton>
+                  }
+                  sx={{ paddingLeft: "10px" }}
+                >
+                  <Tooltip
+                    title={field.field_mapping.type}
+                    arrow
+                    placement="left"
+                  >
+                    <Chip
+                      label={fieldTypeLabel(field.field_mapping)}
+                      size="small"
+                      sx={{
+                        marginRight: "10px",
+                        borderRadius: "3px",
+                        fontSize: "0.6rem",
+                      }}
+                    />
+                  </Tooltip>
+                  <ListItemText primary={field.json_path} />
+                </ListItem>
+              );
+            })}
+          </List>
+        )}
       </Box>
     </IndexBarWrapper>
   );

@@ -1,28 +1,23 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use fail::fail_point;
 use itertools::Itertools;
@@ -30,10 +25,10 @@ use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, Qu
 use quickwit_common::runtimes::RuntimeType;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_directories::write_hotcache;
-use quickwit_doc_mapper::tag_pruning::append_to_tag_set;
 use quickwit_doc_mapper::NamedField;
+use quickwit_doc_mapper::tag_pruning::append_to_tag_set;
 use quickwit_proto::search::{
-    serialize_split_fields, ListFieldType, ListFields, ListFieldsEntryResponse,
+    ListFieldType, ListFields, ListFieldsEntryResponse, serialize_split_fields,
 };
 use tantivy::index::FieldMetadata;
 use tantivy::schema::{FieldType, Type};
@@ -365,8 +360,8 @@ fn field_metadata_to_list_field_serialized(
     ListFieldsEntryResponse {
         field_name: field_metadata.field_name.to_string(),
         field_type: tantivy_type_to_list_field_type(field_metadata.typ) as i32,
-        searchable: field_metadata.indexed,
-        aggregatable: field_metadata.fast,
+        searchable: field_metadata.is_indexed(),
+        aggregatable: field_metadata.is_fast(),
         index_ids: Vec::new(),
         non_searchable_index_ids: Vec::new(),
         non_aggregatable_index_ids: Vec::new(),
@@ -387,11 +382,11 @@ mod tests {
 
     use quickwit_actors::{ObservationType, Universe};
     use quickwit_metastore::checkpoint::IndexCheckpointDelta;
-    use quickwit_proto::search::{deserialize_split_fields, ListFieldsEntryResponse};
+    use quickwit_proto::search::{ListFieldsEntryResponse, deserialize_split_fields};
     use quickwit_proto::types::{DocMappingUid, IndexUid, NodeId};
     use tantivy::directory::MmapDirectory;
-    use tantivy::schema::{NumericOptions, Schema, Type, FAST, STRING, TEXT};
-    use tantivy::{doc, DateTime, IndexBuilder, IndexSettings};
+    use tantivy::schema::{FAST, NumericOptions, STRING, Schema, TEXT, Type};
+    use tantivy::{DateTime, IndexBuilder, IndexSettings, doc};
     use tracing::Span;
 
     use super::*;
@@ -403,23 +398,29 @@ mod tests {
             FieldMetadata {
                 field_name: "test".to_string(),
                 typ: Type::Str,
-                indexed: true,
                 stored: true,
-                fast: true,
+                fast_size: Some(10u64.into()),
+                term_dictionary_size: Some(10u64.into()),
+                postings_size: Some(10u64.into()),
+                positions_size: Some(10u64.into()),
             },
             FieldMetadata {
                 field_name: "test2".to_string(),
                 typ: Type::Str,
-                indexed: true,
                 stored: false,
-                fast: false,
+                fast_size: None,
+                term_dictionary_size: Some(10u64.into()),
+                postings_size: Some(10u64.into()),
+                positions_size: Some(10u64.into()),
             },
             FieldMetadata {
                 field_name: "test3".to_string(),
                 typ: Type::U64,
-                indexed: true,
                 stored: false,
-                fast: true,
+                fast_size: Some(10u64.into()),
+                term_dictionary_size: Some(10u64.into()),
+                postings_size: Some(10u64.into()),
+                positions_size: Some(10u64.into()),
             },
         ];
 

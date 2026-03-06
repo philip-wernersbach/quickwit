@@ -1,34 +1,29 @@
-// Copyright (C) 2024 Quickwit, Inc.
+// Copyright 2021-Present Datadog, Inc.
 //
-// Quickwit is offered under the AGPL v3.0 and as commercial software.
-// For commercial licensing, contact us at hello@quickwit.io.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// AGPL:
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as
-// published by the Free Software Foundation, either version 3 of the
-// License, or (at your option) any later version.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <http://www.gnu.org/licenses/>.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
-use std::collections::{btree_set, BTreeSet, HashMap};
+use std::cmp::PartialEq;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use async_trait::async_trait;
 use prost::Message;
 use quickwit_common::thread_pool::run_cpu_intensive;
 use quickwit_common::uri::Uri;
-use quickwit_config::{load_index_config_from_user_config, ConfigFormat, IndexConfig};
+use quickwit_config::{ConfigFormat, IndexConfig, load_index_config_from_user_config};
 use quickwit_ingest::{CommitType, JsonDocBatchV2Builder};
-use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::ingest::DocBatchV2;
+use quickwit_proto::ingest::router::IngestRouterServiceClient;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::trace_service_server::TraceService;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
@@ -43,16 +38,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tonic::{Request, Response, Status};
 use tracing::field::Empty;
-use tracing::{error, instrument, warn, Span as RuntimeSpan};
+use tracing::{Span as RuntimeSpan, error, instrument, warn};
 
 use super::{
-    extract_otel_index_id_from_metadata, ingest_doc_batch_v2, is_zero, OtelSignal,
-    TryFromSpanIdError, TryFromTraceIdError,
+    OtelSignal, TryFromSpanIdError, TryFromTraceIdError, extract_otel_index_id_from_metadata,
+    ingest_doc_batch_v2, is_zero,
 };
 use crate::otlp::metrics::OTLP_SERVICE_METRICS;
-use crate::otlp::{extract_attributes, SpanId, TraceId};
+use crate::otlp::{SpanId, TraceId, extract_attributes};
 
-pub const OTEL_TRACES_INDEX_ID: &str = "otel-traces-v0_7";
+pub const OTEL_TRACES_INDEX_ID: &str = "otel-traces-v0_9";
 pub const OTEL_TRACES_INDEX_ID_PATTERN: &str = "otel-traces-v0_*";
 
 const OTEL_TRACES_INDEX_CONFIG: &str = r#"
@@ -144,6 +139,10 @@ doc_mapping:
       input_format: hex
       output_format: hex
       indexed: false
+    - name: is_root
+      type: bool
+      indexed: true
+      stored: false
     - name: events
       type: array<json>
       tokenizer: raw
@@ -231,6 +230,8 @@ pub struct Span {
     pub span_status: SpanStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<SpanId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_root: Option<bool>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<Event>,
@@ -312,6 +313,7 @@ impl Span {
             span_dropped_events_count: span.dropped_events_count,
             span_dropped_links_count: span.dropped_links_count,
             span_status: span.status.map(SpanStatus::from_otlp).unwrap_or_default(),
+            is_root: Some(parent_span_id.is_none()),
             parent_span_id,
             events,
             event_names,
@@ -320,43 +322,6 @@ impl Span {
         Ok(span)
     }
 }
-
-/// A wrapper around `Span` that implements `Ord` to allow insertion of spans into a `BTreeSet`.
-#[derive(Debug)]
-struct OrdSpan(Span);
-
-impl Ord for OrdSpan {
-    /// Sort spans by trace ID, span name, start timestamp, and span ID in an attempt to group the
-    /// spans by trace ID and span name in the same docstore blocks. At some point, the
-    /// cost–benefit of this approach should be evaluated via a benchmark and revisited if
-    /// necessary.
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .trace_id
-            .cmp(&other.0.trace_id)
-            .then(self.0.span_name.cmp(&other.0.span_name))
-            .then(
-                self.0
-                    .span_start_timestamp_nanos
-                    .cmp(&other.0.span_start_timestamp_nanos),
-            )
-            .then(self.0.span_id.cmp(&other.0.span_id))
-    }
-}
-
-impl PartialOrd for OrdSpan {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for OrdSpan {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for OrdSpan {}
 
 #[derive(Debug, Clone)]
 pub struct SpanKind(i32);
@@ -648,10 +613,14 @@ impl Link {
     }
 }
 
-fn parse_otlp_spans(
-    request: ExportTraceServiceRequest,
-) -> Result<BTreeSet<OrdSpan>, OtlpTracesError> {
-    let mut spans = BTreeSet::new();
+fn parse_otlp_spans(request: ExportTraceServiceRequest) -> Result<Vec<Span>, OtlpTracesError> {
+    let num_spans = request
+        .resource_spans
+        .iter()
+        .flat_map(|resource_spans| resource_spans.scope_spans.iter())
+        .map(|scope_spans| scope_spans.spans.len())
+        .sum();
+    let mut spans = Vec::with_capacity(num_spans);
 
     for resource_spans in request.resource_spans {
         let resource = resource_spans
@@ -662,7 +631,7 @@ fn parse_otlp_spans(
             let scope = scope_spans.scope.map(Scope::from_otlp).unwrap_or_default();
             for span in scope_spans.spans {
                 let span = Span::from_otlp(span, &resource, &scope)?;
-                spans.insert(OrdSpan(span));
+                spans.push(span);
             }
         }
     }
@@ -753,6 +722,7 @@ impl OtlpGrpcTracesService {
     }
 
     #[instrument(skip_all, parent = parent_span, fields(num_spans = Empty, num_bytes = Empty, num_parse_errors = Empty))]
+    #[allow(clippy::result_large_err)]
     fn parse_spans(
         request: ExportTraceServiceRequest,
         parent_span: RuntimeSpan,
@@ -762,11 +732,11 @@ impl OtlpGrpcTracesService {
         let mut num_parse_errors = 0;
         let mut error_message = String::new();
 
-        let mut doc_batch_builder = JsonDocBatchV2Builder::default();
+        let mut doc_batch_builder = JsonDocBatchV2Builder::with_num_docs(num_spans as usize);
         let mut doc_uid_generator = DocUidGenerator::default();
         for span in spans {
             let doc_uid = doc_uid_generator.next_doc_uid();
-            if let Err(error) = doc_batch_builder.add_doc(doc_uid, span.0) {
+            if let Err(error) = doc_batch_builder.add_doc(doc_uid, span) {
                 error!(error=?error, "failed to JSON serialize span");
                 error_message = format!("failed to JSON serialize span: {error:?}");
                 num_parse_errors += 1;
@@ -856,7 +826,7 @@ impl TraceService for OtlpGrpcTracesService {
 
 /// An iterator of JSON OTLP spans for use in the doc processor.
 pub struct JsonSpanIterator {
-    spans: btree_set::IntoIter<OrdSpan>,
+    spans: std::vec::IntoIter<Span>,
     current_span_idx: usize,
     num_spans: usize,
     avg_span_size: usize,
@@ -864,7 +834,7 @@ pub struct JsonSpanIterator {
 }
 
 impl JsonSpanIterator {
-    fn new(spans: BTreeSet<OrdSpan>, num_bytes: usize) -> Self {
+    fn new(spans: Vec<Span>, num_bytes: usize) -> Self {
         let num_spans = spans.len();
         let avg_span_size = num_bytes.checked_div(num_spans).unwrap_or(0);
         let avg_span_size_rem = avg_span_size + num_bytes.checked_rem(num_spans).unwrap_or(0);
@@ -883,9 +853,10 @@ impl Iterator for JsonSpanIterator {
     type Item = (JsonValue, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let span_opt = self.spans.next().map(|OrdSpan(span)| {
-            serde_json::to_value(span).expect("`Span` should be JSON serializable")
-        });
+        let span_opt = self
+            .spans
+            .next()
+            .map(|span| serde_json::to_value(span).expect("`Span` should be JSON serializable"));
         if span_opt.is_some() {
             self.current_span_idx += 1;
         }
@@ -913,7 +884,7 @@ pub fn parse_otlp_spans_protobuf(
 
 #[cfg(test)]
 mod tests {
-    use quickwit_metastore::{metastore_for_test, CreateIndexRequestExt};
+    use quickwit_metastore::{CreateIndexRequestExt, metastore_for_test};
     use quickwit_proto::metastore::{CreateIndexRequest, MetastoreService};
     use quickwit_proto::opentelemetry::proto::common::v1::any_value::Value as OtlpAnyValueValue;
     use quickwit_proto::opentelemetry::proto::common::v1::{
@@ -1278,6 +1249,7 @@ mod tests {
                 span_dropped_links_count: 0,
                 span_status: SpanStatus::default(),
                 parent_span_id: None,
+                is_root: Some(true),
                 events: Vec::new(),
                 event_names: Vec::new(),
                 links: Vec::new(),
@@ -1320,6 +1292,7 @@ mod tests {
                     message: None,
                 },
                 parent_span_id: Some(SpanId::new([3; 8])),
+                is_root: Some(false),
                 events: vec![Event {
                     event_timestamp_nanos: 1,
                     event_name: "event_name".to_string(),
@@ -1343,7 +1316,7 @@ mod tests {
 
     #[test]
     fn test_json_span_iterator() {
-        let mut json_span_iterator = JsonSpanIterator::new(BTreeSet::new(), 0);
+        let mut json_span_iterator = JsonSpanIterator::new(Vec::new(), 0);
         assert!(json_span_iterator.next().is_none());
 
         let span_0 = Span {
@@ -1373,12 +1346,13 @@ mod tests {
             span_dropped_links_count: 0,
             span_status: SpanStatus::default(),
             parent_span_id: None,
+            is_root: Some(true),
             events: Vec::new(),
             event_names: Vec::new(),
             links: Vec::new(),
         };
 
-        let spans = BTreeSet::from_iter([OrdSpan(span_0.clone())]);
+        let spans = vec![span_0.clone()];
         let mut json_span_iterator = JsonSpanIterator::new(spans, 3);
 
         assert_eq!(
@@ -1390,7 +1364,7 @@ mod tests {
         let mut span_1 = span_0.clone();
         span_1.span_id = SpanId::new([3; 8]);
 
-        let spans = BTreeSet::from_iter([OrdSpan(span_0.clone()), OrdSpan(span_1.clone())]);
+        let spans = vec![span_0.clone(), span_1.clone()];
         let mut json_span_iterator = JsonSpanIterator::new(spans, 7);
 
         assert_eq!(
