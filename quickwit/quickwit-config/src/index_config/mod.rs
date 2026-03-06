@@ -31,7 +31,7 @@ use quickwit_common::{is_true, true_fn};
 use quickwit_doc_mapper::{DocMapper, DocMapperBuilder, DocMapping};
 use quickwit_proto::types::IndexId;
 use rand::{Rng, distr, rng};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 pub use serialize::{load_index_config_from_user_config, load_index_config_update};
 use siphasher::sip::SipHasher;
 use tracing::warn;
@@ -230,8 +230,10 @@ pub struct RetentionPolicy {
     /// If unset, a default jitter of `min(1 hour, next_next_evaluation - next_evaluation)` is
     /// applied. Said otherwise, an operation may start any time between the next time it's
     /// scheduled, and the time after that, but no later than 1h after the scheduled time.
+    #[serde(default, deserialize_with = "parse_human_duration_opt")]
+    #[serde(serialize_with = "serialize_duration_opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub jitter_secs: Option<u64>,
+    pub jitter: Option<Duration>,
 }
 
 impl RetentionPolicy {
@@ -268,17 +270,22 @@ impl RetentionPolicy {
         let mut duration = (future_date - Utc::now())
             .to_std()
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        let jitter_secs = self.jitter_secs.unwrap_or_else(|| {
-            if let Some(next_next_date) = schedule_iter.next() {
-                let time_between_schedules = next_next_date - future_date;
-                time_between_schedules.num_seconds().clamp(0, 3600) as u64
-            } else {
-                // we don't know when the schedule is. That's odd. Let's allow no jitter
-                warn!("found retention policy schedule with no next execution");
-                0
-            }
-        });
-        let jitter = rng().sample::<u64, _>(distr::StandardUniform) % (jitter_secs + 1);
+        let jitter_max_secs = self
+            .jitter
+            .unwrap_or_else(|| {
+                if let Some(next_next_date) = schedule_iter.next() {
+                    let time_between_schedules = next_next_date - future_date;
+                    Duration::from_secs(
+                        time_between_schedules.num_seconds().clamp(0, 3600) as u64,
+                    )
+                } else {
+                    // we don't know when the schedule is. That's odd. Let's allow no jitter
+                    warn!("found retention policy schedule with no next execution");
+                    Duration::ZERO
+                }
+            })
+            .as_secs();
+        let jitter = rng().sample::<u64, _>(distr::StandardUniform) % (jitter_max_secs + 1);
         duration += Duration::from_secs(jitter);
         Ok(duration)
     }
@@ -287,6 +294,29 @@ impl RetentionPolicy {
         self.retention_period()?;
         self.evaluation_schedule()?;
         Ok(())
+    }
+}
+
+fn parse_human_duration_opt<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where D: Deserializer<'de> {
+    let value: Option<String> = Deserialize::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(s) => humantime::parse_duration(&s)
+            .map(Some)
+            .map_err(|error| {
+                de::Error::custom(format!(
+                    "failed to parse human-readable duration `{s}`: {error:?}",
+                ))
+            }),
+    }
+}
+
+fn serialize_duration_opt<S>(value: &Option<Duration>, s: S) -> Result<S::Ok, S::Error>
+where S: Serializer {
+    match value {
+        None => s.serialize_none(),
+        Some(d) => s.serialize_str(&humantime::format_duration(*d).to_string()),
     }
 }
 
@@ -526,7 +556,7 @@ impl crate::TestableForRegression for IndexConfig {
         let retention_policy_opt = Some(RetentionPolicy {
             retention_period: "90 days".to_string(),
             evaluation_schedule: "daily".to_string(),
-            jitter_secs: None,
+            jitter: None,
         });
         IndexConfig {
             index_id: "my-index".to_string(),
@@ -699,7 +729,7 @@ mod tests {
         let expected_retention_policy = RetentionPolicy {
             retention_period: "90 days".to_string(),
             evaluation_schedule: "daily".to_string(),
-            jitter_secs: None,
+            jitter: None,
         };
         assert_eq!(
             index_config.retention_policy_opt.unwrap(),
@@ -879,7 +909,7 @@ mod tests {
         let retention_policy = RetentionPolicy {
             retention_period: "90 days".to_string(),
             evaluation_schedule: "hourly".to_string(),
-            jitter_secs: None,
+            jitter: None,
         };
         let retention_policy_yaml = serde_yaml::to_string(&retention_policy).unwrap();
         assert_eq!(
@@ -900,7 +930,7 @@ mod tests {
             let expected_retention_policy = RetentionPolicy {
                 retention_period: "90 days".to_string(),
                 evaluation_schedule: "hourly".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             assert_eq!(retention_policy, expected_retention_policy);
         }
@@ -915,10 +945,37 @@ mod tests {
             let expected_retention_policy = RetentionPolicy {
                 retention_period: "90 days".to_string(),
                 evaluation_schedule: "daily".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             assert_eq!(retention_policy, expected_retention_policy);
         }
+    }
+
+    #[test]
+    fn test_retention_policy_jitter_deserialization() {
+        let retention_policy_yaml = r#"
+            period: 90 days
+            jitter: 30 minutes
+        "#;
+        let retention_policy =
+            serde_yaml::from_str::<RetentionPolicy>(retention_policy_yaml).unwrap();
+        assert_eq!(
+            retention_policy.jitter,
+            Some(Duration::from_secs(30 * 60))
+        );
+    }
+
+    #[test]
+    fn test_retention_policy_jitter_serialization_roundtrip() {
+        let retention_policy = RetentionPolicy {
+            retention_period: "90 days".to_string(),
+            evaluation_schedule: "hourly".to_string(),
+            jitter: Some(Duration::from_secs(30 * 60)),
+        };
+        let retention_policy_yaml = serde_yaml::to_string(&retention_policy).unwrap();
+        let deserialized: RetentionPolicy =
+            serde_yaml::from_str(&retention_policy_yaml).unwrap();
+        assert_eq!(deserialized, retention_policy);
     }
 
     #[test]
@@ -927,7 +984,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "hourly".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             assert_eq!(
                 retention_policy.retention_period().unwrap(),
@@ -937,7 +994,7 @@ mod tests {
                 let retention_policy = RetentionPolicy {
                     retention_period: "foo".to_string(),
                     evaluation_schedule: "hourly".to_string(),
-                    jitter_secs: None,
+                    jitter: None,
                 };
                 assert_eq!(
                     retention_policy.retention_period().unwrap_err().to_string(),
@@ -962,7 +1019,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "@hourly".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             assert_eq!(
                 retention_policy.evaluation_schedule().unwrap(),
@@ -973,7 +1030,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "hourly".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             assert_eq!(
                 retention_policy.evaluation_schedule().unwrap(),
@@ -984,7 +1041,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "0 * * * * *".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             let evaluation_schedule = retention_policy.evaluation_schedule().unwrap();
             assert_eq!(evaluation_schedule.seconds().count(), 1);
@@ -998,7 +1055,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "hourly".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             retention_policy.validate().unwrap();
         }
@@ -1006,7 +1063,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "foo".to_string(),
                 evaluation_schedule: "hourly".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             retention_policy.validate().unwrap_err();
         }
@@ -1014,7 +1071,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: "foo".to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             retention_policy.validate().unwrap_err();
         }
@@ -1027,7 +1084,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: schedule_str.to_string(),
-                jitter_secs: Some(0),
+                jitter: Some(Duration::ZERO),
             };
 
             let next_evaluation_duration = chrono::Duration::nanoseconds(
@@ -1055,7 +1112,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: schedule_str.to_string(),
-                jitter_secs: Some(60 * 30),
+                jitter: Some(Duration::from_secs(60 * 30)),
             };
 
             for _ in 0..11 {
@@ -1095,7 +1152,7 @@ mod tests {
             let retention_policy = RetentionPolicy {
                 retention_period: "1 hour".to_string(),
                 evaluation_schedule: schedule_str.to_string(),
-                jitter_secs: None,
+                jitter: None,
             };
             let max_1s_delay = schedule_str.starts_with('*');
             let (limit, max_delay) = if max_1s_delay {
