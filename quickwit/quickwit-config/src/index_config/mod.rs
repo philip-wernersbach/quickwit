@@ -274,6 +274,7 @@ impl RetentionPolicy {
                 time_between_schedules.num_seconds().clamp(0, 3600) as u64
             } else {
                 // we don't know when the schedule is. That's odd. Let's allow no jitter
+                warn!("found retention policy schedule with no next execution");
                 0
             }
         });
